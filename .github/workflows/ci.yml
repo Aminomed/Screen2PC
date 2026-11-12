@@ -16,6 +16,8 @@ jobs:
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
 
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
@@ -34,10 +36,12 @@ jobs:
             Write-Host "Found stampinf.exe at: $($stamp.FullName)"
             $stamp.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
-          $wdkProps = Get-ChildItem -Path "packages" -Filter "Microsoft.Windows.WDK.x64.props" -Recurse | Select-Object -First 1
-          if ($wdkProps) {
-            Write-Host "=== $($wdkProps.FullName) ==="
-            Get-Content $wdkProps.FullName
+          Get-ChildItem -Path "packages" -Filter "InfVerif.dll" -Recurse | ForEach-Object { Write-Host "InfVerif.dll: $($_.FullName)" }
+          Get-ChildItem -Path "packages" -Filter "iddcx.h" -Recurse | ForEach-Object { Write-Host "iddcx.h: $($_.FullName)" }
+          $tgt = Get-ChildItem -Path "packages" -Filter "WindowsDriver.common.targets" -Recurse | Select-Object -First 1
+          if ($tgt) {
+            Write-Host "=== WindowsDriver.common.targets (655..695) ==="
+            (Get-Content $tgt.FullName)[654..694]
           }
 
       - name: Build Solution (Release|x64)

@@ -21,6 +21,12 @@
     <RootNamespace>Screen2PCDriver</RootNamespace>
     <DriverType>UMDF</DriverType>
     <TargetName>Screen2PCDriver</TargetName>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>15</UMDF_VERSION_MINOR>
+    <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
+    <IDDCX_VERSION_MINOR>2</IDDCX_VERSION_MINOR>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -56,10 +62,12 @@
     <ClCompile>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\10.0.26100.0\um\iddcx\1.2;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\wdf\umdf\2.15;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\10.0.26100.0\um;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\10.0.26100.0\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <TreatWarningAsError>false</TreatWarningAsError>
       <WppEnabled>false</WppEnabled>
     </ClCompile>
     <Link>
+      <AdditionalLibraryDirectories>$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64\iddcx\1.2;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\wdf\umdf\x64\2.15;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>OneCoreUap.lib;avrt.lib;advapi32.lib;iddcx.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
@@ -70,10 +78,12 @@
     <ClCompile>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <PreprocessorDefinitions>NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\10.0.26100.0\um\iddcx\1.2;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\wdf\umdf\2.15;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\10.0.26100.0\um;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Include\10.0.26100.0\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <TreatWarningAsError>false</TreatWarningAsError>
       <WppEnabled>false</WppEnabled>
     </ClCompile>
     <Link>
+      <AdditionalLibraryDirectories>$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64\iddcx\1.2;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\wdf\umdf\x64\2.15;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>OneCoreUap.lib;avrt.lib;advapi32.lib;iddcx.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
