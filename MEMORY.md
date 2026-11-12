@@ -6,9 +6,9 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `2 — CI-Verifikation & Feinschliff`
-- **Status:** Komplette Codebasis (`Common`, `Driver`, `DriverSetup`, `Sender`, `Receiver`, `Tests`, Scripts, `Screen2PC.sln`, `ci.yml`, `README.md`) erstellt. Starte GitHub Actions Build & Test-Verifikation.
-- **Next Step:** Commit + Push -> `gh run watch` -> etwaige Build-/Test-/Driver-Fehler beheben bis CI 100 % gruen ist.
+- **Phase:** `Fertig (MVP) — CI-Verifiziert`
+- **Status:** Komplette Solution (`Common`, `Driver`, `DriverSetup`, `Sender`, `Receiver`, `Tests`) baut sauber unter `Release|x64` auf `windows-2022` (WDK `10.0.26100.2454`). Alle automatisierten Unit- & Integrationstests (`Screen2PC.Tests.exe`), `infverif`, `Inf2Cat` und das Release-Bundle (`Screen2PC-Windows-x64.zip`, ~735 KB) sind erfolgreich durchgelaufen.
+- **Next Step:** Optional nach erstem Echtbetrieb auf Surface + PC: Feintuning oder Ausbau laut Roadmap (Shared Clipboard, Quick File Transfer, KVM).
 
 ---
 
@@ -61,3 +61,6 @@
 | 2026-11-12 | Init | `MEMORY.md` angelegt; Workflow & Architektur-Entwurf erstellt |
 | 2026-11-12 | Planung | Hardware-Specs, C++20-Entscheidung, Dual-Codec & treiberfreier PC-Empfänger in `MEMORY.md` fixiert |
 | 2026-11-12 | Implementation | `Common`, `Driver`, `DriverSetup`, `Sender`, `Receiver`, `Tests`, Solution, Scripts, `ci.yml` & `README.md` erstellt |
+| 2026-11-12 | CI & Driver Fix | WDK NuGet `10.0.26100.2454` + x64 MSBuild in `ci.yml` integriert; `IddCxStub.lib`, `WDF_DECLARE_CONTEXT_TYPE`, `PnpLockdown=1`, `SignMode=Off` und DLL-Kopie fuer `Inf2Cat` im Treiberprojekt gefixt |
+| 2026-11-12 | Codec & Scripts | `H264Decoder` um Trennung zwischen Macroblock-Padding (`m_codedHeight`, z. B. `1088` bei `1080p` / `368` bei `360p`) und sichtbarer Aperture (`MF_MT_MINIMUM_DISPLAY_APERTURE`) + DXVA-Crop erweitert; `$RootDir` in `install_driver.ps1`/`uninstall_driver.ps1` fuer entpacktes Release-ZIP gefixt; Hotkey-Reentry-Guard im Sender ergaenzt |
+| 2026-11-12 | CI Verifikation | GitHub Actions Run gruen (`43330726483`): MSBuild `Release|x64`, `Screen2PC.Tests.exe` (4/4 Testsuiten bestanden), `infverif.exe`, `Inf2Cat.exe` & Artifact `Screen2PC-Windows-x64.zip` komplett erfolgreich |
