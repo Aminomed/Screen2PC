@@ -57,6 +57,7 @@
     <IntDir>$(SolutionDir)out\obj\$(ProjectName)\$(Configuration)\$(Platform)\</IntDir>
     <DebuggerFlavor>DbgengRemoteDebugger</DebuggerFlavor>
     <RunCodeAnalysis>false</RunCodeAnalysis>
+    <SignMode>Off</SignMode>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
