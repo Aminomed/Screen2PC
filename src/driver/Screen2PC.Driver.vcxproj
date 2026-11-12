@@ -68,7 +68,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64\iddcx\1.2;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\wdf\umdf\x64\2.15;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>OneCoreUap.lib;avrt.lib;advapi32.lib;iddcx.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>OneCoreUap.lib;avrt.lib;advapi32.lib;IddCxStub.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
       <Architecture>$(InfArch)</Architecture>
@@ -84,7 +84,7 @@
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64\iddcx\1.2;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\wdf\umdf\x64\2.15;$(SolutionDir)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\c\Lib\10.0.26100.0\um\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>OneCoreUap.lib;avrt.lib;advapi32.lib;iddcx.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>OneCoreUap.lib;avrt.lib;advapi32.lib;IddCxStub.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Inf>
       <Architecture>$(InfArch)</Architecture>
