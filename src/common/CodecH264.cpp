@@ -698,6 +698,8 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uin
 
     m_width = width;
     m_height = height;
+    m_codedWidth = width;
+    m_codedHeight = height;
     m_decodedStride = width;
     m_device = d3dDevice;
     m_context = d3dCtx;
@@ -791,14 +793,25 @@ bool H264Decoder::ConfigureOutputType() {
             if (SUCCEEDED(m_mft->SetOutputType(0, outType.Get(), 0))) {
                 UINT32 w = 0, h = 0;
                 if (SUCCEEDED(MFGetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) {
-                    m_width = w;
-                    m_height = h;
+                    m_codedWidth = w;
+                    m_codedHeight = h;
+                    if (m_width == 0 || m_height == 0) {
+                        m_width = w;
+                        m_height = h;
+                    }
+                }
+                MFVideoArea area{};
+                UINT32 areaBytes = 0;
+                if (SUCCEEDED(outType->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&area), sizeof(area), &areaBytes)) &&
+                    areaBytes == sizeof(MFVideoArea) && area.Area.cx > 0 && area.Area.cy > 0) {
+                    m_width = static_cast<uint32_t>(area.Area.cx);
+                    m_height = static_cast<uint32_t>(area.Area.cy);
                 }
                 UINT32 stride = 0;
                 if (SUCCEEDED(outType->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride)) && stride > 0) {
                     m_decodedStride = stride;
                 } else {
-                    m_decodedStride = m_width;
+                    m_decodedStride = m_codedWidth;
                 }
                 MFT_OUTPUT_STREAM_INFO osi{};
                 if (SUCCEEDED(m_mft->GetOutputStreamInfo(0, &osi))) {
@@ -871,6 +884,13 @@ bool H264Decoder::ConvertNv12TexToBgraTex(ID3D11Texture2D* nv12Tex, uint32_t sub
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> outView;
     if (FAILED(m_videoDev->CreateVideoProcessorOutputView(outBgraTex, m_vpEnum.Get(), &ovd, &outView))) {
         return false;
+    }
+
+    if (m_width > 0 && m_height > 0 && (inDesc.Width > m_width || inDesc.Height > m_height)) {
+        RECT srcRc{ 0, 0, static_cast<LONG>(std::min(m_width, inDesc.Width)), static_cast<LONG>(std::min(m_height, inDesc.Height)) };
+        m_videoCtx->VideoProcessorSetStreamSourceRect(m_vp.Get(), 0, TRUE, &srcRc);
+    } else {
+        m_videoCtx->VideoProcessorSetStreamSourceRect(m_vp.Get(), 0, FALSE, nullptr);
     }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
@@ -968,8 +988,9 @@ bool H264Decoder::DrainOutputs(ID3D11Texture2D* outBgraTexture,
 
                     if (scan0) {
                         uint32_t stride = static_cast<uint32_t>(std::abs(pitch));
+                        uint32_t planeRows = (m_codedHeight >= m_height && m_codedHeight > 0) ? m_codedHeight : m_height;
                         const uint8_t* yPlane = scan0;
-                        const uint8_t* uvPlane = scan0 + static_cast<size_t>(stride) * m_height;
+                        const uint8_t* uvPlane = scan0 + static_cast<size_t>(stride) * planeRows;
 
                         if (outBgraCpu) {
                             outBgraCpu->resize(static_cast<size_t>(m_width) * m_height * 4);

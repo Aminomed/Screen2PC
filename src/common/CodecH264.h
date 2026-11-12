@@ -130,6 +130,8 @@ private:
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    uint32_t m_codedWidth = 0;
+    uint32_t m_codedHeight = 0;
     uint32_t m_decodedStride = 0;
     bool m_initialized = false;
     bool m_mfStarted = false;

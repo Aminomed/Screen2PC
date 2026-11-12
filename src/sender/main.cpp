@@ -120,7 +120,8 @@ void StartAsyncDiscovery() {
 }
 
 void OnToggleConnect() {
-    if (!g_engine) return;
+    if (!g_engine || !g_hwnd) return;
+    if (!IsWindowEnabled(GetDlgItem(g_hwnd, IDC_BTN_CONNECT))) return;
     if (g_engine->IsConnected()) {
         g_engine->Disconnect();
         UpdateUiFromState();
