@@ -1,0 +1,89 @@
+name: Build & Test Screen2PC (Windows x64)
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore WDK & SDK NuGet packages
+        run: nuget restore .\packages.config -PackagesDirectory .\packages\
+
+      - name: Build Solution (Release|x64)
+        run: msbuild Screen2PC.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Run Automated Unit & Integration Tests
+        run: .\out\Release\x64\Screen2PC.Tests.exe
+
+      - name: Validate INF & Generate Driver Catalog (Inf2Cat)
+        shell: pwsh
+        run: |
+          $drvOut = "out\Release\x64\driver"
+          $infFile = Get-ChildItem -Path $drvOut -Filter "*.inf" -Recurse | Select-Object -First 1
+          if (-not $infFile) { throw "No INF found under $drvOut" }
+          $pkgDir = $infFile.Directory.FullName
+          Write-Host "Driver package dir: $pkgDir"
+
+          $inf2cat = Get-ChildItem -Path "packages" -Filter "Inf2Cat.exe" -Recurse | Select-Object -First 1
+          $infverif = Get-ChildItem -Path "packages" -Filter "infverif.exe" -Recurse | Select-Object -First 1
+
+          if ($infverif) {
+            Write-Host "Running $($infverif.FullName) on $($infFile.FullName)"
+            & $infverif.FullName /v $infFile.FullName
+            if ($LASTEXITCODE -ne 0) { throw "infverif failed with exit code $LASTEXITCODE" }
+          } else {
+            Write-Host "infverif.exe not found in NuGet packages; skipping."
+          }
+
+          if ($inf2cat) {
+            Write-Host "Running $($inf2cat.FullName) /driver:$pkgDir /os:10_VB_X64"
+            & $inf2cat.FullName "/driver:$pkgDir" "/os:10_VB_X64" "/uselocaltime"
+            if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed with exit code $LASTEXITCODE" }
+          } else {
+            Write-Warning "Inf2Cat.exe not found in NuGet packages."
+          }
+
+      - name: Package Release Bundle
+        shell: pwsh
+        run: |
+          $dist = "dist\Screen2PC-Windows-x64"
+          $drvDist = Join-Path $dist "driver"
+          New-Item -ItemType Directory -Path $drvDist -Force | Out-Null
+
+          Copy-Item "out\Release\x64\Screen2PC.Sender.exe" $dist
+          Copy-Item "out\Release\x64\Screen2PC.Receiver.exe" $dist
+          Copy-Item "out\Release\x64\Screen2PC.DriverSetup.exe" $dist
+          Copy-Item "out\Release\x64\Screen2PC.Tests.exe" $dist
+
+          $drvOut = "out\Release\x64\driver"
+          Get-ChildItem -Path $drvOut -Include *.dll,*.inf,*.cat -Recurse | ForEach-Object {
+            Copy-Item $_.FullName $drvDist -Force
+          }
+
+          Copy-Item "scripts\install_driver.ps1" $dist
+          Copy-Item "scripts\uninstall_driver.ps1" $dist
+          Copy-Item "README.md" $dist
+
+          Compress-Archive -Path "$dist\*" -DestinationPath "dist\Screen2PC-Windows-x64.zip" -Force
+          Get-ChildItem -Path $dist -Recurse
+
+      - name: Upload Windows Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Screen2PC-Windows-x64
+          path: dist/Screen2PC-Windows-x64.zip
+          if-no-files-found: error

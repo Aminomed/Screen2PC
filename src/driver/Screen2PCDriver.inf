@@ -1,0 +1,69 @@
+;
+; Screen2PCDriver.inf
+; UMDF v2 Indirect Display Driver (IddCx 1.2+) for Screen2PC Virtual Displays
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = Screen2PCDriver.cat
+DriverVer   = 11/12/2026,1.0.0.0
+PnpLockdown = 0
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...17763
+
+[Standard.NT$ARCH$.10.0...17763]
+%DeviceName% = Screen2PCDriver_Install, Root\Screen2PCVDD
+
+[SourceDisksFiles]
+Screen2PCDriver.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[DestinationDirs]
+UMDriverCopy = 13
+
+[Screen2PCDriver_Install.NT]
+CopyFiles = UMDriverCopy
+
+[Screen2PCDriver_Install.NT.HW]
+AddReg = Screen2PCDriver_HW_AddReg
+
+[Screen2PCDriver_HW_AddReg]
+HKR,, "UpperFilters", 0x00010000, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", 0x00000000, "Screen2PCVDDPool"
+
+[Screen2PCDriver_Install.NT.Services]
+AddService = WUDFRd, 0x000001fa, WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[Screen2PCDriver_Install.NT.Wdf]
+UmdfService              = Screen2PCDriver, Screen2PCDriver_Install_UMDF
+UmdfServiceOrder         = Screen2PCDriver
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing   = ProcessSharingDisabled
+UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
+UmdfExtensions           = IddCx0102
+
+[Screen2PCDriver_Install_UMDF]
+UmdfLibraryVersion = 2.15.0
+ServiceBinary      = %13%\Screen2PCDriver.dll
+
+[UMDriverCopy]
+Screen2PCDriver.dll
+
+[Strings]
+ManufacturerName  = "Screen2PC"
+DiskName          = "Screen2PC Virtual Display Driver Disc"
+DeviceName        = "Screen2PC Virtual Display Adapter"
+WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"

@@ -1,0 +1,13 @@
+.vs/
+x64/
+Win32/
+Release/
+Debug/
+packages/
+*.user
+*.suo
+*.log
+*.tlog
+*.lastbuildstate
+out/
+dist/

@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <SolutionRoot>$(MSBuildThisFileDirectory)</SolutionRoot>
+  </PropertyGroup>
+  <!-- Import WDK + matching SDK NuGet props for the UMDF v2 IddCx driver project -->
+  <Import Project="$(MSBuildThisFileDirectory)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="'$(MSBuildProjectName)' == 'Screen2PC.Driver' and '$(Platform)' == 'x64' and Exists('$(MSBuildThisFileDirectory)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\build\native\Microsoft.Windows.WDK.x64.props')" />
+  <Import Project="$(MSBuildThisFileDirectory)packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.2454\build\native\Microsoft.Windows.SDK.cpp.x64.props"
+          Condition="'$(MSBuildProjectName)' == 'Screen2PC.Driver' and '$(Platform)' == 'x64' and Exists('$(MSBuildThisFileDirectory)packages\Microsoft.Windows.SDK.CPP.x64.10.0.26100.2454\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
+  <Import Project="$(MSBuildThisFileDirectory)packages\Microsoft.Windows.SDK.CPP.10.0.26100.2454\build\native\Microsoft.Windows.SDK.cpp.props"
+          Condition="'$(MSBuildProjectName)' == 'Screen2PC.Driver' and Exists('$(MSBuildThisFileDirectory)packages\Microsoft.Windows.SDK.CPP.10.0.26100.2454\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>
