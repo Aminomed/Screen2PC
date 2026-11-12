@@ -6,7 +6,10 @@
 #>
 $ErrorActionPreference = "Stop"
 
-$RootDir = Split-Path -Parent $PSScriptRoot
+$RootDir = $PSScriptRoot
+if (-not (Test-Path (Join-Path $RootDir "Screen2PC.DriverSetup.exe"))) {
+    $RootDir = Split-Path -Parent $PSScriptRoot
+}
 $DriverDir = Join-Path $RootDir "driver"
 $InfPath = Join-Path $DriverDir "Screen2PCDriver.inf"
 $DllPath = Join-Path $DriverDir "Screen2PCDriver.dll"

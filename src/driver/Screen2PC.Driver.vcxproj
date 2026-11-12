@@ -102,4 +102,8 @@
     <ClCompile Include="Driver.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyDriverOutputToPackageDir" AfterTargets="Link" BeforeTargets="Inf2Cat;CreateCat;DriverPackage" Condition="Exists('$(TargetPath)')">
+    <MakeDir Directories="$(OutDir)$(ProjectName)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(OutDir)$(ProjectName)" SkipUnchangedFiles="true" />
+  </Target>
 </Project>
