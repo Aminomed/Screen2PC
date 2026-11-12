@@ -116,6 +116,8 @@ void CpuNv12ToBgra(const uint8_t* yPlane, uint32_t yStride, const uint8_t* uvPla
 // H264Encoder
 // ============================================================================
 
+H264Encoder::H264Encoder() = default;
+
 H264Encoder::~H264Encoder() {
     Shutdown();
 }
@@ -215,21 +217,35 @@ bool H264Encoder::InitMft(bool tryHardware) {
     MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, MFVideoFormat_H264 };
     UINT32 flags = tryHardware
         ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
-        : (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER);
+        : (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER);
 
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
     HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, nullptr, &outInfo, &activates, &count);
-    if (FAILED(hr) || count == 0 || !activates) {
+    std::vector<Microsoft::WRL::ComPtr<IMFTransform>> candidates;
+    if (SUCCEEDED(hr) && activates) {
+        for (UINT32 idx = 0; idx < count; ++idx) {
+            Microsoft::WRL::ComPtr<IMFTransform> candidate;
+            if (SUCCEEDED(activates[idx]->ActivateObject(IID_PPV_ARGS(&candidate)))) {
+                candidates.push_back(candidate);
+            }
+            activates[idx]->Release();
+        }
+        CoTaskMemFree(activates);
+    }
+    if (!tryHardware && candidates.empty()) {
+        Microsoft::WRL::ComPtr<IMFTransform> msEnc;
+        if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&msEnc)))) {
+            candidates.push_back(msEnc);
+        }
+    }
+    if (candidates.empty()) {
         return false;
     }
 
     bool configured = false;
-    for (UINT32 idx = 0; idx < count; ++idx) {
-        Microsoft::WRL::ComPtr<IMFTransform> candidate;
-        if (FAILED(activates[idx]->ActivateObject(IID_PPV_ARGS(&candidate)))) {
-            continue;
-        }
+    for (auto& candidate : candidates) {
+        if (!candidate) continue;
 
         Microsoft::WRL::ComPtr<IMFAttributes> attrs;
         if (SUCCEEDED(candidate->GetAttributes(&attrs))) {
@@ -357,10 +373,6 @@ bool H264Encoder::InitMft(bool tryHardware) {
         break;
     }
 
-    for (UINT32 i = 0; i < count; ++i) {
-        if (activates[i]) activates[i]->Release();
-    }
-    CoTaskMemFree(activates);
     return configured;
 }
 
@@ -653,6 +665,8 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
 // ============================================================================
 // H264Decoder
 // ============================================================================
+
+H264Decoder::H264Decoder() = default;
 
 H264Decoder::~H264Decoder() {
     Shutdown();

@@ -23,6 +23,23 @@ jobs:
       - name: Restore WDK & SDK NuGet packages
         run: nuget restore .\packages.config -PackagesDirectory .\packages\
 
+      - name: Expose WDK NuGet Tools to MSBuild
+        shell: pwsh
+        run: |
+          $stamp = Get-ChildItem -Path "packages" -Filter "stampinf.exe" -Recurse | Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1
+          if (-not $stamp) {
+            $stamp = Get-ChildItem -Path "packages" -Filter "stampinf.exe" -Recurse | Select-Object -First 1
+          }
+          if ($stamp) {
+            Write-Host "Found stampinf.exe at: $($stamp.FullName)"
+            $stamp.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          $wdkProps = Get-ChildItem -Path "packages" -Filter "Microsoft.Windows.WDK.x64.props" -Recurse | Select-Object -First 1
+          if ($wdkProps) {
+            Write-Host "=== $($wdkProps.FullName) ==="
+            Get-Content $wdkProps.FullName
+          }
+
       - name: Build Solution (Release|x64)
         run: msbuild Screen2PC.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
 

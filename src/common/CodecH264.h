@@ -18,7 +18,7 @@ namespace s2p {
 
 class H264Encoder {
 public:
-    H264Encoder() = default;
+    H264Encoder();
     ~H264Encoder();
 
     H264Encoder(const H264Encoder&) = delete;
@@ -101,7 +101,7 @@ private:
 
 class H264Decoder {
 public:
-    H264Decoder() = default;
+    H264Decoder();
     ~H264Decoder();
 
     H264Decoder(const H264Decoder&) = delete;
