@@ -10,7 +10,7 @@ ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
 CatalogFile = Screen2PCDriver.cat
 DriverVer   = 11/12/2026,1.0.0.0
-PnpLockdown = 0
+PnpLockdown = 1
 
 [Manufacturer]
 %ManufacturerName% = Standard,NT$ARCH$.10.0...17763

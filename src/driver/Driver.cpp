@@ -65,8 +65,11 @@ struct IndirectMonitorContextWrapper {
 
 } // namespace s2p::vdd
 
-WDF_DECLARE_CONTEXT_TYPE(s2p::vdd::IndirectDeviceContextWrapper);
-WDF_DECLARE_CONTEXT_TYPE(s2p::vdd::IndirectMonitorContextWrapper);
+using IndirectDeviceContextWrapper = s2p::vdd::IndirectDeviceContextWrapper;
+using IndirectMonitorContextWrapper = s2p::vdd::IndirectMonitorContextWrapper;
+
+WDF_DECLARE_CONTEXT_TYPE(IndirectDeviceContextWrapper);
+WDF_DECLARE_CONTEXT_TYPE(IndirectMonitorContextWrapper);
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD Screen2PCDeviceAdd;
@@ -113,7 +116,7 @@ NTSTATUS Screen2PCDeviceAdd(WDFDRIVER, PWDFDEVICE_INIT pDeviceInit) {
     if (!NT_SUCCESS(status)) return status;
 
     WDF_OBJECT_ATTRIBUTES attr;
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, s2p::vdd::IndirectDeviceContextWrapper);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, IndirectDeviceContextWrapper);
     attr.EvtCleanupCallback = [](WDFOBJECT obj) {
         auto* w = WdfObjectGet_IndirectDeviceContextWrapper(obj);
         if (w) w->Cleanup();
