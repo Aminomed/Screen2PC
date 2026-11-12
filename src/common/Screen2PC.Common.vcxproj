@@ -64,12 +64,14 @@
     <ClInclude Include="NetSocket.h" />
     <ClInclude Include="CodecDelta.h" />
     <ClInclude Include="CodecH264.h" />
+    <ClInclude Include="ClipboardSync.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="NetSocket.cpp" />
     <ClCompile Include="CodecDelta.cpp" />
     <ClCompile Include="CodecH264.cpp" />
+    <ClCompile Include="ClipboardSync.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -235,6 +235,10 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     }
 
     m_connected = true;
+    m_clipboard.SetEnabled(m_clipboardEnabled.load());
+    m_clipboard.Start([this](uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
+        SendClipboardData(kind, hash64, data);
+    });
     m_controlThread = std::thread(&SenderEngine::ControlLoop, this);
 
     {
@@ -404,6 +408,13 @@ void SenderEngine::ControlLoop() {
                     Logger::Instance().Info("SND-CTL", L"Receiver requested StopSession.");
                     m_stop = true;
                     break;
+                } else if (hdr.type == static_cast<uint16_t>(MsgType::ClipboardSync) &&
+                           payload.size() >= sizeof(ClipboardHeader)) {
+                    ClipboardHeader ch{};
+                    std::memcpy(&ch, payload.data(), sizeof(ch));
+                    if (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize) {
+                        m_clipboard.ApplyRemote(ch.kind, ch.hash64, payload.data() + sizeof(ch), ch.dataSize);
+                    }
                 }
             } else {
                 int err = WSAGetLastError();
@@ -432,6 +443,17 @@ void SenderEngine::ControlLoop() {
         m_status.connected = false;
         m_status.stateText = L"Getrennt";
     }
+}
+
+void SenderEngine::SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
+    if (!m_clipboardEnabled.load() || !m_connected.load() || data.empty() || data.size() > kMaxClipboardBytes) return;
+    std::lock_guard<std::mutex> lock(m_controlSendMutex);
+    if (!m_controlSock.IsValid()) return;
+    ClipboardHeader ch{ kind, hash64, static_cast<uint32_t>(data.size()) };
+    std::vector<uint8_t> pkt(sizeof(ch) + data.size());
+    std::memcpy(pkt.data(), &ch, sizeof(ch));
+    std::memcpy(pkt.data() + sizeof(ch), data.data(), data.size());
+    m_controlSock.SendPacket(MsgType::ClipboardSync, pkt.data(), static_cast<uint32_t>(pkt.size()));
 }
 
 void SenderEngine::RunStreamWorker(StreamWorker* w) {
@@ -613,6 +635,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 void SenderEngine::Disconnect() {
     m_stop = true;
     m_connected = false;
+    m_clipboard.Stop();
 
     if (m_controlSock.IsValid()) {
         {

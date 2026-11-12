@@ -282,6 +282,11 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
                              L") - " + std::to_wstring(streamCount) + L" Display(s)";
     }
 
+    m_clipboard.SetEnabled(m_clipboardEnabled.load());
+    m_clipboard.Start([this](uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
+        SendClipboardData(kind, hash64, data);
+    });
+
     auto lastHeartbeat = std::chrono::steady_clock::now();
     while (!m_stop && !m_sessionStop && m_activeCtrlSock.IsValid()) {
         int wr = m_activeCtrlSock.WaitReadable(50);
@@ -304,6 +309,13 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
             if (chdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
                 Logger::Instance().Info("RCV-CTL", L"Sender closed session.");
                 break;
+            } else if (chdr.type == static_cast<uint16_t>(MsgType::ClipboardSync) &&
+                       cpayload.size() >= sizeof(ClipboardHeader)) {
+                ClipboardHeader ch{};
+                std::memcpy(&ch, cpayload.data(), sizeof(ch));
+                if (ch.dataSize > 0 && cpayload.size() >= sizeof(ch) + ch.dataSize) {
+                    m_clipboard.ApplyRemote(ch.kind, ch.hash64, cpayload.data() + sizeof(ch), ch.dataSize);
+                }
             }
         } else {
             int err = WSAGetLastError();
@@ -315,6 +327,17 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     }
 
     DisconnectSession();
+}
+
+void ReceiverEngine::SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
+    if (!m_clipboardEnabled.load() || m_sessionStop || data.empty() || data.size() > kMaxClipboardBytes) return;
+    std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
+    if (!m_activeCtrlSock.IsValid()) return;
+    ClipboardHeader ch{ kind, hash64, static_cast<uint32_t>(data.size()) };
+    std::vector<uint8_t> pkt(sizeof(ch) + data.size());
+    std::memcpy(pkt.data(), &ch, sizeof(ch));
+    std::memcpy(pkt.data() + sizeof(ch), data.data(), data.size());
+    m_activeCtrlSock.SendPacket(MsgType::ClipboardSync, pkt.data(), static_cast<uint32_t>(pkt.size()));
 }
 
 void ReceiverEngine::RequestKeyframe(uint32_t monitorIndex) {
@@ -489,6 +512,7 @@ void ReceiverEngine::StopStreamWorkers() {
 
 void ReceiverEngine::DisconnectSession() {
     m_sessionStop = true;
+    m_clipboard.Stop();
     {
         std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
         if (m_activeCtrlSock.IsValid()) {

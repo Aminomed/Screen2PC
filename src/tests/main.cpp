@@ -15,6 +15,7 @@
 #include "../common/NetSocket.h"
 #include "../common/CodecDelta.h"
 #include "../common/CodecH264.h"
+#include "../common/ClipboardSync.h"
 
 namespace {
 
@@ -238,6 +239,33 @@ void TestLoopbackNetworking() {
     std::cout << "[PASS] TestLoopbackNetworking\n";
 }
 
+void TestClipboardSync() {
+    const wchar_t text1[] = L"Hallo Screen2PC Zwischenablage!";
+    const wchar_t text2[] = L"Anderer Text";
+
+    uint64_t h1 = s2p::ClipboardSync::ComputeHash64(text1, sizeof(text1));
+    uint64_t h1Again = s2p::ClipboardSync::ComputeHash64(text1, sizeof(text1));
+    uint64_t h2 = s2p::ClipboardSync::ComputeHash64(text2, sizeof(text2));
+
+    CHECK(h1 != 0, "Clipboard hash must be non-zero");
+    CHECK(h1 == h1Again, "Clipboard hash must be deterministic");
+    CHECK(h1 != h2, "Different clipboard contents collided unexpectedly");
+
+    // Anti-echo loop test
+    CHECK(!s2p::ClipboardSync::ShouldEmit(h1, h1), "Remote-applied clipboard hash echoed back");
+    CHECK(!s2p::ClipboardSync::ShouldEmit(0, h1), "Zero hash must not emit");
+    CHECK(s2p::ClipboardSync::ShouldEmit(h2, h1), "New local clipboard content was suppressed");
+
+    // ClipboardHeader struct serialization check
+    s2p::ClipboardHeader ch{};
+    ch.kind = s2p::kClipKindText;
+    ch.hash64 = h1;
+    ch.dataSize = sizeof(text1);
+    CHECK(sizeof(ch) == 16, "Unexpected ClipboardHeader packed size");
+
+    std::cout << "[PASS] TestClipboardSync\n";
+}
+
 } // namespace
 
 int main() {
@@ -250,6 +278,7 @@ int main() {
     TestDeltaCodec();
     TestColorAndH264();
     TestLoopbackNetworking();
+    TestClipboardSync();
 
     CoUninitialize();
 

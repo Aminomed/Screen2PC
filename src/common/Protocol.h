@@ -39,7 +39,10 @@ enum class MsgType : uint16_t {
     // TCP Video Stream (on stream socket)
     VideoFrame       = 20,
     CursorUpdate     = 21,
-    StreamEnd        = 22
+    StreamEnd        = 22,
+
+    // TCP Control - Shared Clipboard & KVM (Phase 2/3)
+    ClipboardSync    = 30
 };
 
 enum FrameFlags : uint32_t {
@@ -150,6 +153,12 @@ struct CursorUpdateHeader {
     uint32_t shapePitch;
     uint32_t hotX;
     uint32_t hotY;
+    uint32_t dataSize;
+};
+
+struct ClipboardHeader {
+    uint32_t kind;     // 1 = UTF-16LE text, 2 = CF_DIB image
+    uint64_t hash64;
     uint32_t dataSize;
 };
 

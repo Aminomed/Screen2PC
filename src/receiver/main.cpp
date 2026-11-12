@@ -28,6 +28,7 @@ constexpr int IDC_CHK_FULLSCR  = 202;
 constexpr int IDC_BTN_DISCONN  = 203;
 constexpr int IDC_STATS_TEXT   = 204;
 constexpr int IDC_BTN_FIREWALL = 205;
+constexpr int IDC_CHK_CLIPBOARD= 206;
 
 constexpr int IDM_SHOW = 3001;
 constexpr int IDM_EXIT = 3002;
@@ -52,6 +53,14 @@ bool LoadFullscreenPref() {
 
 void SaveFullscreenPref(bool fs) {
     WritePrivateProfileStringW(L"Receiver", L"StartFullscreen", fs ? L"1" : L"0", GetReceiverIniPath().c_str());
+}
+
+bool LoadClipboardPref() {
+    return GetPrivateProfileIntW(L"Receiver", L"ClipboardSync", 1, GetReceiverIniPath().c_str()) != 0;
+}
+
+void SaveClipboardPref(bool enabled) {
+    WritePrivateProfileStringW(L"Receiver", L"ClipboardSync", enabled ? L"1" : L"0", GetReceiverIniPath().c_str());
 }
 
 void UpdateUi() {
@@ -121,10 +130,16 @@ void CreateUiControls(HWND hwnd) {
                        BS_AUTOCHECKBOX | WS_TABSTOP, 16, 94, 520, 24, IDC_CHK_FULLSCR);
     SendMessageW(chk, BM_SETCHECK, LoadFullscreenPref() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, 16, 128, 250, 32, IDC_BTN_DISCONN);
-    addCtrl(L"BUTTON", L"Windows Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, 276, 128, 260, 32, IDC_BTN_FIREWALL);
+    HWND chkClip = addCtrl(L"BUTTON", L"Geteilte Zwischenablage (Text && Bilder zwischen Surface <-> PC)",
+                           BS_AUTOCHECKBOX | WS_TABSTOP, 16, 122, 520, 24, IDC_CHK_CLIPBOARD);
+    bool clipPref = LoadClipboardPref();
+    SendMessageW(chkClip, BM_SETCHECK, clipPref ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_engine) g_engine->SetClipboardEnabled(clipPref);
 
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 172, 520, 160, IDC_STATS_TEXT, g_monoFont);
+    addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, 16, 156, 250, 32, IDC_BTN_DISCONN);
+    addCtrl(L"BUTTON", L"Windows Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, 276, 156, 260, 32, IDC_BTN_FIREWALL);
+
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 200, 520, 160, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -164,6 +179,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_FULLSCR, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 g_engine->SetStartFullscreen(checked);
                 SaveFullscreenPref(checked);
+            }
+            return 0;
+        case IDC_CHK_CLIPBOARD:
+            if (g_engine) {
+                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_CLIPBOARD, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_engine->SetClipboardEnabled(checked);
+                SaveClipboardPref(checked);
             }
             return 0;
         case IDC_BTN_DISCONN:
@@ -232,6 +254,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     s2p::ReceiverEngine engine;
     g_engine = &engine;
+    engine.SetClipboardEnabled(LoadClipboardPref());
     if (!engine.Start(LoadFullscreenPref())) {
         MessageBoxW(nullptr, L"Konnte Receiver-Port 48211 nicht oeffnen (evtl. laeuft Screen2PC Receiver bereits).",
                     L"Screen2PC Receiver", MB_ICONERROR);
@@ -251,7 +274,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Screen2PC Receiver (PC - Treiberfrei)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 570, 388,
+        CW_USEDEFAULT, CW_USEDEFAULT, 570, 418,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

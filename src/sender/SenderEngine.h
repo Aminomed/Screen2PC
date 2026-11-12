@@ -15,6 +15,7 @@
 #include "../common/NetSocket.h"
 #include "../common/CodecH264.h"
 #include "../common/CodecDelta.h"
+#include "../common/ClipboardSync.h"
 #include "DxgiCapture.h"
 
 namespace s2p {
@@ -72,8 +73,10 @@ public:
 
     SenderStatus GetStatus() const;
     bool IsConnected() const { return m_connected.load(); }
+    void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
 
 private:
+    void SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data);
     struct StreamWorker {
         uint32_t targetPcMonitor = 0;
         uint32_t adapterIndex = 0;
@@ -109,11 +112,13 @@ private:
 
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_connected{false};
+    std::atomic<bool> m_clipboardEnabled{true};
     bool m_createdVirtualDisplays = false;
 
     TcpSocket m_controlSock;
     std::mutex m_controlSendMutex;
     std::thread m_controlThread;
+    ClipboardSync m_clipboard;
     std::vector<std::unique_ptr<StreamWorker>> m_workers;
 };
 

@@ -39,6 +39,7 @@ constexpr int IDC_BTN_CONNECT  = 107;
 constexpr int IDC_STATUS_LABEL = 108;
 constexpr int IDC_DRIVER_LABEL = 109;
 constexpr int IDC_STATS_TEXT   = 110;
+constexpr int IDC_CHK_CLIPBOARD= 111;
 
 constexpr int IDM_SHOW   = 2001;
 constexpr int IDM_TOGGLE = 2002;
@@ -227,9 +228,15 @@ void CreateUiControls(HWND hwnd) {
 
     addCtrl(L"BUTTON", L"Verbinden (Ctrl+Shift+K)", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 178, 480, 34, IDC_BTN_CONNECT);
 
-    addCtrl(L"STATIC", L"", 0, 16, 222, 480, 36, IDC_DRIVER_LABEL);
-    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 260, 480, 40, IDC_STATUS_LABEL);
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 304, 480, 120, IDC_STATS_TEXT, g_monoFont);
+    HWND chkClip = addCtrl(L"BUTTON", L"Geteilte Zwischenablage (Text && Bilder zwischen Surface <-> PC)",
+                           BS_AUTOCHECKBOX | WS_TABSTOP, 16, 220, 480, 22, IDC_CHK_CLIPBOARD);
+    bool clipEnabled = LoadSetting(L"ClipboardSync", 1) != 0;
+    SendMessageW(chkClip, BM_SETCHECK, clipEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_engine) g_engine->SetClipboardEnabled(clipEnabled);
+
+    addCtrl(L"STATIC", L"", 0, 16, 250, 480, 36, IDC_DRIVER_LABEL);
+    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 288, 480, 40, IDC_STATUS_LABEL);
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 332, 480, 120, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -274,6 +281,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BTN_CONNECT:
         case IDM_TOGGLE:
             OnToggleConnect();
+            return 0;
+        case IDC_CHK_CLIPBOARD:
+            if (g_engine) {
+                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_CLIPBOARD, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_engine->SetClipboardEnabled(checked);
+                SaveSetting(L"ClipboardSync", checked ? 1 : 0);
+            }
             return 0;
         case IDC_PEER_COMBO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
@@ -390,7 +404,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Screen2PC Sender (Surface)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 530, 476,
+        CW_USEDEFAULT, CW_USEDEFAULT, 530, 504,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

@@ -13,6 +13,7 @@
 
 #include "../common/Protocol.h"
 #include "../common/NetSocket.h"
+#include "../common/ClipboardSync.h"
 
 namespace s2p {
 
@@ -52,10 +53,12 @@ public:
     void Stop();
     void DisconnectSession();
     void SetStartFullscreen(bool fs) { m_startFullscreen = fs; }
+    void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
 
     ReceiverStatus GetStatus() const;
 
 private:
+    void SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data);
     struct StreamReceiverWorker {
         uint32_t monitorIndex = 0;
         uint16_t port = kPortStreamBase;
@@ -83,6 +86,7 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_sessionStop{false};
     std::atomic<bool> m_startFullscreen{true};
+    std::atomic<bool> m_clipboardEnabled{true};
 
     UdpSocket m_discoverySock;
     TcpSocket m_controlListenSock;
@@ -91,6 +95,8 @@ private:
 
     std::mutex m_ctrlSendMutex;
     TcpSocket m_activeCtrlSock;
+
+    ClipboardSync m_clipboard;
 
     mutable std::mutex m_stateMutex;
     ReceiverStatus m_status;
