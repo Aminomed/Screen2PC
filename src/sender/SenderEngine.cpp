@@ -173,10 +173,11 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     uint32_t streamCount = static_cast<uint32_t>(std::min<size_t>(captureOutputs.size(), kMaxMonitors));
     startReq.streamCount = streamCount;
     for (uint32_t i = 0; i < streamCount; ++i) {
-        startReq.streams[i].monitorIndex = i;
+        uint32_t targetPcMon = (cfg.mode == DisplayMode::ExtendSecondary && helloResp.monitorCount >= 2) ? 1u : i;
+        startReq.streams[i].monitorIndex = targetPcMon;
         startReq.streams[i].width = captureOutputs[i].width;
         startReq.streams[i].height = captureOutputs[i].height;
-        startReq.streams[i].refreshHz = (helloResp.monitors[i].refreshHz > 0) ? helloResp.monitors[i].refreshHz : cfg.targetFps;
+        startReq.streams[i].refreshHz = (helloResp.monitors[targetPcMon].refreshHz > 0) ? helloResp.monitors[targetPcMon].refreshHz : cfg.targetFps;
         startReq.streams[i].codec = static_cast<uint8_t>(cfg.codec);
         startReq.streams[i].bitrateMbps = cfg.bitrateMbps;
     }
@@ -213,7 +214,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     // Spawn per-monitor capture/encode/stream workers
     for (uint32_t i = 0; i < streamCount; ++i) {
         auto w = std::make_unique<StreamWorker>();
-        w->targetPcMonitor = i;
+        w->targetPcMonitor = startReq.streams[i].monitorIndex;
         w->adapterIndex = captureOutputs[i].adapterIndex;
         w->outputIndex = captureOutputs[i].outputIndex;
         w->width = captureOutputs[i].width;
@@ -224,7 +225,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->targetFps = cfg.targetFps;
         w->peerIp = cfg.targetIp;
         w->streamPort = static_cast<uint16_t>(kPortStreamBase + i);
-        w->stats.monitorIndex = i;
+        w->stats.monitorIndex = startReq.streams[i].monitorIndex;
         w->stats.width = w->width;
         w->stats.height = w->height;
 
@@ -277,12 +278,15 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
                                 : 1u;
     if (desiredCount == 0) desiredCount = 1;
 
+    uint32_t startMonIdx = (cfg.mode == DisplayMode::ExtendSecondary && hello.monitorCount >= 2) ? 1u : 0u;
+
     std::vector<vdd::VddMonitorSpec> specs;
     for (uint32_t i = 0; i < desiredCount; ++i) {
+        uint32_t srcIdx = std::min<uint32_t>(startMonIdx + i, hello.monitorCount - 1);
         vdd::VddMonitorSpec s{};
-        s.width = hello.monitors[i].width ? hello.monitors[i].width : 1920;
-        s.height = hello.monitors[i].height ? hello.monitors[i].height : 1080;
-        s.refreshHz = hello.monitors[i].refreshHz ? hello.monitors[i].refreshHz : cfg.targetFps;
+        s.width = hello.monitors[srcIdx].width ? hello.monitors[srcIdx].width : 1920;
+        s.height = hello.monitors[srcIdx].height ? hello.monitors[srcIdx].height : 1080;
+        s.refreshHz = hello.monitors[srcIdx].refreshHz ? hello.monitors[srcIdx].refreshHz : cfg.targetFps;
         if (s.refreshHz < 30 || s.refreshHz > 240) s.refreshHz = 60;
         specs.push_back(s);
     }
@@ -301,8 +305,17 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
     m_createdVirtualDisplays = true;
 
     // Poll DXGI outputs until the virtual displays appear in Windows Display Manager
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+    const auto startPoll = std::chrono::steady_clock::now();
+    const auto deadline = startPoll + std::chrono::milliseconds(5500);
+    bool forcedExtend = false;
+
     while (std::chrono::steady_clock::now() < deadline && !m_stop) {
+        if (!forcedExtend && std::chrono::steady_clock::now() - startPoll > std::chrono::milliseconds(1600)) {
+            forcedExtend = true;
+            // Ensure Windows topology is in Extend mode instead of Duplicate / PC-screen-only
+            SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+        }
+
         auto after = DxgiCapture::EnumerateOutputs();
         std::vector<DisplayOutputInfo> candidates;
 
@@ -332,7 +345,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
         }
 
         if (candidates.size() >= desiredCount) {
-            // Order candidates to match requested spec resolutions as closely as possible
+            outSelectedOutputs.clear();
             for (const auto& s : specs) {
                 auto it = std::find_if(candidates.begin(), candidates.end(), [&](const DisplayOutputInfo& c) {
                     bool used = std::any_of(outSelectedOutputs.begin(), outSelectedOutputs.end(), [&](const DisplayOutputInfo& u) {
@@ -368,28 +381,37 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
 void SenderEngine::ControlLoop() {
     auto lastHeartbeat = std::chrono::steady_clock::now();
     while (!m_stop && m_controlSock.IsValid()) {
-        PacketHeader hdr{};
-        std::vector<uint8_t> payload;
-        if (m_controlSock.RecvPacket(hdr, payload)) {
-            if (hdr.type == static_cast<uint16_t>(MsgType::RequestKeyframe) &&
-                payload.size() >= sizeof(RequestKeyframePayload)) {
-                RequestKeyframePayload req{};
-                std::memcpy(&req, payload.data(), sizeof(req));
-                if (req.monitorIndex < m_workers.size()) {
-                    m_workers[req.monitorIndex]->forceKeyframe = true;
+        int wr = m_controlSock.WaitReadable(50);
+        if (wr < 0) {
+            Logger::Instance().Warn("SND-CTL", L"Control socket closed during wait.");
+            m_stop = true;
+            break;
+        }
+        if (wr > 0) {
+            PacketHeader hdr{};
+            std::vector<uint8_t> payload;
+            if (m_controlSock.RecvPacket(hdr, payload)) {
+                if (hdr.type == static_cast<uint16_t>(MsgType::RequestKeyframe) &&
+                    payload.size() >= sizeof(RequestKeyframePayload)) {
+                    RequestKeyframePayload req{};
+                    std::memcpy(&req, payload.data(), sizeof(req));
+                    for (auto& w : m_workers) {
+                        if (w->targetPcMonitor == req.monitorIndex) {
+                            w->forceKeyframe = true;
+                        }
+                    }
+                } else if (hdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
+                    Logger::Instance().Info("SND-CTL", L"Receiver requested StopSession.");
+                    m_stop = true;
+                    break;
                 }
-            } else if (hdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
-                Logger::Instance().Info("SND-CTL", L"Receiver requested StopSession.");
-                m_stop = true;
-                break;
-            }
-        } else {
-            // Timeout or socket error? Only break if socket disconnected or fatal
-            int err = WSAGetLastError();
-            if (err != WSAETIMEDOUT && err != 0) {
-                Logger::Instance().Warn("SND-CTL", L"Control socket closed, wsa=" + std::to_wstring(err));
-                m_stop = true;
-                break;
+            } else {
+                int err = WSAGetLastError();
+                if (err != WSAETIMEDOUT && err != 0) {
+                    Logger::Instance().Warn("SND-CTL", L"Control socket closed, wsa=" + std::to_wstring(err));
+                    m_stop = true;
+                    break;
+                }
             }
         }
 
@@ -433,7 +455,15 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     sock.SetTimeouts(4000, 4000);
 
     DxgiCapture capture;
-    if (!capture.Init(w->adapterIndex, w->outputIndex)) {
+    bool capOk = false;
+    for (int retry = 0; retry < 5 && !m_stop && !w->stop; ++retry) {
+        if (capture.Init(w->adapterIndex, w->outputIndex)) {
+            capOk = true;
+            break;
+        }
+        Sleep(200);
+    }
+    if (!capOk) {
         Logger::Instance().Error("SND-WRK", L"DxgiCapture::Init failed for adapter=" +
                                  std::to_wstring(w->adapterIndex) + L" output=" + std::to_wstring(w->outputIndex));
         return;
@@ -454,6 +484,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
     DeltaEncoder delta;
     std::vector<uint8_t> encodedPayload;
+    std::vector<uint8_t> sendPkt;
     std::vector<uint8_t> cpuBgra;
     uint32_t cpuStride = 0;
     uint64_t frameIndex = 0;
@@ -501,12 +532,12 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             ch.hotY = cursor.hotY;
             ch.dataSize = cursor.shapeChanged ? static_cast<uint32_t>(cursor.shapeData.size()) : 0;
 
-            std::vector<uint8_t> pkt(sizeof(CursorUpdateHeader) + ch.dataSize);
-            std::memcpy(pkt.data(), &ch, sizeof(CursorUpdateHeader));
+            sendPkt.resize(sizeof(CursorUpdateHeader) + ch.dataSize);
+            std::memcpy(sendPkt.data(), &ch, sizeof(CursorUpdateHeader));
             if (ch.dataSize > 0) {
-                std::memcpy(pkt.data() + sizeof(CursorUpdateHeader), cursor.shapeData.data(), ch.dataSize);
+                std::memcpy(sendPkt.data() + sizeof(CursorUpdateHeader), cursor.shapeData.data(), ch.dataSize);
             }
-            if (!sock.SendPacket(MsgType::CursorUpdate, pkt.data(), static_cast<uint32_t>(pkt.size()))) {
+            if (!sock.SendPacket(MsgType::CursorUpdate, sendPkt.data(), static_cast<uint32_t>(sendPkt.size()))) {
                 break;
             }
         }
@@ -520,9 +551,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             if (activeCodec == CodecType::H264) {
                 if (needKey) h264.RequestKeyframe();
                 encodeOk = h264.EncodeTexture(capture.FrameTexture(), NowUs(), encodedPayload, isKeyframe);
-                if (!encodeOk && !h264.IsHardware()) {
-                    // Nothing yet if priming
-                }
             } else {
                 if (capture.CopyFrameToCpu(cpuBgra, cpuStride)) {
                     encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
@@ -541,17 +569,17 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 vh.flags = (isKeyframe ? kFrameFlagKeyframe : kFrameFlagNone);
                 vh.dataSize = static_cast<uint32_t>(encodedPayload.size());
 
-                std::vector<uint8_t> pkt(sizeof(VideoFrameHeader) + encodedPayload.size());
-                std::memcpy(pkt.data(), &vh, sizeof(VideoFrameHeader));
-                std::memcpy(pkt.data() + sizeof(VideoFrameHeader), encodedPayload.data(), encodedPayload.size());
+                sendPkt.resize(sizeof(VideoFrameHeader) + encodedPayload.size());
+                std::memcpy(sendPkt.data(), &vh, sizeof(VideoFrameHeader));
+                std::memcpy(sendPkt.data() + sizeof(VideoFrameHeader), encodedPayload.data(), encodedPayload.size());
 
-                if (!sock.SendPacket(MsgType::VideoFrame, pkt.data(), static_cast<uint32_t>(pkt.size()))) {
+                if (!sock.SendPacket(MsgType::VideoFrame, sendPkt.data(), static_cast<uint32_t>(sendPkt.size()))) {
                     Logger::Instance().Warn("SND-WRK", L"SendPacket(VideoFrame) failed on monitor " + std::to_wstring(w->targetPcMonitor));
                     break;
                 }
                 sentInitialFrame = true;
                 ++windowFrames;
-                windowBytes += pkt.size() + sizeof(PacketHeader);
+                windowBytes += sendPkt.size() + sizeof(PacketHeader);
             }
         }
 

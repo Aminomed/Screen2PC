@@ -241,11 +241,16 @@ void IndirectMonitorContext::UnassignSwapChain() {
     m_processingThread.reset();
 }
 
+static std::atomic<IndirectDeviceContext*> g_lastDeviceCtx{ nullptr };
+
 IndirectDeviceContext::IndirectDeviceContext(WDFDEVICE wdfDevice) : m_wdfDevice(wdfDevice) {
     m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_lastDeviceCtx.store(this);
 }
 
 IndirectDeviceContext::~IndirectDeviceContext() {
+    IndirectDeviceContext* expected = this;
+    g_lastDeviceCtx.compare_exchange_strong(expected, nullptr);
     StopPipeServer();
     if (m_stopEvent) {
         CloseHandle(m_stopEvent);
@@ -279,6 +284,8 @@ void IndirectDeviceContext::InitAdapter() {
     init.WdfDevice = m_wdfDevice;
     init.pCaps = &caps;
     init.ObjectAttributes = &attr;
+
+    g_lastDeviceCtx.store(this);
 
     IDARG_OUT_ADAPTER_INIT initOut{};
     NTSTATUS status = IddCxAdapterInitAsync(&init, &initOut);
@@ -365,7 +372,7 @@ DWORD IndirectDeviceContext::ApplyMonitorConfig(uint32_t count, const VddMonitor
         st = IddCxMonitorArrival(mcOut.MonitorObject, &arrOut);
         if (!NT_SUCCESS(st)) {
             OutputDebugStringW(L"Screen2PCDriver: IddCxMonitorArrival failed\n");
-            IddCxMonitorDeparture(mcOut.MonitorObject);
+            WdfObjectDelete(mcOut.MonitorObject);
             return static_cast<DWORD>(st);
         }
         m_monitors.push_back(mcOut.MonitorObject);
@@ -487,8 +494,9 @@ void IndirectDeviceContext::RunPipeServer() {
 _Use_decl_annotations_
 NTSTATUS Screen2PCAdapterInitFinished(IDDCX_ADAPTER adapterObject, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs) {
     auto* w = WdfObjectGet_IndirectDeviceContextWrapper(adapterObject);
-    if (w && w->pContext) {
-        w->pContext->OnAdapterInitFinished(pInArgs->AdapterInitStatus);
+    s2p::vdd::IndirectDeviceContext* ctx = (w && w->pContext) ? w->pContext : s2p::vdd::g_lastDeviceCtx.load();
+    if (ctx) {
+        ctx->OnAdapterInitFinished(pInArgs->AdapterInitStatus);
     }
     return STATUS_SUCCESS;
 }

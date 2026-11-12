@@ -138,6 +138,7 @@ void H264Encoder::Shutdown() {
     m_videoDev.Reset();
     m_nv12Tex.Reset();
     m_stagingNv12.Reset();
+    m_fallbackStagingBgra.Reset();
     m_dxgiMgr.Reset();
     m_context.Reset();
     m_device.Reset();
@@ -477,18 +478,28 @@ bool H264Encoder::EncodeTexture(ID3D11Texture2D* bgraTexture,
     // CPU fallback if VideoProcessor unavailable
     D3D11_TEXTURE2D_DESC desc{};
     bgraTexture->GetDesc(&desc);
-    D3D11_TEXTURE2D_DESC st = desc;
-    st.Usage = D3D11_USAGE_STAGING;
-    st.BindFlags = 0;
-    st.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    st.MiscFlags = 0;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
-    if (FAILED(m_device->CreateTexture2D(&st, nullptr, &staging))) return false;
-    m_context->CopyResource(staging.Get(), bgraTexture);
+    bool needCreate = !m_fallbackStagingBgra;
+    if (!needCreate) {
+        D3D11_TEXTURE2D_DESC cur{};
+        m_fallbackStagingBgra->GetDesc(&cur);
+        if (cur.Width != desc.Width || cur.Height != desc.Height || cur.Format != desc.Format) {
+            m_fallbackStagingBgra.Reset();
+            needCreate = true;
+        }
+    }
+    if (needCreate) {
+        D3D11_TEXTURE2D_DESC st = desc;
+        st.Usage = D3D11_USAGE_STAGING;
+        st.BindFlags = 0;
+        st.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        st.MiscFlags = 0;
+        if (FAILED(m_device->CreateTexture2D(&st, nullptr, &m_fallbackStagingBgra))) return false;
+    }
+    m_context->CopyResource(m_fallbackStagingBgra.Get(), bgraTexture);
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(m_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    if (FAILED(m_context->Map(m_fallbackStagingBgra.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
     CpuBgraToNv12(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch, m_width, m_height, m_cpuNv12.data());
-    m_context->Unmap(staging.Get(), 0);
+    m_context->Unmap(m_fallbackStagingBgra.Get(), 0);
     return EncodeNv12TextureOrBuffer(nullptr, m_cpuNv12.data(), m_width, timestampUs, outAnnexB, outIsKeyframe);
 }
 

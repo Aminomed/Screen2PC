@@ -146,6 +146,7 @@ void D3D11Renderer::Destroy() {
     m_cursorTex.Reset();
     m_frameSrv.Reset();
     m_frameTex.Reset();
+    m_quadCb.Reset();
     m_alphaBlend.Reset();
     m_sampler.Reset();
     m_ps.Reset();
@@ -225,6 +226,13 @@ bool D3D11Renderer::CreateDeviceAndShaders() {
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     if (FAILED(m_device->CreateBlendState(&bd, &m_alphaBlend))) return false;
 
+    D3D11_BUFFER_DESC cbd{};
+    cbd.ByteWidth = sizeof(QuadCB);
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(m_device->CreateBuffer(&cbd, nullptr, &m_quadCb))) return false;
+
     return true;
 }
 
@@ -275,6 +283,7 @@ void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
             m_device->CreateRenderTargetView(backBuf.Get(), nullptr, &m_rtv);
         }
     }
+    m_needRepaint = true;
 }
 
 bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
@@ -483,15 +492,13 @@ void D3D11Renderer::Present() {
     }
 
     auto drawQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, bool blend) {
-        QuadCB cb{ x, y, w, h };
-        D3D11_BUFFER_DESC cbd{};
-        cbd.ByteWidth = sizeof(cb);
-        cbd.Usage = D3D11_USAGE_IMMUTABLE;
-        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        D3D11_SUBRESOURCE_DATA init{ &cb, 0, 0 };
-        ComPtr<ID3D11Buffer> cbuf;
-        if (SUCCEEDED(m_device->CreateBuffer(&cbd, &init, &cbuf))) {
-            m_context->VSSetConstantBuffers(0, 1, cbuf.GetAddressOf());
+        if (!m_quadCb) return;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(m_context->Map(m_quadCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            QuadCB cb{ x, y, w, h };
+            std::memcpy(mapped.pData, &cb, sizeof(cb));
+            m_context->Unmap(m_quadCb.Get(), 0);
+            m_context->VSSetConstantBuffers(0, 1, m_quadCb.GetAddressOf());
             m_context->PSSetShaderResources(0, 1, &srv);
             m_context->OMSetBlendState(blend ? m_alphaBlend.Get() : nullptr, nullptr, 0xFFFFFFFF);
             m_context->Draw(4, 0);
@@ -514,6 +521,13 @@ void D3D11Renderer::Present() {
 
 LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        m_needRepaint = true;
+        return 0;
+    }
     case WM_SIZE: {
         UINT w = LOWORD(lp);
         UINT h = HIWORD(lp);

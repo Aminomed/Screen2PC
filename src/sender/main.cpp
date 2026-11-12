@@ -60,6 +60,14 @@ std::wstring GetIniPath() {
     return dir + L"\\sender.ini";
 }
 
+void SaveSetting(const wchar_t* key, int val) {
+    WritePrivateProfileStringW(L"Sender", key, std::to_wstring(val).c_str(), GetIniPath().c_str());
+}
+
+int LoadSetting(const wchar_t* key, int defVal) {
+    return GetPrivateProfileIntW(L"Sender", key, defVal, GetIniPath().c_str());
+}
+
 void SaveLastIp(const std::wstring& ip) {
     WritePrivateProfileStringW(L"Sender", L"LastIp", ip.c_str(), GetIniPath().c_str());
 }
@@ -143,7 +151,8 @@ void OnToggleConnect() {
 
     LRESULT modeIdx = SendDlgItemMessageW(g_hwnd, IDC_MODE_COMBO, CB_GETCURSEL, 0, 0);
     if (modeIdx == 1) cfg.mode = s2p::DisplayMode::ExtendPrimary;
-    else if (modeIdx == 2) cfg.mode = s2p::DisplayMode::MirrorPrimary;
+    else if (modeIdx == 2) cfg.mode = s2p::DisplayMode::ExtendSecondary;
+    else if (modeIdx == 3) cfg.mode = s2p::DisplayMode::MirrorPrimary;
     else cfg.mode = s2p::DisplayMode::ExtendAll;
 
     LRESULT codecIdx = SendDlgItemMessageW(g_hwnd, IDC_CODEC_COMBO, CB_GETCURSEL, 0, 0);
@@ -153,6 +162,10 @@ void OnToggleConnect() {
     const uint32_t bitrates[] = { 15, 25, 40, 60 };
     cfg.bitrateMbps = (brIdx >= 0 && brIdx < 4) ? bitrates[brIdx] : 25;
     cfg.targetFps = 60;
+
+    SaveSetting(L"ModeIdx", static_cast<int>(modeIdx));
+    SaveSetting(L"CodecIdx", static_cast<int>(codecIdx));
+    SaveSetting(L"BitrateIdx", static_cast<int>(brIdx));
 
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_CONNECT), FALSE);
     SetDlgItemTextW(g_hwnd, IDC_STATUS_LABEL, L"Status: Verbinde und richte Monitore ein...");
@@ -189,24 +202,28 @@ void CreateUiControls(HWND hwnd) {
     (void)ipEdit;
 
     addCtrl(L"STATIC", L"Modus:", 0, 16, 108, 120, 20, 0);
-    HWND modeCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 160, 104, 336, 150, IDC_MODE_COMBO);
+    HWND modeCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 160, 104, 336, 170, IDC_MODE_COMBO);
     SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Erweitern (Alle PC-Monitore, bis zu 2)"));
     SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Erweitern (Nur PC-Monitor 1)"));
+    SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Erweitern (Nur PC-Monitor 2)"));
     SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Surface-Display spiegeln (ohne Treiber)"));
-    SendMessageW(modeCb, CB_SETCURSEL, 0, 0);
+    int savedMode = std::clamp(LoadSetting(L"ModeIdx", 0), 0, 3);
+    SendMessageW(modeCb, CB_SETCURSEL, savedMode, 0);
 
     addCtrl(L"STATIC", L"Codec / Bitrate:", 0, 16, 142, 120, 20, 0);
     HWND codecCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 160, 138, 216, 120, IDC_CODEC_COMBO);
     SendMessageW(codecCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"H.264 Low-Latency (GPU/CPU)"));
     SendMessageW(codecCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Delta Lossless (4:4:4 Text-scharf)"));
-    SendMessageW(codecCb, CB_SETCURSEL, 0, 0);
+    int savedCodec = std::clamp(LoadSetting(L"CodecIdx", 0), 0, 1);
+    SendMessageW(codecCb, CB_SETCURSEL, savedCodec, 0);
 
     HWND brCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 386, 138, 110, 120, IDC_BITRATE_COMBO);
     SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"15 Mbit/s"));
     SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"25 Mbit/s"));
     SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"40 Mbit/s"));
     SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"60 Mbit/s"));
-    SendMessageW(brCb, CB_SETCURSEL, 1, 0);
+    int savedBr = std::clamp(LoadSetting(L"BitrateIdx", 1), 0, 3);
+    SendMessageW(brCb, CB_SETCURSEL, savedBr, 0);
 
     addCtrl(L"BUTTON", L"Verbinden (Ctrl+Shift+K)", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 178, 480, 34, IDC_BTN_CONNECT);
 

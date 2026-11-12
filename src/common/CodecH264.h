@@ -95,6 +95,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Tex;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_vpOutView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingNv12;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_fallbackStagingBgra;
 
     std::vector<uint8_t> m_cpuNv12;
 };

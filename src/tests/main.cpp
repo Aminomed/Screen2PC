@@ -106,62 +106,72 @@ void TestDeltaCodec() {
     CHECK(dec.Decode(payload3.data(), payload3.size(), 320, 240), "Delta resize decode failed");
     CHECK(std::memcmp(frameSmall.data(), dec.FrameData(), frameSmall.size()) == 0, "Delta resize round-trip mismatch");
 
+    // Corrupted payload must be rejected cleanly without out-of-bounds read/write
+    std::vector<uint8_t> corrupt = payload2;
+    if (corrupt.size() > 8) {
+        corrupt.resize(corrupt.size() - 5);
+        CHECK(!dec.Decode(corrupt.data(), corrupt.size(), w, h), "Truncated Delta payload unexpectedly accepted");
+    }
+
     std::cout << "[PASS] TestDeltaCodec\n";
 }
 
 void TestColorAndH264() {
-    const uint32_t w = 640, h = 360;
-    std::vector<uint8_t> bgra(static_cast<size_t>(w) * h * 4, 0);
-    // Solid bright frame (B=200, G=220, R=210)
-    for (size_t i = 0; i < w * h; ++i) {
-        bgra[i * 4 + 0] = 200;
-        bgra[i * 4 + 1] = 220;
-        bgra[i * 4 + 2] = 210;
-        bgra[i * 4 + 3] = 255;
-    }
+    auto testRes = [](uint32_t w, uint32_t h) {
+        std::vector<uint8_t> bgra(static_cast<size_t>(w) * h * 4, 0);
+        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+            bgra[i * 4 + 0] = 200;
+            bgra[i * 4 + 1] = 220;
+            bgra[i * 4 + 2] = 210;
+            bgra[i * 4 + 3] = 255;
+        }
 
-    std::vector<uint8_t> nv12(static_cast<size_t>(w) * h * 3 / 2);
-    std::vector<uint8_t> roundTrip(static_cast<size_t>(w) * h * 4);
-    s2p::CpuBgraToNv12(bgra.data(), w * 4, w, h, nv12.data());
-    s2p::CpuNv12ToBgra(nv12.data(), w, nv12.data() + static_cast<size_t>(w) * h, w, w, h, roundTrip.data());
-    CHECK(std::abs(static_cast<int>(roundTrip[1]) - 220) < 20, "CPU BGRA<->NV12 conversion accuracy check failed");
+        std::vector<uint8_t> nv12(static_cast<size_t>(w) * h * 3 / 2);
+        std::vector<uint8_t> roundTrip(static_cast<size_t>(w) * h * 4);
+        s2p::CpuBgraToNv12(bgra.data(), w * 4, w, h, nv12.data());
+        s2p::CpuNv12ToBgra(nv12.data(), w, nv12.data() + static_cast<size_t>(w) * h, w, w, h, roundTrip.data());
+        CHECK(std::abs(static_cast<int>(roundTrip[1]) - 220) < 20, "CPU BGRA<->NV12 conversion accuracy check failed");
 
-    s2p::H264Encoder enc;
-    s2p::H264Decoder dec;
-    bool encInit = enc.Init(nullptr, nullptr, w, h, 30, 10);
-    bool decInit = dec.Init(nullptr, nullptr, w, h);
-    CHECK(encInit, "H264Encoder CPU Init failed");
-    CHECK(decInit, "H264Decoder CPU Init failed");
+        s2p::H264Encoder enc;
+        s2p::H264Decoder dec;
+        bool encInit = enc.Init(nullptr, nullptr, w, h, 30, 15);
+        bool decInit = dec.Init(nullptr, nullptr, w, h);
+        CHECK(encInit, "H264Encoder CPU Init failed");
+        CHECK(decInit, "H264Decoder CPU Init failed");
 
-    if (encInit && decInit) {
-        bool gotEncoded = false;
-        bool gotDecoded = false;
-        std::vector<uint8_t> outBgra;
+        if (encInit && decInit) {
+            bool gotEncoded = false;
+            bool gotDecoded = false;
+            std::vector<uint8_t> outBgra;
 
-        for (int f = 0; f < 10; ++f) {
-            std::vector<uint8_t> annexB;
-            bool isKey = false;
-            if (f == 0) enc.RequestKeyframe();
-            if (enc.EncodeBgra(bgra.data(), w * 4, static_cast<uint64_t>(f) * 33333ULL, annexB, isKey) && !annexB.empty()) {
-                gotEncoded = true;
-                uint32_t outW = 0, outH = 0;
-                if (dec.Decode(annexB.data(), annexB.size(), static_cast<uint64_t>(f) * 33333ULL,
-                               nullptr, &outBgra, &outW, &outH) && !outBgra.empty()) {
-                    CHECK(outW == w && outH == h, "H264 decoded dimensions mismatch");
-                    // Center pixel should be bright (>150)
-                    size_t center = (static_cast<size_t>(h / 2) * w + (w / 2)) * 4;
-                    CHECK(outBgra[center + 1] > 150, "H264 decoded center pixel luma unexpectedly dark");
-                    gotDecoded = true;
-                    break;
+            for (int f = 0; f < 10; ++f) {
+                std::vector<uint8_t> annexB;
+                bool isKey = false;
+                if (f == 0) enc.RequestKeyframe();
+                if (enc.EncodeBgra(bgra.data(), w * 4, static_cast<uint64_t>(f) * 33333ULL, annexB, isKey) && !annexB.empty()) {
+                    gotEncoded = true;
+                    uint32_t outW = 0, outH = 0;
+                    if (dec.Decode(annexB.data(), annexB.size(), static_cast<uint64_t>(f) * 33333ULL,
+                                   nullptr, &outBgra, &outW, &outH) && !outBgra.empty()) {
+                        CHECK(outW == w && outH == h, "H264 decoded dimensions mismatch");
+                        CHECK(outBgra.size() == static_cast<size_t>(w) * h * 4, "H264 decoded buffer byte count mismatch");
+                        size_t center = (static_cast<size_t>(h / 2) * w + (w / 2)) * 4;
+                        CHECK(outBgra[center + 1] > 150, "H264 decoded center pixel luma unexpectedly dark");
+                        gotDecoded = true;
+                        break;
+                    }
                 }
             }
+            CHECK(gotEncoded, "H264Encoder produced no Annex-B output");
+            CHECK(gotDecoded, "H264Decoder produced no decoded frame");
         }
-        CHECK(gotEncoded, "H264Encoder produced no Annex-B output across 10 frames");
-        CHECK(gotDecoded, "H264Decoder produced no decoded frame across 10 frames");
-    }
 
-    enc.Shutdown();
-    dec.Shutdown();
+        enc.Shutdown();
+        dec.Shutdown();
+    };
+
+    testRes(640, 360);
+    testRes(1920, 1080); // Macroblock-padded 1088 -> cropped 1080 check
     std::cout << "[PASS] TestColorAndH264\n";
 }
 
@@ -169,17 +179,20 @@ void TestLoopbackNetworking() {
     const uint16_t testTcpPort = 48299;
     const uint16_t testUdpPort = 48298;
 
-    // 1. TCP Packet framing roundtrip
+    // 1. TCP Packet framing roundtrip (small + large > 1536 bytes)
     s2p::TcpSocket listener;
     CHECK(listener.Listen(testTcpPort, 2), "TcpSocket::Listen failed on loopback test port");
 
     std::thread serverThread([&]() {
         s2p::TcpSocket srv = listener.Accept(nullptr, 3000);
         if (!srv.IsValid()) return;
-        s2p::PacketHeader hdr{};
-        std::vector<uint8_t> payload;
-        if (srv.RecvPacket(hdr, payload) && hdr.type == static_cast<uint16_t>(s2p::MsgType::VideoFrame)) {
-            srv.SendPacket(s2p::MsgType::SessionAck, payload.data(), static_cast<uint32_t>(payload.size()), 77);
+        for (int i = 0; i < 2; ++i) {
+            s2p::PacketHeader hdr{};
+            std::vector<uint8_t> payload;
+            if (srv.WaitReadable(2000) == 1 && srv.RecvPacket(hdr, payload) &&
+                hdr.type == static_cast<uint16_t>(s2p::MsgType::VideoFrame)) {
+                srv.SendPacket(s2p::MsgType::SessionAck, payload.data(), static_cast<uint32_t>(payload.size()), hdr.reserved);
+            }
         }
         srv.Close();
     });
@@ -187,15 +200,22 @@ void TestLoopbackNetworking() {
     s2p::TcpSocket client;
     CHECK(client.Connect("127.0.0.1", testTcpPort, 2000), "TcpSocket::Connect 127.0.0.1 failed");
     const std::vector<uint8_t> sample = { 1, 2, 3, 4, 5, 42, 99 };
-    CHECK(client.SendPacket(s2p::MsgType::VideoFrame, sample.data(), static_cast<uint32_t>(sample.size())),
-          "TcpSocket::SendPacket failed");
+    CHECK(client.SendPacket(s2p::MsgType::VideoFrame, sample.data(), static_cast<uint32_t>(sample.size()), 77),
+          "TcpSocket::SendPacket small failed");
 
     s2p::PacketHeader ackHdr{};
     std::vector<uint8_t> ackPayload;
-    CHECK(client.RecvPacket(ackHdr, ackPayload), "TcpSocket::RecvPacket failed");
+    CHECK(client.RecvPacket(ackHdr, ackPayload), "TcpSocket::RecvPacket small failed");
     CHECK(ackHdr.type == static_cast<uint16_t>(s2p::MsgType::SessionAck), "Wrong echo MsgType");
     CHECK(ackHdr.reserved == 77, "Wrong header reserved field");
-    CHECK(ackPayload == sample, "Echoed TCP payload corrupted");
+    CHECK(ackPayload == sample, "Echoed small TCP payload corrupted");
+
+    std::vector<uint8_t> largeSample(16384);
+    for (size_t i = 0; i < largeSample.size(); ++i) largeSample[i] = static_cast<uint8_t>((i * 13) & 0xFF);
+    CHECK(client.SendPacket(s2p::MsgType::VideoFrame, largeSample.data(), static_cast<uint32_t>(largeSample.size()), 88),
+          "TcpSocket::SendPacket large failed");
+    CHECK(client.RecvPacket(ackHdr, ackPayload), "TcpSocket::RecvPacket large failed");
+    CHECK(ackHdr.reserved == 88 && ackPayload == largeSample, "Echoed large TCP payload corrupted");
 
     client.Close();
     listener.Close();

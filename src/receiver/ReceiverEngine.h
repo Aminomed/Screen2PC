@@ -89,7 +89,7 @@ private:
     std::thread m_discoveryThread;
     std::thread m_controlThread;
 
-    std::mutex m_ctrlClientMutex;
+    std::mutex m_ctrlSendMutex;
     TcpSocket m_activeCtrlSock;
 
     mutable std::mutex m_stateMutex;

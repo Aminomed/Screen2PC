@@ -20,9 +20,10 @@
 namespace s2p {
 
 enum class DisplayMode : uint8_t {
-    ExtendAll     = 0, // 1 virtual monitor per PC monitor (up to 2)
-    ExtendPrimary = 1, // 1 virtual monitor matching PC monitor 1
-    MirrorPrimary = 2  // Mirror Surface main screen (no VDD needed)
+    ExtendAll       = 0, // 1 virtual monitor per PC monitor (up to 2)
+    ExtendPrimary   = 1, // 1 virtual monitor matching PC monitor 1
+    MirrorPrimary   = 2, // Mirror Surface main screen (no VDD needed)
+    ExtendSecondary = 3  // 1 virtual monitor matching PC monitor 2 (keeps PC monitor 1 free)
 };
 
 struct SenderConfig {

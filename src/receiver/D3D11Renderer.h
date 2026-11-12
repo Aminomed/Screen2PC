@@ -55,6 +55,15 @@ public:
     void SetFullscreen(bool fullscreen);
     void PumpMessages();
     void Present();
+    bool NeedsRepaint() const { return m_needRepaint; }
+    void ClearRepaint() { m_needRepaint = false; }
+
+    uint32_t MonitorIndex() const { return m_monitorIndex; }
+    uint32_t SourceWidth() const { return m_srcWidth; }
+    uint32_t SourceHeight() const { return m_srcHeight; }
+    uint32_t WindowWidth() const { return m_winWidth; }
+    uint32_t WindowHeight() const { return m_winHeight; }
+    HWND Hwnd() const { return m_hwnd; }
 
     // Callback-friendly handle for WndProc
     LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -78,6 +87,7 @@ private:
     uint32_t m_winHeight = 720;
     bool m_fullscreen = true;
     bool m_closedByUser = false;
+    bool m_needRepaint = false;
 
     HWND m_hwnd = nullptr;
 
@@ -90,6 +100,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_ps;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_sampler;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_alphaBlend;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_quadCb;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_frameTex;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_frameSrv;

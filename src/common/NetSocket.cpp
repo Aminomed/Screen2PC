@@ -180,6 +180,20 @@ void TcpSocket::SetTimeouts(int sendTimeoutMs, int recvTimeoutMs) {
     setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv), sizeof(rcv));
 }
 
+int TcpSocket::WaitReadable(int timeoutMs) {
+    if (m_sock == INVALID_SOCKET) return -1;
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(m_sock, &readSet);
+    timeval tv{};
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    int sel = select(0, &readSet, nullptr, nullptr, (timeoutMs >= 0) ? &tv : nullptr);
+    if (sel > 0) return 1;
+    if (sel == 0) return 0;
+    return -1;
+}
+
 bool TcpSocket::SendAll(const void* data, size_t len) {
     if (m_sock == INVALID_SOCKET) return false;
     const char* ptr = static_cast<const char*>(data);
@@ -208,11 +222,23 @@ bool TcpSocket::RecvAll(void* data, size_t len) {
 
 bool TcpSocket::SendPacket(MsgType type, const void* payload, uint32_t payloadSize, uint32_t reserved) {
     PacketHeader hdr = MakeHeader(type, payloadSize, reserved);
-    if (!SendAll(&hdr, sizeof(hdr))) return false;
-    if (payloadSize > 0 && payload) {
-        if (!SendAll(payload, payloadSize)) return false;
+    if (payloadSize == 0 || !payload) {
+        return SendAll(&hdr, sizeof(hdr));
     }
-    return true;
+
+    const size_t total = sizeof(hdr) + static_cast<size_t>(payloadSize);
+    if (total <= 1536) {
+        uint8_t stackBuf[1536];
+        std::memcpy(stackBuf, &hdr, sizeof(hdr));
+        std::memcpy(stackBuf + sizeof(hdr), payload, payloadSize);
+        return SendAll(stackBuf, total);
+    }
+
+    thread_local std::vector<uint8_t> sendBuf;
+    sendBuf.resize(total);
+    std::memcpy(sendBuf.data(), &hdr, sizeof(hdr));
+    std::memcpy(sendBuf.data() + sizeof(hdr), payload, payloadSize);
+    return SendAll(sendBuf.data(), total);
 }
 
 bool TcpSocket::RecvPacket(PacketHeader& outHeader, std::vector<uint8_t>& outPayload) {

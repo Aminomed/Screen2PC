@@ -38,6 +38,22 @@ HFONT g_font = nullptr;
 HFONT g_monoFont = nullptr;
 NOTIFYICONDATAW g_nid{};
 
+std::wstring GetReceiverIniPath() {
+    wchar_t buf[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(buf) + L"\\Screen2PC" : L".";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\receiver.ini";
+}
+
+bool LoadFullscreenPref() {
+    return GetPrivateProfileIntW(L"Receiver", L"StartFullscreen", 1, GetReceiverIniPath().c_str()) != 0;
+}
+
+void SaveFullscreenPref(bool fs) {
+    WritePrivateProfileStringW(L"Receiver", L"StartFullscreen", fs ? L"1" : L"0", GetReceiverIniPath().c_str());
+}
+
 void UpdateUi() {
     if (!g_hwnd || !g_engine) return;
     auto st = g_engine->GetStatus();
@@ -103,7 +119,7 @@ void CreateUiControls(HWND hwnd) {
 
     HWND chk = addCtrl(L"BUTTON", L"Streams direkt im randlosen Vollbild auf PC-Monitoren oeffnen (F11 zum Umschalten)",
                        BS_AUTOCHECKBOX | WS_TABSTOP, 16, 94, 520, 24, IDC_CHK_FULLSCR);
-    SendMessageW(chk, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(chk, BM_SETCHECK, LoadFullscreenPref() ? BST_CHECKED : BST_UNCHECKED, 0);
 
     addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, 16, 128, 250, 32, IDC_BTN_DISCONN);
     addCtrl(L"BUTTON", L"Windows Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, 276, 128, 260, 32, IDC_BTN_FIREWALL);
@@ -147,6 +163,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_engine) {
                 bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_FULLSCR, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 g_engine->SetStartFullscreen(checked);
+                SaveFullscreenPref(checked);
             }
             return 0;
         case IDC_BTN_DISCONN:
@@ -215,7 +232,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     s2p::ReceiverEngine engine;
     g_engine = &engine;
-    if (!engine.Start(true)) {
+    if (!engine.Start(LoadFullscreenPref())) {
         MessageBoxW(nullptr, L"Konnte Receiver-Port 48211 nicht oeffnen (evtl. laeuft Screen2PC Receiver bereits).",
                     L"Screen2PC Receiver", MB_ICONERROR);
         CoUninitialize();

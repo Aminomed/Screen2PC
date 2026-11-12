@@ -268,7 +268,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     }
 
     {
-        std::lock_guard<std::mutex> lock(m_ctrlClientMutex);
+        std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
         m_activeCtrlSock = std::move(clientSock);
     }
 
@@ -283,17 +283,23 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     }
 
     auto lastHeartbeat = std::chrono::steady_clock::now();
-    while (!m_stop && !m_sessionStop) {
-        PacketHeader chdr{};
-        std::vector<uint8_t> cpayload;
-        bool ok = false;
-        {
-            std::lock_guard<std::mutex> lock(m_ctrlClientMutex);
-            if (!m_activeCtrlSock.IsValid()) break;
-            ok = m_activeCtrlSock.RecvPacket(chdr, cpayload);
+    while (!m_stop && !m_sessionStop && m_activeCtrlSock.IsValid()) {
+        int wr = m_activeCtrlSock.WaitReadable(50);
+        if (wr < 0) {
+            Logger::Instance().Warn("RCV-CTL", L"Control socket closed during wait.");
+            break;
+        }
+        if (wr == 0) {
+            if (std::chrono::steady_clock::now() - lastHeartbeat > std::chrono::seconds(8)) {
+                Logger::Instance().Warn("RCV-CTL", L"Heartbeat timeout from sender.");
+                break;
+            }
+            continue;
         }
 
-        if (ok) {
+        PacketHeader chdr{};
+        std::vector<uint8_t> cpayload;
+        if (m_activeCtrlSock.RecvPacket(chdr, cpayload)) {
             lastHeartbeat = std::chrono::steady_clock::now();
             if (chdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
                 Logger::Instance().Info("RCV-CTL", L"Sender closed session.");
@@ -305,10 +311,6 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
                 Logger::Instance().Warn("RCV-CTL", L"Control connection closed, wsa=" + std::to_wstring(err));
                 break;
             }
-            if (std::chrono::steady_clock::now() - lastHeartbeat > std::chrono::seconds(8)) {
-                Logger::Instance().Warn("RCV-CTL", L"Heartbeat timeout from sender.");
-                break;
-            }
         }
     }
 
@@ -316,7 +318,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
 }
 
 void ReceiverEngine::RequestKeyframe(uint32_t monitorIndex) {
-    std::lock_guard<std::mutex> lock(m_ctrlClientMutex);
+    std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
     if (!m_activeCtrlSock.IsValid()) return;
     RequestKeyframePayload req{ monitorIndex };
     m_activeCtrlSock.SendPacket(MsgType::RequestKeyframe, &req, sizeof(req));
@@ -333,7 +335,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         return;
     }
     sock.TuneLowLatency(4 * 1024 * 1024);
-    sock.SetTimeouts(3000, 100); // short recv timeout so PumpMessages stays responsive
+    sock.SetTimeouts(3000, 50); // short recv timeout so PumpMessages stays responsive
 
     D3D11Renderer renderer;
     if (!renderer.Create(w->monitorIndex, w->targetMonitorRect, w->expectedWidth, w->expectedHeight, w->startFullscreen)) {
@@ -355,6 +357,10 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     while (!m_stop && !m_sessionStop && !w->stop && !renderer.IsClosedByUser()) {
         renderer.PumpMessages();
+        if (renderer.NeedsRepaint()) {
+            renderer.ClearRepaint();
+            needPresent = true;
+        }
 
         PacketHeader hdr{};
         std::vector<uint8_t> payload;
@@ -456,6 +462,14 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         }
     }
 
+    if (renderer.IsClosedByUser() && !m_sessionStop) {
+        std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
+        if (m_activeCtrlSock.IsValid()) {
+            m_activeCtrlSock.SendPacket(MsgType::StopSession, nullptr, 0);
+        }
+        m_sessionStop = true;
+    }
+
     h264.Shutdown();
     renderer.Destroy();
     sock.Close();
@@ -476,7 +490,7 @@ void ReceiverEngine::StopStreamWorkers() {
 void ReceiverEngine::DisconnectSession() {
     m_sessionStop = true;
     {
-        std::lock_guard<std::mutex> lock(m_ctrlClientMutex);
+        std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
         if (m_activeCtrlSock.IsValid()) {
             m_activeCtrlSock.SendPacket(MsgType::StopSession, nullptr, 0);
             m_activeCtrlSock.Close();
