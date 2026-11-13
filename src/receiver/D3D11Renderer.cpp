@@ -595,6 +595,9 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         return 0;
     }
     case WM_KILLFOCUS: {
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+        }
         if (m_kvmEnabled && m_kvmKeyCb) {
             const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
             for (uint16_t vk : mods) {

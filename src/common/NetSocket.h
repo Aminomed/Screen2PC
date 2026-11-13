@@ -4,6 +4,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,8 +34,8 @@ public:
     TcpSocket(TcpSocket&& other) noexcept;
     TcpSocket& operator=(TcpSocket&& other) noexcept;
 
-    bool IsValid() const { return m_sock != INVALID_SOCKET; }
-    SOCKET Handle() const { return m_sock; }
+    bool IsValid() const { return m_sock.load() != INVALID_SOCKET; }
+    SOCKET Handle() const { return m_sock.load(); }
     void Close();
 
     bool Connect(const std::string& host, uint16_t port, int timeoutMs = 3000);
@@ -55,7 +56,7 @@ public:
     std::string PeerIp() const;
 
 private:
-    SOCKET m_sock = INVALID_SOCKET;
+    std::atomic<SOCKET> m_sock{ INVALID_SOCKET };
 };
 
 class UdpSocket {

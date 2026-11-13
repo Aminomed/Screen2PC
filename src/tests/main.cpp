@@ -293,19 +293,29 @@ void TestFileTransfer() {
     CreateDirectoryW(dstDir.c_str(), nullptr);
 
     std::wstring srcFile = srcDir + L"\\sample_payload.bin";
+    std::wstring revSrcFile = dstDir + L"\\reverse_payload.bin";
     const size_t fileBytes = 200 * 1024 + 137; // > 3 chunks (64 KB) + unaligned tail
+    const size_t revBytes = 95 * 1024 + 41;
     std::vector<uint8_t> expected(fileBytes);
     for (size_t i = 0; i < fileBytes; ++i) {
         expected[i] = static_cast<uint8_t>((i * 29 + 7) & 0xFF);
     }
-
-    HANDLE hOut = CreateFileW(srcFile.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    CHECK(hOut != INVALID_HANDLE_VALUE, "Could not create temp source file");
-    if (hOut != INVALID_HANDLE_VALUE) {
-        DWORD written = 0;
-        WriteFile(hOut, expected.data(), static_cast<DWORD>(expected.size()), &written, nullptr);
-        CloseHandle(hOut);
+    std::vector<uint8_t> revExpected(revBytes);
+    for (size_t i = 0; i < revBytes; ++i) {
+        revExpected[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
     }
+
+    auto writeTestFile = [](const std::wstring& path, const std::vector<uint8_t>& data) {
+        HANDLE hOut = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(hOut != INVALID_HANDLE_VALUE, "Could not create temp source file");
+        if (hOut != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(hOut, data.data(), static_cast<DWORD>(data.size()), &written, nullptr);
+            CloseHandle(hOut);
+        }
+    };
+    writeTestFile(srcFile, expected);
+    writeTestFile(revSrcFile, revExpected);
 
     const uint16_t ftPort = 48297;
     s2p::TcpSocket listener;
@@ -327,31 +337,39 @@ void TestFileTransfer() {
     senderFt.Start(std::move(cliSock), srcDir);
     receiverFt.Start(std::move(srvSock), dstDir);
 
+    // Simultaneous full-duplex transfer in both directions at once
     CHECK(senderFt.QueueFiles({ srcFile }) == 1, "QueueFiles failed to enqueue test file");
+    CHECK(receiverFt.QueueFiles({ revSrcFile }) == 1, "QueueFiles failed to enqueue reverse test file");
 
     bool done = false;
-    for (int i = 0; i < 60; ++i) {
-        if (receiverFt.GetStats().filesReceived >= 1) {
+    for (int i = 0; i < 80; ++i) {
+        if (receiverFt.GetStats().filesReceived >= 1 && senderFt.GetStats().filesReceived >= 1) {
             done = true;
             break;
         }
         Sleep(50);
     }
-    CHECK(done, "Loopback file transfer did not finish in time");
-    CHECK(senderFt.GetStats().filesSent == 1, "Sender filesSent count mismatch");
+    CHECK(done, "Bidirectional loopback file transfer did not finish in time");
+    CHECK(senderFt.GetStats().filesSent == 1 && receiverFt.GetStats().filesSent == 1, "filesSent count mismatch");
     CHECK(receiverFt.GetStats().bytesReceived == fileBytes, "Receiver bytesReceived mismatch");
+    CHECK(senderFt.GetStats().bytesReceived == revBytes, "Sender reverse bytesReceived mismatch");
 
-    // Verify exact file bytes on disk
+    // Verify exact file bytes on disk for both directions
+    auto verifyDiskFile = [](const std::wstring& path, const std::vector<uint8_t>& exp) {
+        HANDLE hIn = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(hIn != INVALID_HANDLE_VALUE, "Received destination file missing");
+        if (hIn != INVALID_HANDLE_VALUE) {
+            std::vector<uint8_t> actual(exp.size());
+            DWORD readBytes = 0;
+            ReadFile(hIn, actual.data(), static_cast<DWORD>(actual.size()), &readBytes, nullptr);
+            CloseHandle(hIn);
+            CHECK(readBytes == exp.size() && actual == exp, "Received file content corrupted");
+        }
+    };
     std::wstring dstFile = dstDir + L"\\sample_payload.bin";
-    HANDLE hIn = CreateFileW(dstFile.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    CHECK(hIn != INVALID_HANDLE_VALUE, "Received destination file missing");
-    if (hIn != INVALID_HANDLE_VALUE) {
-        std::vector<uint8_t> actual(fileBytes);
-        DWORD readBytes = 0;
-        ReadFile(hIn, actual.data(), static_cast<DWORD>(actual.size()), &readBytes, nullptr);
-        CloseHandle(hIn);
-        CHECK(readBytes == fileBytes && actual == expected, "Received file content corrupted");
-    }
+    std::wstring revDstFile = srcDir + L"\\reverse_payload.bin";
+    verifyDiskFile(dstFile, expected);
+    verifyDiskFile(revDstFile, revExpected);
 
     // Also test unique destination collision naming when same filename already exists
     std::wstring collisionPath = s2p::FileTransfer::ResolveUniqueDestPath(dstDir, L"sample_payload.bin");
@@ -360,7 +378,9 @@ void TestFileTransfer() {
     senderFt.Stop();
     receiverFt.Stop();
     DeleteFileW(srcFile.c_str());
+    DeleteFileW(revSrcFile.c_str());
     DeleteFileW(dstFile.c_str());
+    DeleteFileW(revDstFile.c_str());
     RemoveDirectoryW(srcDir.c_str());
     RemoveDirectoryW(dstDir.c_str());
 
@@ -388,14 +408,17 @@ void TestKvmInput() {
           "Top letterbox bar should return inside=false");
     CHECK(ny == 0.0f && std::abs(nx - 0.5f) < 0.001f, "Top letterbox clamp mismatch");
 
-    // 4. Virtual desktop multi-monitor mapping (Primary 0..1920 + Virtual 1920..3840)
+    // 4. Virtual desktop multi-monitor mapping (Surface 2256x1504 + Virtual Mon1 2560x1440 + Virtual Mon2 1920x1080)
     int32_t dx = -1, dy = -1;
-    RECT rightMon{ 1920, 0, 3840, 1080 };
-    s2p::KvmInput::ComputeVirtualDesktopAbs(rightMon, 0.0f, 0.0f, 0, 0, 3840, 1080, dx, dy);
-    CHECK(std::abs(dx - 32776) <= 1 && dy == 0, "Right monitor top-left virtual desk mapping mismatch");
+    RECT rightMon{ 2256, 0, 2256 + 2560, 1440 };
+    const int32_t totalW = 2256 + 2560 + 1920; // 6736
+    const int32_t totalH = 1504;
+    s2p::KvmInput::ComputeVirtualDesktopAbs(rightMon, 0.0f, 0.0f, 0, 0, totalW, totalH, dx, dy);
+    CHECK(dx > 21000 && dx < 23000 && dy == 0, "Virtual 2K monitor top-left mapping out of expected range");
 
-    s2p::KvmInput::ComputeVirtualDesktopAbs(rightMon, 1.0f, 1.0f, 0, 0, 3840, 1080, dx, dy);
-    CHECK(dx == 65535 && dy == 65535, "Right monitor bottom-right virtual desk mapping mismatch");
+    RECT mon2{ 2256 + 2560, 0, totalW, 1080 };
+    s2p::KvmInput::ComputeVirtualDesktopAbs(mon2, 1.0f, 1.0f, 0, 0, totalW, totalH, dx, dy);
+    CHECK(dx == 65535 && dy > 46000 && dy < 48000, "Virtual 1080p bottom-right mapping mismatch");
 
     // 5. Negative left monitor mapping (-1920..0 left of primary 0..1920)
     RECT leftMon{ -1920, 0, 0, 1080 };

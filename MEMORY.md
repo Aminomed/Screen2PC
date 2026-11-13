@@ -6,9 +6,9 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Phase 3 (KVM Maus/Tastatur) — Implementiert, bereit fuer CI-Verifikation & Final Audit`
-- **Status:** Shared Clipboard (Phase 2A), Quick File Transfer (Phase 2B inkl. `SanitizeFilename`-Fix) und treiberfreies KVM (Phase 3 via `WM_*` -> `SendInput`) sind komplett implementiert und verdrahtet.
-- **Next Step:** GitHub Actions Windows CI (`Release|x64` Build + 6 Unit-/Integrations-Testsuiten + `infverif`/`Inf2Cat`) fuer Phase 2B + Phase 3 pruefen, Compiler-Warnings & Edge-Cases auditieren.
+- **Phase:** `Phase 0–3 Abgeschlossen & CI-verifiziert; Deep-Audit & Hardening Pass`
+- **Status:** Shared Clipboard (Phase 2A), Quick File Transfer (Phase 2B), treiberfreies KVM (Phase 3) sowie alle Basis-/Codec-/Treiber-Komponenten sind in Run `43341834757` (`ffa80dc`) mit 0 Projekt-Warnings und 7/7 bestandenen Testsuiten gruen verifiziert. Aktueller Hardening-Commit ergaenzt atomares `TcpSocket`-Lifecycle-Handling, `ReleaseCapture()` bei Focus-Verlust und simultane bidirektionale Full-Duplex-Tests.
+- **Next Step:** Aktuellen Hardening-Commit pushen & CI pruefen, dann Timer bis `06:45 CET` (Credit-Reset-Fenster) abwarten und vor `09:00 CET` finale End-to-End-Abnahme liefern.
 
 ---
 
@@ -49,7 +49,7 @@
 | `src/driversetup/` | Eigenstaendiges CLI (`Screen2PC.DriverSetup.exe`) fuer SetupAPI/Devnode Install/Remove/Status |
 | `src/sender/` | Surface App (`DxgiCapture`, `VirtualDisplayCtl`, `SenderEngine`, Win32 Tray/GUI + `Ctrl+Shift+K`) |
 | `src/receiver/` | PC App (`D3D11Renderer` mit Cursor-Overlay, KVM-Capture, Drag&Drop & `F11`/`ESC`/`Ctrl+Alt+K`, `ReceiverEngine`, Win32 Tray/GUI) |
-| `src/tests/` | Automatisierte Unit- & Integrationstests (`Screen2PC.Tests.exe`, 6 Testsuiten inkl. KVM & FileTransfer) |
+| `src/tests/` | Automatisierte Unit- & Integrationstests (`Screen2PC.Tests.exe`, 7 Testsuiten inkl. Clipboard, Full-Duplex FileTransfer & KVM) |
 | `scripts/` | `install_driver.ps1` & `uninstall_driver.ps1` (nur fuer Surface!) |
 | `.github/workflows/ci.yml` | Automatischer Windows x64 Build, Testlauf, `infverif`/`Inf2Cat` & Artifact ZIP |
 
@@ -67,4 +67,5 @@
 | 2026-11-13 | Phase 1: Deep Debug & Hardening | `ReceiverEngine` Control-Mutex-Deadlock (`m_ctrlSendMutex` + `WaitReadable`) gefixt; `TcpSocket::SendPacket` auf Single-Send gebuendelt; `D3D11Renderer` `m_quadCb` & `WM_PAINT`/`WM_SIZE`-Repaint optimiert; `H264Encoder` Staging-Texture gecached; `Driver` `AdapterInitFinished`-Race & Fehler-Cleanup gefixt; `DisplayMode::ExtendSecondary` (nur PC-Monitor 2) + `SetDisplayConfig`-Extend-Fallback + `sender.ini`/`receiver.ini` Settings-Persistenz + `1080p` H.264/Delta-Corruption/Large-TCP-Tests ergaenzt |
 | 2026-11-13 | Phase 2A: Shared Clipboard | `ClipboardSync` (`HWND_MESSAGE` + `AddClipboardFormatListener`, `CF_UNICODETEXT` bis 2 MB + `CF_DIB` bis 16 MB, 64-Bit FNV-1a Anti-Echo, `OpenClipboard`-Retry) erstellt und in `Protocol.h`, `SenderEngine`, `ReceiverEngine`, Sender/Receiver UI (inkl. INI-Persistenz) und Unit-Tests verdrahtet (CI gruen `43332884439`) |
 | 2026-11-13 | Phase 2B: Quick File Transfer | `FileTransfer` (`TCP 48214` Full-Duplex, 64-KB-Chunks + CRC32-Pruefung, `.part`-Tempdatei, Path-Traversal-Sanitization, Auto-Rename `datei (1).ext`) erstellt und via `WM_DROPFILES` Drag&Drop (Hauptfenster + `D3D11Renderer`-Fenster), Dateiauswahl-Dialog (`GetOpenFileNameW`), Ordner-Button & Loopback-Test verdrahtet; `SanitizeFilename` Drive-Prefix-Fix ergaenzt |
-| 2026-11-13 | Phase 3: Pure User-Mode KVM | `KvmInput` (Aspect-Letterbox-Mapping + Multi-Monitor Virtual Desktop `SendInput`), `MsgType::KvmMouse`/`KvmKey`, `D3D11Renderer` Maus-/Tastaturerfassung + `Ctrl+Alt+K`-Toggle + `WM_KILLFOCUS`-Modifier-Release, `ReceiverEngine`/`SenderEngine` Forwarding & Injektion, Checkboxen/INI in Sender/Receiver, Thread-Join-Race in `SenderEngine::Disconnect` gefixt & `TestKvmInput` ergaenzt |
+| 2026-11-13 | Phase 3: Pure User-Mode KVM | `KvmInput` (Aspect-Letterbox-Mapping + Multi-Monitor Virtual Desktop `SendInput`), `MsgType::KvmMouse`/`KvmKey`, `D3D11Renderer` Maus-/Tastaturerfassung + `Ctrl+Alt+K`-Toggle + `WM_KILLFOCUS`-Modifier-Release, `ReceiverEngine`/`SenderEngine` Forwarding & Injektion, Checkboxen/INI in Sender/Receiver, Thread-Join-Race in `SenderEngine::Disconnect` gefixt & `TestKvmInput` ergaenzt (CI gruen `43341834757`) |
+| 2026-11-13 | Deep Audit & Hardening | `TcpSocket::m_sock` auf `std::atomic<SOCKET>` fuer race-freies paralleles `Close()`/Shutdown umgestellt; `D3D11Renderer` `WM_KILLFOCUS` um `ReleaseCapture()` ergaenzt; `TestFileTransfer` auf simultanen Full-Duplex-Transfer (Senden+Empfangen gleichzeitig) & `TestKvmInput` auf `2560x1440`+`1920x1080`-Geometrie erweitert |

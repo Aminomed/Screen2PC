@@ -23,24 +23,22 @@ TcpSocket::~TcpSocket() {
     Close();
 }
 
-TcpSocket::TcpSocket(TcpSocket&& other) noexcept : m_sock(other.m_sock) {
-    other.m_sock = INVALID_SOCKET;
-}
+TcpSocket::TcpSocket(TcpSocket&& other) noexcept
+    : m_sock(other.m_sock.exchange(INVALID_SOCKET)) {}
 
 TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
     if (this != &other) {
         Close();
-        m_sock = other.m_sock;
-        other.m_sock = INVALID_SOCKET;
+        m_sock.store(other.m_sock.exchange(INVALID_SOCKET));
     }
     return *this;
 }
 
 void TcpSocket::Close() {
-    if (m_sock != INVALID_SOCKET) {
-        shutdown(m_sock, SD_BOTH);
-        closesocket(m_sock);
-        m_sock = INVALID_SOCKET;
+    SOCKET s = m_sock.exchange(INVALID_SOCKET);
+    if (s != INVALID_SOCKET) {
+        shutdown(s, SD_BOTH);
+        closesocket(s);
     }
 }
 
@@ -104,7 +102,7 @@ bool TcpSocket::Connect(const std::string& host, uint16_t port, int timeoutMs) {
 
     nonBlock = 0;
     ioctlsocket(s, FIONBIO, &nonBlock);
-    m_sock = s;
+    m_sock.store(s);
     TuneLowLatency();
     return true;
 }
@@ -130,17 +128,18 @@ bool TcpSocket::Listen(uint16_t port, int backlog) {
         closesocket(s);
         return false;
     }
-    m_sock = s;
+    m_sock.store(s);
     return true;
 }
 
 TcpSocket TcpSocket::Accept(std::string* outPeerIp, int timeoutMs) {
-    if (m_sock == INVALID_SOCKET) return TcpSocket();
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return TcpSocket();
 
     if (timeoutMs >= 0) {
         fd_set readSet;
         FD_ZERO(&readSet);
-        FD_SET(m_sock, &readSet);
+        FD_SET(s, &readSet);
         timeval tv{};
         tv.tv_sec = timeoutMs / 1000;
         tv.tv_usec = (timeoutMs % 1000) * 1000;
@@ -150,7 +149,7 @@ TcpSocket TcpSocket::Accept(std::string* outPeerIp, int timeoutMs) {
 
     sockaddr_in peer{};
     int peerLen = sizeof(peer);
-    SOCKET client = accept(m_sock, reinterpret_cast<sockaddr*>(&peer), &peerLen);
+    SOCKET client = accept(s, reinterpret_cast<sockaddr*>(&peer), &peerLen);
     if (client == INVALID_SOCKET) return TcpSocket();
 
     if (outPeerIp) {
@@ -165,26 +164,29 @@ TcpSocket TcpSocket::Accept(std::string* outPeerIp, int timeoutMs) {
 }
 
 void TcpSocket::TuneLowLatency(int bufBytes) {
-    if (m_sock == INVALID_SOCKET) return;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return;
     BOOL nodelay = TRUE;
-    setsockopt(m_sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-    setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufBytes), sizeof(bufBytes));
-    setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufBytes), sizeof(bufBytes));
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufBytes), sizeof(bufBytes));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufBytes), sizeof(bufBytes));
 }
 
 void TcpSocket::SetTimeouts(int sendTimeoutMs, int recvTimeoutMs) {
-    if (m_sock == INVALID_SOCKET) return;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return;
     DWORD snd = static_cast<DWORD>(sendTimeoutMs);
     DWORD rcv = static_cast<DWORD>(recvTimeoutMs);
-    setsockopt(m_sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&snd), sizeof(snd));
-    setsockopt(m_sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv), sizeof(rcv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&snd), sizeof(snd));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv), sizeof(rcv));
 }
 
 int TcpSocket::WaitReadable(int timeoutMs) {
-    if (m_sock == INVALID_SOCKET) return -1;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return -1;
     fd_set readSet;
     FD_ZERO(&readSet);
-    FD_SET(m_sock, &readSet);
+    FD_SET(s, &readSet);
     timeval tv{};
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
@@ -195,12 +197,13 @@ int TcpSocket::WaitReadable(int timeoutMs) {
 }
 
 bool TcpSocket::SendAll(const void* data, size_t len) {
-    if (m_sock == INVALID_SOCKET) return false;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return false;
     const char* ptr = static_cast<const char*>(data);
     size_t sent = 0;
     while (sent < len) {
         int chunk = static_cast<int>(std::min<size_t>(len - sent, 1 << 20));
-        int n = send(m_sock, ptr + sent, chunk, 0);
+        int n = send(s, ptr + sent, chunk, 0);
         if (n <= 0) return false;
         sent += static_cast<size_t>(n);
     }
@@ -208,12 +211,13 @@ bool TcpSocket::SendAll(const void* data, size_t len) {
 }
 
 bool TcpSocket::RecvAll(void* data, size_t len) {
-    if (m_sock == INVALID_SOCKET) return false;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return false;
     char* ptr = static_cast<char*>(data);
     size_t recvd = 0;
     while (recvd < len) {
         int chunk = static_cast<int>(std::min<size_t>(len - recvd, 1 << 20));
-        int n = recv(m_sock, ptr + recvd, chunk, 0);
+        int n = recv(s, ptr + recvd, chunk, 0);
         if (n <= 0) return false;
         recvd += static_cast<size_t>(n);
     }
@@ -252,10 +256,11 @@ bool TcpSocket::RecvPacket(PacketHeader& outHeader, std::vector<uint8_t>& outPay
 }
 
 std::string TcpSocket::PeerIp() const {
-    if (m_sock == INVALID_SOCKET) return {};
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return {};
     sockaddr_in addr{};
     int len = sizeof(addr);
-    if (getpeername(m_sock, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return {};
+    if (getpeername(s, reinterpret_cast<sockaddr*>(&addr), &len) != 0) return {};
     char buf[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf));
     return buf;
