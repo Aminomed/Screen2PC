@@ -137,38 +137,83 @@ void KvmInput::StepVirtualDesktopPoint(int32_t curX,
     int32_t rawY = std::clamp<int32_t>(curY + deltaY, vTop, maxY);
 
     if (monitorRects && monitorCount > 0) {
+        auto isInside = [](int32_t x, int32_t y, const RECT& r) -> bool {
+            return r.right > r.left && r.bottom > r.top &&
+                   x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        };
+
         bool insideAny = false;
+        const RECT* curMon = nullptr;
         for (size_t i = 0; i < monitorCount; ++i) {
             const RECT& r = monitorRects[i];
-            if (rawX >= r.left && rawX < r.right && rawY >= r.top && rawY < r.bottom) {
+            if (isInside(rawX, rawY, r)) {
                 insideAny = true;
                 break;
             }
-        }
-        if (!insideAny) {
-            // Prefer monitors whose span along the movement axis contains rawX/rawY so
-            // transitions between monitors of different heights (e.g. 1504p <-> 1440p <-> 1080p)
-            // never get stuck on corner dead zones.
-            size_t bestIdx = 0;
-            int64_t bestScore = std::numeric_limits<int64_t>::max();
-            for (size_t i = 0; i < monitorCount; ++i) {
-                const RECT& r = monitorRects[i];
-                if (r.right <= r.left || r.bottom <= r.top) continue;
-                int64_t d2 = DistSqToRect(rawX, rawY, r);
-                bool xMatch = (rawX >= r.left && rawX < r.right);
-                bool yMatch = (rawY >= r.top && rawY < r.bottom);
-                if (!xMatch && !yMatch) {
-                    d2 += 100000000LL;
-                }
-                if (d2 < bestScore) {
-                    bestScore = d2;
-                    bestIdx = i;
-                }
+            if (!curMon && isInside(curX, curY, r)) {
+                curMon = &r;
             }
-            const RECT& best = monitorRects[bestIdx];
-            if (best.right > best.left && best.bottom > best.top) {
-                rawX = std::clamp<int32_t>(rawX, best.left, best.right - 1);
-                rawY = std::clamp<int32_t>(rawY, best.top, best.bottom - 1);
+        }
+
+        if (!insideAny) {
+            // When crossing out of curMon across an uneven-height seam (e.g. 1504p <-> 1440p <-> 1080p),
+            // snap smoothly onto the adjacent monitor along the crossed axis rather than stalling on a
+            // corner dead zone or slipping off an outer edge onto a neighbor.
+            const RECT* chosen = nullptr;
+
+            if (curMon) {
+                const bool crossedLeft = (rawX < curMon->left);
+                const bool crossedRight = (rawX >= curMon->right);
+                const bool crossedTop = (rawY < curMon->top);
+                const bool crossedBottom = (rawY >= curMon->bottom);
+
+                int64_t bestCandDist = std::numeric_limits<int64_t>::max();
+                for (size_t i = 0; i < monitorCount; ++i) {
+                    const RECT& r = monitorRects[i];
+                    if (&r == curMon || r.right <= r.left || r.bottom <= r.top) continue;
+
+                    const bool yOverlap = std::min(curMon->bottom, r.bottom) > std::max(curMon->top, r.top);
+                    const bool xOverlap = std::min(curMon->right, r.right) > std::max(curMon->left, r.left);
+                    const bool xMatch = (rawX >= r.left && rawX < r.right);
+                    const bool yMatch = (rawY >= r.top && rawY < r.bottom);
+
+                    const bool horizTransition = yOverlap && xMatch &&
+                        ((crossedRight && r.right > curMon->right) ||
+                         (crossedLeft && r.left < curMon->left));
+                    const bool vertTransition = xOverlap && yMatch &&
+                        ((crossedBottom && r.bottom > curMon->bottom) ||
+                         (crossedTop && r.top < curMon->top));
+
+                    if (horizTransition || vertTransition) {
+                        int64_t d2 = DistSqToRect(rawX, rawY, r);
+                        if (d2 < bestCandDist) {
+                            bestCandDist = d2;
+                            chosen = &r;
+                        }
+                    }
+                }
+
+                if (!chosen) {
+                    chosen = curMon;
+                }
+            } else {
+                size_t bestIdx = 0;
+                int64_t bestScore = std::numeric_limits<int64_t>::max();
+                for (size_t i = 0; i < monitorCount; ++i) {
+                    const RECT& r = monitorRects[i];
+                    if (r.right <= r.left || r.bottom <= r.top) continue;
+                    int64_t d2 = DistSqToRect(rawX, rawY, r);
+                    if (d2 < bestScore) {
+                        bestScore = d2;
+                        bestIdx = i;
+                    }
+                }
+                chosen = &monitorRects[bestIdx];
+            }
+
+            if (chosen && chosen->right > chosen->left && chosen->bottom > chosen->top) {
+                rawX = std::clamp<int32_t>(rawX, chosen->left, chosen->right - 1);
+                rawY = std::clamp<int32_t>(rawY, chosen->top, chosen->bottom - 1);
             }
         }
     }

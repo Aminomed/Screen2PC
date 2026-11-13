@@ -472,6 +472,22 @@ void TestKvmInput() {
     s2p::KvmInput::StepVirtualDesktopPoint(2550, 1300, 30, 0, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
     CHECK(nxPx == 2580 && nyPx == 1079, "Snapping onto shorter adjacent monitor height failed");
 
+    // Bumping bottom edge of Monitor 2 right near the seam stays on Monitor 2 instead of warping sideways
+    s2p::KvmInput::StepVirtualDesktopPoint(2565, 1075, 0, 20, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == 2565 && nyPx == 1079, "Bottom edge push near seam wrongly jumped sideways");
+
+    // Crossing right from bottom of 1504p Surface onto 1440p Monitor 1 snaps cleanly to y=1439
+    s2p::KvmInput::StepVirtualDesktopPoint(-10, 1490, 30, 0, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == 20 && nyPx == 1439, "Crossing right from Surface bottom onto Monitor 1 failed");
+
+    // Vertical stack: crossing down from wider 1440p top monitor onto narrower 1080p bottom monitor
+    const RECT stackedMons[2] = {
+        RECT{ 0, 0, 2560, 1440 },
+        RECT{ 0, 1440, 1920, 2520 }
+    };
+    s2p::KvmInput::StepVirtualDesktopPoint(2200, 1430, 0, 20, stackedMons, 2, 0, 0, 2560, 2520, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == 1919 && nyPx == 1450, "Vertical uneven-width monitor crossing failed");
+
     // Clamping at outer left edge of physical Surface monitor
     s2p::KvmInput::StepVirtualDesktopPoint(-2240, 100, -100, -200, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
     CHECK(nxPx == -2256 && nyPx == 0 && dx == 0 && dy == 0, "Outer top-left virtual desktop clamping failed");
