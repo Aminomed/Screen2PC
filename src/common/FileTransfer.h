@@ -74,6 +74,7 @@ private:
     mutable std::mutex m_statsMutex;
     FileTransferStats m_stats;
 
+    std::mutex m_lifecycleMutex;
     std::thread m_sendThread;
     std::thread m_recvThread;
 };

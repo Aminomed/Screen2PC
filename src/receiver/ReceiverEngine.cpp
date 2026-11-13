@@ -403,7 +403,11 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     renderer.SetKvmEnabled(lastGlobalKvm);
     renderer.SetKvmCallbacks(
         [this](const KvmMouseEvent& ev) { SendKvmMouse(ev); },
-        [this](const KvmKeyEvent& ev) { SendKvmKey(ev); });
+        [this](const KvmKeyEvent& ev) { SendKvmKey(ev); },
+        [this, &lastGlobalKvm](bool enabled) {
+            lastGlobalKvm = enabled;
+            m_kvmEnabled = enabled;
+        });
     renderer.SetFileDropCallback([this](const std::vector<std::wstring>& files) {
         SendFiles(files);
     });
@@ -430,8 +434,9 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     uint64_t windowBytes = 0;
     uint64_t totalFrames = 0;
     bool needPresent = false;
+    bool streamEnded = false;
 
-    while (!m_stop && !m_sessionStop && !w->stop && !renderer.IsClosedByUser()) {
+    while (!m_stop && !m_sessionStop && !w->stop && !streamEnded && !renderer.IsClosedByUser()) {
         bool curGlobalKvm = m_kvmEnabled.load();
         if (curGlobalKvm != lastGlobalKvm) {
             lastGlobalKvm = curGlobalKvm;
@@ -443,125 +448,136 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
             needPresent = true;
         }
 
-        int wr = sock.WaitReadable(10);
+        int wr = sock.WaitReadable(needPresent ? 0 : 1);
         if (wr < 0) {
             break;
         }
-        if (wr == 0) {
-            if (needPresent) {
-                renderer.Present();
-                needPresent = false;
+
+        // Drain all currently queued packets so we always render the freshest cursor & video frame
+        for (int drained = 0; drained < 8 && wr > 0; ++drained) {
+            PacketHeader hdr{};
+            std::vector<uint8_t> payload;
+            if (!sock.RecvPacket(hdr, payload)) {
+                streamEnded = true;
+                break;
             }
-            continue;
-        }
 
-        PacketHeader hdr{};
-        std::vector<uint8_t> payload;
-        if (!sock.RecvPacket(hdr, payload)) {
-            break;
-        }
-
-        if (hdr.type == static_cast<uint16_t>(MsgType::StreamEnd)) {
-            break;
-        } else if (hdr.type == static_cast<uint16_t>(MsgType::CursorUpdate) &&
-                   payload.size() >= sizeof(CursorUpdateHeader)) {
-            CursorUpdateHeader ch{};
-            std::memcpy(&ch, payload.data(), sizeof(ch));
-            const uint8_t* shapePtr = (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize)
-                                          ? (payload.data() + sizeof(ch))
-                                          : nullptr;
-            renderer.UpdateCursor(ch.visible != 0, ch.x, ch.y, ch.shapeChanged != 0, ch.shapeType,
-                                  ch.shapeWidth, ch.shapeHeight, ch.shapePitch, ch.hotX, ch.hotY,
-                                  shapePtr, ch.dataSize);
-            needPresent = true;
-        } else if (hdr.type == static_cast<uint16_t>(MsgType::VideoFrame) &&
-                   payload.size() >= sizeof(VideoFrameHeader)) {
-            VideoFrameHeader vh{};
-            std::memcpy(&vh, payload.data(), sizeof(vh));
-            if (payload.size() < sizeof(vh) + vh.dataSize) continue;
-            const uint8_t* frameData = payload.data() + sizeof(vh);
-
-            bool decodedOk = false;
-            std::wstring codecLabel;
-            bool isDxva = false;
-
-            if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
-                if (!h264.IsInitialized() || h264W != vh.width || h264H != vh.height) {
-                    h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height);
-                    h264W = vh.width;
-                    h264H = vh.height;
-                    decodedAnyH264 = false;
-                    consecutiveH264Fails = 0;
-                    renderer.EnsureFrameTexture(vh.width, vh.height);
+            if (hdr.type == static_cast<uint16_t>(MsgType::StreamEnd)) {
+                streamEnded = true;
+                break;
+            } else if (hdr.type == static_cast<uint16_t>(MsgType::CursorUpdate) &&
+                       payload.size() >= sizeof(CursorUpdateHeader)) {
+                CursorUpdateHeader ch{};
+                std::memcpy(&ch, payload.data(), sizeof(ch));
+                const uint8_t* shapePtr = (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize)
+                                              ? (payload.data() + sizeof(ch))
+                                              : nullptr;
+                renderer.UpdateCursor(ch.visible != 0, ch.x, ch.y, ch.shapeChanged != 0, ch.shapeType,
+                                      ch.shapeWidth, ch.shapeHeight, ch.shapePitch, ch.hotX, ch.hotY,
+                                      shapePtr, ch.dataSize);
+                needPresent = true;
+            } else if (hdr.type == static_cast<uint16_t>(MsgType::VideoFrame) &&
+                       payload.size() >= sizeof(VideoFrameHeader)) {
+                VideoFrameHeader vh{};
+                std::memcpy(&vh, payload.data(), sizeof(vh));
+                if (payload.size() < sizeof(vh) + vh.dataSize) {
+                    wr = sock.WaitReadable(0);
+                    continue;
                 }
-                if (h264.IsInitialized()) {
-                    renderer.EnsureFrameTexture(vh.width, vh.height);
-                    uint32_t outW = vh.width, outH = vh.height;
-                    if (h264.IsHardwareDxva()) {
-                        decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
-                                                renderer.FrameTexture(), nullptr, &outW, &outH);
-                        codecLabel = L"H.264 (NVDEC/DXVA)";
-                        isDxva = true;
-                    } else {
-                        decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
-                                                nullptr, &cpuBgra, &outW, &outH);
-                        if (decodedOk && !cpuBgra.empty()) {
-                            renderer.UploadCpuBgra(cpuBgra.data(), outW * 4, outW, outH);
-                        }
-                        codecLabel = L"H.264 (CPU)";
-                    }
+                const uint8_t* frameData = payload.data() + sizeof(vh);
 
-                    if (decodedOk) {
-                        decodedAnyH264 = true;
+                bool decodedOk = false;
+                std::wstring codecLabel;
+                bool isDxva = false;
+
+                if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
+                    if (!h264.IsInitialized() || h264W != vh.width || h264H != vh.height) {
+                        h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height);
+                        h264W = vh.width;
+                        h264H = vh.height;
+                        decodedAnyH264 = false;
                         consecutiveH264Fails = 0;
-                    } else {
-                        ++consecutiveH264Fails;
-                        if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
-                            Logger::Instance().Warn("RCV-DEC", L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
-                            h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false);
-                            consecutiveH264Fails = 0;
-                            RequestKeyframe(w->monitorIndex);
-                            lastKeyframeReq = std::chrono::steady_clock::now();
-                        } else if (consecutiveH264Fails >= 2) {
-                            maybeRequestKeyframe();
-                        }
+                        renderer.EnsureFrameTexture(vh.width, vh.height);
                     }
-                } else {
-                    maybeRequestKeyframe();
+                    if (h264.IsInitialized()) {
+                        renderer.EnsureFrameTexture(vh.width, vh.height);
+                        uint32_t outW = vh.width, outH = vh.height;
+                        if (h264.IsHardwareDxva()) {
+                            decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
+                                                    renderer.FrameTexture(), nullptr, &outW, &outH);
+                            codecLabel = L"H.264 (NVDEC/DXVA)";
+                            isDxva = true;
+                        } else {
+                            decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
+                                                    nullptr, &cpuBgra, &outW, &outH);
+                            if (decodedOk && !cpuBgra.empty()) {
+                                renderer.UploadCpuBgra(cpuBgra.data(), outW * 4, outW, outH);
+                            }
+                            codecLabel = L"H.264 (CPU)";
+                        }
+
+                        if (decodedOk) {
+                            decodedAnyH264 = true;
+                            consecutiveH264Fails = 0;
+                        } else {
+                            ++consecutiveH264Fails;
+                            if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
+                                Logger::Instance().Warn("RCV-DEC", L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
+                                h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false);
+                                consecutiveH264Fails = 0;
+                                RequestKeyframe(w->monitorIndex);
+                                lastKeyframeReq = std::chrono::steady_clock::now();
+                            } else if (consecutiveH264Fails >= 2) {
+                                maybeRequestKeyframe();
+                            }
+                        }
+                    } else {
+                        maybeRequestKeyframe();
+                    }
+                } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
+                    if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
+                        renderer.UploadCpuBgra(delta.FrameData(), delta.StrideBytes(), delta.Width(), delta.Height());
+                        decodedOk = true;
+                        codecLabel = L"Delta Lossless";
+                    } else {
+                        maybeRequestKeyframe();
+                    }
                 }
-            } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
-                if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
-                    renderer.UploadCpuBgra(delta.FrameData(), delta.StrideBytes(), delta.Width(), delta.Height());
-                    decodedOk = true;
-                    codecLabel = L"Delta Lossless";
-                } else {
-                    maybeRequestKeyframe();
+
+                if (decodedOk) {
+                    ++totalFrames;
+                    ++windowFrames;
+                    windowBytes += payload.size() + sizeof(PacketHeader);
+                    needPresent = true;
+
+                    auto now = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - windowStart).count();
+                    if (elapsed >= 0.5) {
+                        std::lock_guard<std::mutex> sl(w->statsMutex);
+                        w->stats.width = vh.width;
+                        w->stats.height = vh.height;
+                        w->stats.fps = static_cast<double>(windowFrames) / elapsed;
+                        w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsed * 1000000.0);
+                        w->stats.framesReceived = totalFrames;
+                        w->stats.codecName = codecLabel;
+                        w->stats.hardwareDxva = isDxva;
+                        windowStart = now;
+                        windowFrames = 0;
+                        windowBytes = 0;
+                    }
                 }
             }
 
-            if (decodedOk) {
-                ++totalFrames;
-                ++windowFrames;
-                windowBytes += payload.size() + sizeof(PacketHeader);
-                renderer.Present();
-                needPresent = false;
-
-                auto now = std::chrono::steady_clock::now();
-                double elapsed = std::chrono::duration<double>(now - windowStart).count();
-                if (elapsed >= 0.5) {
-                    std::lock_guard<std::mutex> sl(w->statsMutex);
-                    w->stats.width = vh.width;
-                    w->stats.height = vh.height;
-                    w->stats.fps = static_cast<double>(windowFrames) / elapsed;
-                    w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsed * 1000000.0);
-                    w->stats.framesReceived = totalFrames;
-                    w->stats.codecName = codecLabel;
-                    w->stats.hardwareDxva = isDxva;
-                    windowStart = now;
-                    windowFrames = 0;
-                    windowBytes = 0;
-                }
+            wr = sock.WaitReadable(0);
+            if (wr < 0) {
+                streamEnded = true;
+                break;
             }
+        }
+
+        if (needPresent) {
+            renderer.Present();
+            needPresent = false;
         }
     }
 

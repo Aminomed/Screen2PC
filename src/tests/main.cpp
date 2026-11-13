@@ -454,6 +454,32 @@ void TestKvmInput() {
     s2p::KvmInput::ComputeVirtualDesktopAbs(leftMon, 0.0f, 0.5f, -1920, 0, 3840, 1080, dx, dy);
     CHECK(dx == 0 && std::abs(dy - 32768) <= 32, "Negative-left monitor mapping mismatch");
 
+    // 6. Full-desktop relative roaming across Surface (-2256..0, 1504h) + Mon1 (0..2560, 1440h) + Mon2 (2560..4480, 1080h)
+    const RECT roamMons[3] = {
+        RECT{ -2256, 0, 0, 1504 },
+        RECT{ 0, 0, 2560, 1440 },
+        RECT{ 2560, 0, 4480, 1080 }
+    };
+    const int32_t rLeft = -2256, rTop = 0, rW = 2256 + 2560 + 1920, rH = 1504;
+    int32_t nxPx = 0, nyPx = 0;
+
+    // Crossing left from Monitor 1 onto physical Surface monitor
+    s2p::KvmInput::StepVirtualDesktopPoint(10, 700, -30, 5, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == -20 && nyPx == 705, "Crossing left from PC monitor onto physical Surface monitor failed");
+    CHECK(dx >= 0 && dx < 65535 && dy > 0 && dy < 65535, "Virtual desktop normalized coord out of range on Surface");
+
+    // Crossing right from bottom of 1440p Monitor 1 onto shorter 1080p Monitor 2 snaps cleanly to y=1079
+    s2p::KvmInput::StepVirtualDesktopPoint(2550, 1300, 30, 0, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == 2580 && nyPx == 1079, "Snapping onto shorter adjacent monitor height failed");
+
+    // Clamping at outer left edge of physical Surface monitor
+    s2p::KvmInput::StepVirtualDesktopPoint(-2240, 100, -100, -200, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == -2256 && nyPx == 0 && dx == 0 && dy == 0, "Outer top-left virtual desktop clamping failed");
+
+    // Clamping at outer right edge of Monitor 2
+    s2p::KvmInput::StepVirtualDesktopPoint(4460, 1060, 100, 100, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx == 4479 && nyPx == 1079 && dx == 65535, "Outer bottom-right Monitor 2 clamping failed");
+
     std::cout << "[PASS] TestKvmInput\n";
 }
 

@@ -211,10 +211,11 @@ struct FileDonePayload {
 
 struct KvmMouseEvent {
     uint32_t monitorIndex;
-    uint8_t  action;   // KvmMouseAction
-    uint8_t  pad[3];
-    float    normX;    // 0.0 .. 1.0 inside streamed monitor
-    float    normY;    // 0.0 .. 1.0 inside streamed monitor
+    uint8_t  action;     // KvmMouseAction
+    uint8_t  isRelative; // 0 = normX/normY in [0..1] of monitorIndex; 1 = normX/normY are pixel deltas (dx, dy) across full Virtual Desktop
+    uint8_t  pad[2];
+    float    normX;      // 0.0 .. 1.0 inside streamed monitor (or deltaX in pixels when isRelative != 0)
+    float    normY;      // 0.0 .. 1.0 inside streamed monitor (or deltaY in pixels when isRelative != 0)
     int32_t  wheelDelta;
 };
 

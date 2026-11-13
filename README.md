@@ -26,10 +26,11 @@
    - **H.264 Low-Latency:** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC (inkl. CPU-MFT-Fallback).
    - **Delta Lossless (4:4:4):** Nutzt DXGI-Dirty-Rects + verlustfreien Tile-RLE-Codec fuer gestochen scharfen Text/Code.
 5. Klicke **Verbinden** (oder jederzeit global via **`Ctrl + Shift + K`**).
-   - Im Vollbild auf dem PC schaltet **`F11`** / **`ESC`** zwischen randlosem Vollbild und Fenster um.
+   - Im Vollbild auf dem PC schaltet **`F11`** / **`ESC`** zwischen randlosem Vollbild und Fenster um (**`ESC`** gibt zusaetzlich sofort den KVM-Mausfokus frei).
    - **Geteilte Zwischenablage:** Text & Bilder automatisch zwischen Surface und PC synchronisieren (optional per Checkbox abschaltbar).
    - **Quick File Transfer:** Dateien einfach per **Drag & Drop** ins Hauptfenster oder direkt in ein gestreamtes Monitorfenster ziehen (oder *"Datei(en) senden..."* nutzen); empfangene Dateien landen in `%USERPROFILE%\Downloads\Screen2PC`.
-   - **KVM (Maus & Tastatur PC -> Surface):** Steuere das Surface direkt mit PC-Maus und -Tastatur im Streamfenster (umschaltbar per **`Strg + Alt + K`** oder Checkbox; komplett ohne Global Hooks auf dem PC).
+   - **KVM (Maus & Tastatur PC -> Surface):** Klick ins Streamfenster (oder Vollbild-Fokus) bindet die PC-Maus nahtlos auf das gesamte Surface-Desktop-Setup (Du kannst frei ueber alle PC-Monitore **und** direkt auf den physischen Surface-Bildschirm hinueberfahren, um Fenster herueberzuziehen; **`ESC`** oder **`Strg + Alt + K`** gibt die PC-Maus jederzeit wieder frei — komplett ohne Treiber oder Global Hooks auf dem PC).
+   - **Bitrate & Flussigkeit:** Einstellbar zwischen **`25 / 50 / 80 (Standard) / 120 / 200 Mbit/s`** bei voller Monitor-Refreshrate (bis 120 Hz).
 
 ---
 

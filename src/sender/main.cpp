@@ -6,6 +6,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <objbase.h>
+#include <timeapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +25,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winmm.lib")
 
 namespace {
 
@@ -61,6 +63,7 @@ bool g_scanning = false;
 std::thread g_scanThread;
 std::thread g_connectThread;
 std::atomic<bool> g_closing{false};
+std::atomic<bool> g_connectBusy{false};
 
 std::wstring GetIniPath() {
     wchar_t buf[MAX_PATH]{};
@@ -177,7 +180,11 @@ void StartAsyncDiscovery() {
 
 void OnToggleConnect() {
     if (!g_engine || !g_hwnd) return;
-    if (!IsWindowEnabled(GetDlgItem(g_hwnd, IDC_BTN_CONNECT))) return;
+    if (g_connectBusy.exchange(true)) return;
+    if (!IsWindowEnabled(GetDlgItem(g_hwnd, IDC_BTN_CONNECT))) {
+        g_connectBusy = false;
+        return;
+    }
     if (g_engine->IsConnected()) {
         EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_CONNECT), FALSE);
         SetDlgItemTextW(g_hwnd, IDC_STATUS_LABEL, L"Status: Trenne Verbindung...");
@@ -189,6 +196,7 @@ void OnToggleConnect() {
             if (g_engine && !g_closing.load()) {
                 g_engine->Disconnect();
             }
+            g_connectBusy = false;
             if (!g_closing.load() && g_hwnd) {
                 PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
             }
@@ -201,6 +209,7 @@ void OnToggleConnect() {
     std::wstring ipW(ipBuf);
     while (!ipW.empty() && ipW.back() == L' ') ipW.pop_back();
     if (ipW.empty()) {
+        g_connectBusy = false;
         MessageBoxW(g_hwnd, L"Bitte waehle einen gefundenen PC aus oder gib die IP-Adresse des PCs ein.", L"Screen2PC Sender", MB_ICONINFORMATION);
         return;
     }
@@ -219,8 +228,8 @@ void OnToggleConnect() {
     cfg.codec = (codecIdx == 1) ? s2p::CodecType::DeltaLossless : s2p::CodecType::H264;
 
     LRESULT brIdx = SendDlgItemMessageW(g_hwnd, IDC_BITRATE_COMBO, CB_GETCURSEL, 0, 0);
-    const uint32_t bitrates[] = { 15, 25, 40, 60 };
-    cfg.bitrateMbps = (brIdx >= 0 && brIdx < 4) ? bitrates[brIdx] : 25;
+    const uint32_t bitrates[] = { 25, 50, 80, 120, 200 };
+    cfg.bitrateMbps = (brIdx >= 0 && brIdx < 5) ? bitrates[brIdx] : 80;
     cfg.targetFps = 60;
 
     SaveSetting(L"ModeIdx", static_cast<int>(modeIdx));
@@ -237,6 +246,7 @@ void OnToggleConnect() {
         if (g_engine && !g_closing.load()) {
             g_engine->Connect(cfg);
         }
+        g_connectBusy = false;
         if (!g_closing.load() && g_hwnd) {
             PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
         }
@@ -282,12 +292,13 @@ void CreateUiControls(HWND hwnd) {
     int savedCodec = std::clamp(LoadSetting(L"CodecIdx", 0), 0, 1);
     SendMessageW(codecCb, CB_SETCURSEL, savedCodec, 0);
 
-    HWND brCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 386, 138, 110, 120, IDC_BITRATE_COMBO);
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"15 Mbit/s"));
+    HWND brCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 386, 138, 110, 160, IDC_BITRATE_COMBO);
     SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"25 Mbit/s"));
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"40 Mbit/s"));
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"60 Mbit/s"));
-    int savedBr = std::clamp(LoadSetting(L"BitrateIdx", 1), 0, 3);
+    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"50 Mbit/s"));
+    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"80 Mbit/s"));
+    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"120 Mbit/s"));
+    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"200 Mbit/s"));
+    int savedBr = std::clamp(LoadSetting(L"BitrateIdx", 2), 0, 4);
     SendMessageW(brCb, CB_SETCURSEL, savedBr, 0);
 
     addCtrl(L"BUTTON", L"Verbinden (Ctrl+Shift+K)", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 178, 480, 34, IDC_BTN_CONNECT);
@@ -491,6 +502,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    timeBeginPeriod(1);
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
@@ -501,6 +513,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     if (!wsa.Ok()) {
         MessageBoxW(nullptr, L"Winsock2 Initialisierung fehlgeschlagen.", L"Screen2PC Sender", MB_ICONERROR);
         CoUninitialize();
+        timeEndPeriod(1);
         return 1;
     }
 
@@ -535,5 +548,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     engine.Disconnect();
     CoUninitialize();
+    timeEndPeriod(1);
     return 0;
 }

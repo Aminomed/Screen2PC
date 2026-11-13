@@ -93,6 +93,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoContext> m_videoCtx;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> m_vpEnum;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> m_vp;
+    ID3D11Texture2D* m_vpInTex = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_vpInView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Tex;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_vpOutView;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingNv12;

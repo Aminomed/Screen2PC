@@ -105,6 +105,7 @@ void FileTransfer::Start(TcpSocket sock, const std::wstring& customDownloadDir) 
     Stop();
     if (!sock.IsValid()) return;
 
+    std::lock_guard<std::mutex> lifeLock(m_lifecycleMutex);
     m_stop = false;
     m_sock = std::move(sock);
     m_sock.TuneLowLatency(2 * 1024 * 1024);
@@ -132,8 +133,22 @@ void FileTransfer::Stop() {
     m_queueCv.notify_all();
     m_sock.Close();
 
-    if (m_sendThread.joinable()) m_sendThread.join();
-    if (m_recvThread.joinable()) m_recvThread.join();
+    std::thread sendToJoin;
+    std::thread recvToJoin;
+    {
+        std::lock_guard<std::mutex> lifeLock(m_lifecycleMutex);
+        if (m_sendThread.joinable()) sendToJoin = std::move(m_sendThread);
+        if (m_recvThread.joinable()) recvToJoin = std::move(m_recvThread);
+    }
+
+    if (sendToJoin.joinable()) {
+        if (sendToJoin.get_id() == std::this_thread::get_id()) sendToJoin.detach();
+        else sendToJoin.join();
+    }
+    if (recvToJoin.joinable()) {
+        if (recvToJoin.get_id() == std::this_thread::get_id()) recvToJoin.detach();
+        else recvToJoin.join();
+    }
 
     {
         std::lock_guard<std::mutex> qLock(m_queueMutex);

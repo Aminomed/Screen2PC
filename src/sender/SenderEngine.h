@@ -123,9 +123,13 @@ private:
 
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_connected{false};
+    std::atomic<bool> m_connecting{false};
+    std::atomic<bool> m_disconnecting{false};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
     std::atomic<bool> m_createdVirtualDisplays{false};
+    mutable std::atomic<bool> m_cachedDriverActive{false};
+    mutable std::atomic<ULONGLONG> m_lastDriverCheckMs{0};
 
     TcpSocket m_controlSock;
     std::mutex m_controlSendMutex;

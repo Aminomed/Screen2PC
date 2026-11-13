@@ -57,6 +57,7 @@ public:
     void SetStartFullscreen(bool fs) { m_startFullscreen = fs; }
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
     void SetKvmEnabled(bool enabled) { m_kvmEnabled = enabled; }
+    bool IsKvmEnabled() const { return m_kvmEnabled.load(); }
     size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
     ReceiverStatus GetStatus() const;

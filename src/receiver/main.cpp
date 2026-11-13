@@ -6,6 +6,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <objbase.h>
+#include <timeapi.h>
 
 #include <iomanip>
 #include <sstream>
@@ -20,6 +21,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "winmm.lib")
 
 namespace {
 
@@ -126,6 +128,12 @@ void UpdateUi() {
     SetDlgItemTextW(g_hwnd, IDC_INFO_LABEL, hdr.str().c_str());
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_DISCONN), st.sessionActive ? TRUE : FALSE);
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SENDFILE), st.fileStats.active ? TRUE : FALSE);
+
+    bool kvmOn = g_engine->IsKvmEnabled();
+    LRESULT chkState = SendDlgItemMessageW(g_hwnd, IDC_CHK_KVM, BM_GETCHECK, 0, 0);
+    if ((chkState == BST_CHECKED) != kvmOn) {
+        SendDlgItemMessageW(g_hwnd, IDC_CHK_KVM, BM_SETCHECK, kvmOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
 
     std::wostringstream body;
     if (!st.sessionActive) {
@@ -340,6 +348,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    timeBeginPeriod(1);
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
@@ -350,6 +359,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     if (!wsa.Ok()) {
         MessageBoxW(nullptr, L"Winsock2 Initialisierung fehlgeschlagen.", L"Screen2PC Receiver", MB_ICONERROR);
         CoUninitialize();
+        timeEndPeriod(1);
         return 1;
     }
 
@@ -361,6 +371,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         MessageBoxW(nullptr, L"Konnte Receiver-Port 48211 nicht oeffnen (evtl. laeuft Screen2PC Receiver bereits).",
                     L"Screen2PC Receiver", MB_ICONERROR);
         CoUninitialize();
+        timeEndPeriod(1);
         return 1;
     }
 
@@ -392,5 +403,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     engine.Stop();
     CoUninitialize();
+    timeEndPeriod(1);
     return 0;
 }

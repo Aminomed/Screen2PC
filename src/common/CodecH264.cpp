@@ -131,6 +131,8 @@ void H264Encoder::Shutdown() {
     m_codecApi.Reset();
     m_eventGen.Reset();
     m_mft.Reset();
+    m_vpInView.Reset();
+    m_vpInTex = nullptr;
     m_vpOutView.Reset();
     m_vp.Reset();
     m_vpEnum.Reset();
@@ -437,18 +439,24 @@ bool H264Encoder::EnsureVideoProcessor() {
 bool H264Encoder::ConvertBgraToNv12Gpu(ID3D11Texture2D* bgraTex) {
     if (!EnsureVideoProcessor()) return false;
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivd.Texture2D.MipSlice = 0;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inView;
-    HRESULT hr = m_videoDev->CreateVideoProcessorInputView(bgraTex, m_vpEnum.Get(), &ivd, &inView);
-    if (FAILED(hr)) return false;
+    if (!m_vpInView || m_vpInTex != bgraTex) {
+        m_vpInView.Reset();
+        m_vpInTex = bgraTex;
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivd.Texture2D.MipSlice = 0;
+        HRESULT hr = m_videoDev->CreateVideoProcessorInputView(bgraTex, m_vpEnum.Get(), &ivd, &m_vpInView);
+        if (FAILED(hr)) {
+            m_vpInTex = nullptr;
+            return false;
+        }
+    }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
-    stream.pInputSurface = inView.Get();
+    stream.pInputSurface = m_vpInView.Get();
 
-    hr = m_videoCtx->VideoProcessorBlt(m_vp.Get(), m_vpOutView.Get(), 0, 1, &stream);
+    HRESULT hr = m_videoCtx->VideoProcessorBlt(m_vp.Get(), m_vpOutView.Get(), 0, 1, &stream);
     return SUCCEEDED(hr);
 }
 
@@ -591,10 +599,15 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
             if (FAILED(hr)) return false;
             fedInput = true;
         }
-        for (int iter = 0; iter < 16; ++iter) {
+        for (int iter = 0; iter < 32; ++iter) {
             Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
-            hr = m_eventGen->GetEvent(0, &ev);
-            if (FAILED(hr)) return false;
+            // After we have output, drain any remaining ready events non-blockingly
+            DWORD waitFlag = (fedInput && !outAnnexB.empty()) ? MF_EVENT_FLAG_NO_WAIT : 0;
+            hr = m_eventGen->GetEvent(waitFlag, &ev);
+            if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+                break;
+            }
+            if (FAILED(hr)) return !outAnnexB.empty();
             MediaEventType met = MEUnknown;
             ev->GetType(&met);
             if (met == METransformNeedInput) {
@@ -604,7 +617,11 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                     fedInput = true;
                 } else {
                     m_asyncNeedInput = true;
-                    return true;
+                    // Do NOT abort waiting for METransformHaveOutput of the frame we just fed,
+                    // unless we already collected output in this call.
+                    if (!outAnnexB.empty()) {
+                        break;
+                    }
                 }
             } else if (met == METransformHaveOutput) {
                 DWORD status = 0;
@@ -634,7 +651,6 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                 if (outBuf.pEvents) outBuf.pEvents->Release();
                 if (!outAnnexB.empty()) {
                     if (!outIsKeyframe) outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size());
-                    return true;
                 }
             }
         }

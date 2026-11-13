@@ -48,12 +48,13 @@ private:
     std::atomic<bool> m_enabled{ true };
     std::atomic<bool> m_running{ false };
 
+    std::mutex m_lifecycleMutex;
     std::mutex m_hashMutex;
     uint64_t m_lastHash = 0;
 
     std::thread m_thread;
-    DWORD m_threadId = 0;
-    HWND m_hwnd = nullptr;
+    std::atomic<DWORD> m_threadId{ 0 };
+    std::atomic<HWND> m_hwnd{ nullptr };
     HANDLE m_readyEvent = nullptr;
 };
 

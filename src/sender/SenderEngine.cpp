@@ -3,6 +3,7 @@
 #include "../common/KvmInput.h"
 #include "../common/Logger.h"
 
+#include <objbase.h>
 #include <algorithm>
 #include <chrono>
 #include <set>
@@ -10,6 +11,15 @@
 namespace s2p {
 
 namespace {
+
+struct ComScope {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ~ComScope() {
+        if (SUCCEEDED(hr)) {
+            CoUninitialize();
+        }
+    }
+};
 
 uint64_t NowUs() {
     auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -96,20 +106,25 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     DisconnectInternal();
 
     {
+        bool active = VirtualDisplayCtl::IsDriverActive();
+        m_cachedDriverActive.store(active);
+        m_lastDriverCheckMs.store(GetTickCount64());
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_cfg = cfg;
         m_status = SenderStatus{};
         m_status.connecting = true;
-        m_status.driverActive = VirtualDisplayCtl::IsDriverActive();
+        m_status.driverActive = active;
         m_status.peerIp = cfg.targetIp;
         m_status.stateText = L"Verbinde mit PC...";
     }
 
     m_stop = false;
     m_connected = false;
+    m_connecting = true;
     m_createdVirtualDisplays = false;
 
     if (!m_controlSock.Connect(cfg.targetIp, cfg.controlPort, 3000)) {
+        m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
         m_status.stateText = L"Verbindung fehlgeschlagen";
@@ -129,6 +144,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     helloReq.targetFps = cfg.targetFps;
 
     if (!m_controlSock.SendPacket(MsgType::HelloSender, &helloReq, sizeof(helloReq))) {
+        m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
         m_status.lastError = L"Handshake senden fehlgeschlagen.";
@@ -141,6 +157,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     if (!m_controlSock.RecvPacket(hdr, payload) ||
         hdr.type != static_cast<uint16_t>(MsgType::HelloReceiver) ||
         payload.size() < sizeof(HelloReceiverPayload)) {
+        m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
         m_status.lastError = L"Ungueltige Handshake-Antwort vom PC.";
@@ -153,6 +170,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     helloResp.pcName[_countof(helloResp.pcName) - 1] = L'\0';
 
     if (helloResp.monitorCount == 0) {
+        m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
         m_status.lastError = L"PC meldet 0 Monitore.";
@@ -163,6 +181,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     std::vector<DisplayOutputInfo> captureOutputs;
     std::wstring vddErr;
     if (!SetupVirtualDisplays(helloResp, cfg, captureOutputs, vddErr)) {
+        m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
         m_status.stateText = L"Display-Setup fehlgeschlagen";
@@ -179,7 +198,10 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         startReq.streams[i].monitorIndex = targetPcMon;
         startReq.streams[i].width = captureOutputs[i].width;
         startReq.streams[i].height = captureOutputs[i].height;
-        startReq.streams[i].refreshHz = (helloResp.monitors[targetPcMon].refreshHz > 0) ? helloResp.monitors[targetPcMon].refreshHz : cfg.targetFps;
+        uint32_t monHz = (helloResp.monitors[targetPcMon].refreshHz >= 30 && helloResp.monitors[targetPcMon].refreshHz <= 240)
+                             ? helloResp.monitors[targetPcMon].refreshHz
+                             : cfg.targetFps;
+        startReq.streams[i].refreshHz = monHz;
         startReq.streams[i].codec = static_cast<uint8_t>(cfg.codec);
         startReq.streams[i].bitrateMbps = cfg.bitrateMbps;
     }
@@ -228,7 +250,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->refreshHz = startReq.streams[i].refreshHz;
         w->codec = cfg.codec;
         w->bitrateMbps = cfg.bitrateMbps;
-        w->targetFps = cfg.targetFps;
+        w->targetFps = std::max<uint32_t>(cfg.targetFps, std::min<uint32_t>(startReq.streams[i].refreshHz, 120u));
         w->peerIp = cfg.targetIp;
         w->streamPort = static_cast<uint16_t>(kPortStreamBase + i);
         w->stats.monitorIndex = startReq.streams[i].monitorIndex;
@@ -245,6 +267,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     }
 
     m_connected = true;
+    m_connecting = false;
     m_clipboard.SetEnabled(m_clipboardEnabled.load());
     m_clipboard.Start([this](uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
         SendClipboardData(kind, hash64, data);
@@ -403,6 +426,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
 }
 
 void SenderEngine::ControlLoop() {
+    ComScope comScope;
     auto lastHeartbeat = std::chrono::steady_clock::now();
     while (!m_stop && m_controlSock.IsValid()) {
         int wr = m_controlSock.WaitReadable(50);
@@ -421,7 +445,7 @@ void SenderEngine::ControlLoop() {
                     std::memcpy(&req, payload.data(), sizeof(req));
                     std::lock_guard<std::mutex> wl(m_workersMutex);
                     for (auto& w : m_workers) {
-                        if (w->streamIndex == req.monitorIndex) {
+                        if (w->streamIndex == req.monitorIndex || w->targetPcMonitor == req.monitorIndex) {
                             w->forceKeyframe = true;
                         }
                     }
@@ -446,7 +470,7 @@ void SenderEngine::ControlLoop() {
                         {
                             std::lock_guard<std::mutex> wl(m_workersMutex);
                             for (const auto& w : m_workers) {
-                                if (w->streamIndex == ev.monitorIndex) {
+                                if (w->streamIndex == ev.monitorIndex || w->targetPcMonitor == ev.monitorIndex) {
                                     rect = w->desktopRect;
                                     if (rect.right <= rect.left || rect.bottom <= rect.top) {
                                         rect = RECT{ 0, 0, static_cast<LONG>(w->width), static_cast<LONG>(w->height) };
@@ -521,6 +545,7 @@ void SenderEngine::SendClipboardData(uint32_t kind, uint64_t hash64, const std::
 }
 
 void SenderEngine::RunStreamWorker(StreamWorker* w) {
+    ComScope comScope;
     Logger::Instance().Info("SND-WRK", L"Starting worker for monitor " + std::to_wstring(w->targetPcMonitor) +
                             L" (" + std::to_wstring(w->width) + L"x" + std::to_wstring(w->height) + L")");
 
@@ -586,7 +611,10 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
     }
 
-    const uint32_t frameIntervalMs = std::max<uint32_t>(4u, 1000u / std::max<uint32_t>(15u, w->targetFps));
+    // Use a short AcquireNextFrame wait so cursor updates and frames are dispatched immediately
+    // without sleeping away an entire frame interval (~16-31 ms) whenever only the mouse moves.
+    const uint32_t targetFps = std::clamp<uint32_t>(w->targetFps, 30u, 120u);
+    const uint32_t acqTimeoutMs = std::max<uint32_t>(4u, std::min<uint32_t>(8u, 1000u / targetFps));
     auto windowStart = std::chrono::steady_clock::now();
     uint64_t windowFrames = 0;
     uint64_t windowBytes = 0;
@@ -594,13 +622,11 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     uint32_t consecutiveH264Fails = 0;
 
     while (!m_stop && !w->stop) {
-        auto frameStart = std::chrono::steady_clock::now();
-
         bool hasNewImage = false;
         std::vector<DeltaRect> dirtyRects;
         CapturedCursor cursor;
-        if (!capture.AcquireFrame(frameIntervalMs, hasNewImage, dirtyRects, cursor)) {
-            Sleep(50);
+        if (!capture.AcquireFrame(acqTimeoutMs, hasNewImage, dirtyRects, cursor)) {
+            Sleep(25);
             continue;
         }
 
@@ -708,12 +734,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             windowFrames = 0;
             windowBytes = 0;
         }
-
-        auto spentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - frameStart).count();
-        if (spentMs < static_cast<long long>(frameIntervalMs) && !hasNewImage) {
-            Sleep(static_cast<DWORD>(frameIntervalMs - spentMs));
-        }
     }
 
     if (sock.IsValid()) {
@@ -726,7 +746,10 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
 void SenderEngine::SignalStop() {
     m_stop = true;
-    m_controlSock.Close();
+    std::lock_guard<std::mutex> wl(m_workersMutex);
+    for (auto& w : m_workers) {
+        w->stop = true;
+    }
 }
 
 void SenderEngine::Disconnect() {
@@ -759,10 +782,10 @@ void SenderEngine::CleanupSessionResources() {
 }
 
 void SenderEngine::DisconnectInternal() {
+    m_disconnecting = true;
     m_stop = true;
     m_connected = false;
-    m_clipboard.Stop();
-    m_fileTransfer.Stop();
+    m_connecting = false;
 
     if (m_controlSock.IsValid()) {
         {
@@ -772,11 +795,23 @@ void SenderEngine::DisconnectInternal() {
         m_controlSock.Close();
     }
 
+    // Wait for ControlLoop to exit cleanly before CleanupSessionResources runs
+    // (ControlLoop calls CleanupSessionResources itself; CleanupSessionResources is mutex-serialized
+    // and ClipboardSync/FileTransfer Stop() are thread-safe, so there is no double-join race).
+    std::thread ctrlToJoin;
     if (m_controlThread.joinable()) {
-        m_controlThread.join();
+        ctrlToJoin = std::move(m_controlThread);
+    }
+    if (ctrlToJoin.joinable()) {
+        if (ctrlToJoin.get_id() == std::this_thread::get_id()) {
+            ctrlToJoin.detach();
+        } else {
+            ctrlToJoin.join();
+        }
     }
 
     CleanupSessionResources();
+    m_disconnecting = false;
 
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.connected = false;
@@ -793,7 +828,18 @@ SenderStatus SenderEngine::GetStatus() const {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         s = m_status;
     }
-    s.driverActive = VirtualDisplayCtl::IsDriverActive();
+
+    // Avoid synchronous named pipe probing during active connect, stream, or teardown;
+    // cache result and refresh every ~2.5s only when idle.
+    ULONGLONG nowMs = GetTickCount64();
+    ULONGLONG lastMs = m_lastDriverCheckMs.load();
+    if (!m_connecting.load() && !m_connected.load() && !m_disconnecting.load() &&
+        (lastMs == 0 || (nowMs - lastMs) >= 2500)) {
+        bool active = VirtualDisplayCtl::IsDriverActive();
+        m_cachedDriverActive.store(active);
+        m_lastDriverCheckMs.store(nowMs);
+    }
+    s.driverActive = m_cachedDriverActive.load();
     s.fileStats = m_fileTransfer.GetStats();
     s.streams.clear();
     std::lock_guard<std::mutex> wl(m_workersMutex);

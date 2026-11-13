@@ -38,6 +38,7 @@ bool ClipboardSync::ShouldEmit(uint64_t newHash, uint64_t lastRemoteHash) {
 
 bool ClipboardSync::Start(ChangeCallback onLocalChange) {
     Stop();
+    std::lock_guard<std::mutex> lock(m_lifecycleMutex);
     m_callback = std::move(onLocalChange);
     m_running = true;
     m_readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -48,18 +49,31 @@ bool ClipboardSync::Start(ChangeCallback onLocalChange) {
         CloseHandle(m_readyEvent);
         m_readyEvent = nullptr;
     }
-    return m_hwnd != nullptr;
+    return m_hwnd.load() != nullptr;
 }
 
 void ClipboardSync::Stop() {
     m_running = false;
-    if (m_hwnd) {
-        PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
-    } else if (m_threadId != 0) {
-        PostThreadMessageW(m_threadId, WM_QUIT, 0, 0);
+    std::thread toJoin;
+    {
+        std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+        HWND hwnd = m_hwnd.load();
+        DWORD tid = m_threadId.load();
+        if (hwnd) {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        } else if (tid != 0) {
+            PostThreadMessageW(tid, WM_QUIT, 0, 0);
+        }
+        if (m_thread.joinable()) {
+            toJoin = std::move(m_thread);
+        }
     }
-    if (m_thread.joinable()) {
-        m_thread.join();
+    if (toJoin.joinable()) {
+        if (toJoin.get_id() == std::this_thread::get_id()) {
+            toJoin.detach();
+        } else {
+            toJoin.join();
+        }
     }
     m_hwnd = nullptr;
     m_threadId = 0;
@@ -75,12 +89,13 @@ void ClipboardSync::ThreadMain() {
     wc.lpszClassName = kClipWndClass;
     RegisterClassExW(&wc);
 
-    m_hwnd = CreateWindowExW(
+    HWND hwnd = CreateWindowExW(
         0, kClipWndClass, L"Screen2PC_Clip", 0,
         0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), this);
+    m_hwnd = hwnd;
 
-    if (m_hwnd) {
-        AddClipboardFormatListener(m_hwnd);
+    if (hwnd) {
+        AddClipboardFormatListener(hwnd);
     }
     if (m_readyEvent) {
         SetEvent(m_readyEvent);
@@ -92,9 +107,9 @@ void ClipboardSync::ThreadMain() {
         DispatchMessageW(&msg);
     }
 
-    if (m_hwnd) {
-        RemoveClipboardFormatListener(m_hwnd);
-        DestroyWindow(m_hwnd);
+    if (hwnd) {
+        RemoveClipboardFormatListener(hwnd);
+        DestroyWindow(hwnd);
         m_hwnd = nullptr;
     }
 }
@@ -165,9 +180,10 @@ void ClipboardSync::OnClipboardUpdate() {
     uint32_t kind = 0;
     std::vector<uint8_t> bytes;
 
+    HWND hwnd = m_hwnd.load();
     bool opened = false;
     for (int attempt = 0; attempt < 3; ++attempt) {
-        if (OpenClipboard(m_hwnd)) {
+        if (hwnd && OpenClipboard(hwnd)) {
             opened = true;
             break;
         }
@@ -226,7 +242,8 @@ void ClipboardSync::OnClipboardUpdate() {
 }
 
 bool ClipboardSync::ApplyRemote(uint32_t kind, uint64_t hash64, const uint8_t* data, size_t size) {
-    if (!m_enabled.load() || !m_hwnd || !data || size == 0 || size > kMaxClipboardBytes) {
+    HWND hwnd = m_hwnd.load();
+    if (!m_enabled.load() || !hwnd || !data || size == 0 || size > kMaxClipboardBytes) {
         return false;
     }
     if (kind != kClipKindText && kind != kClipKindImage) {
@@ -248,7 +265,7 @@ bool ClipboardSync::ApplyRemote(uint32_t kind, uint64_t hash64, const uint8_t* d
         req->hash64 = hash64 ? hash64 : ComputeHash64(req->data.data(), req->data.size());
     }
 
-    if (!PostMessageW(m_hwnd, WM_S2P_APPLY_CLIP, 0, reinterpret_cast<LPARAM>(req))) {
+    if (!PostMessageW(hwnd, WM_S2P_APPLY_CLIP, 0, reinterpret_cast<LPARAM>(req))) {
         delete req;
         return false;
     }
