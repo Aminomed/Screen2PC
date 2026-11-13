@@ -17,6 +17,7 @@
 #include "../common/CodecH264.h"
 #include "../common/ClipboardSync.h"
 #include "../common/FileTransfer.h"
+#include "../common/KvmInput.h"
 
 namespace {
 
@@ -273,7 +274,7 @@ void TestFileTransfer() {
           "Backslash path traversal not stripped");
     CHECK(s2p::FileTransfer::SanitizeFilename(L"../../etc/passwd") == L"passwd",
           "Slash path traversal not stripped");
-    CHECK(s2p::FileTransfer::SanitizeFilename(L"C:evil:name*?.txt") == L"name__.txt",
+    CHECK(s2p::FileTransfer::SanitizeFilename(L"C:evil:name*?.txt") == L"evil_name__.txt",
           "Illegal Windows chars not sanitized");
     CHECK(s2p::FileTransfer::SanitizeFilename(L"..") == L"received_file.bin",
           "Dotdot filename not replaced");
@@ -366,6 +367,44 @@ void TestFileTransfer() {
     std::cout << "[PASS] TestFileTransfer\n";
 }
 
+void TestKvmInput() {
+    float nx = -1.0f, ny = -1.0f;
+
+    // 1. Exact 16:9 inside 16:9
+    CHECK(s2p::KvmInput::MapWindowClientToDisplayNorm(960, 540, 1920, 1080, 1920, 1080, nx, ny),
+          "16:9 center should be inside");
+    CHECK(std::abs(nx - 0.5f) < 0.001f && std::abs(ny - 0.5f) < 0.001f, "16:9 center norm mismatch");
+
+    // 2. Pillarbox: 16:9 (1600x900) inside ultrawide 2560x900 -> 480px black bars left & right
+    CHECK(!s2p::KvmInput::MapWindowClientToDisplayNorm(200, 450, 2560, 900, 1920, 1080, nx, ny),
+          "Left pillarbox bar should return inside=false");
+    CHECK(nx == 0.0f && std::abs(ny - 0.5f) < 0.001f, "Left pillarbox clamp mismatch");
+    CHECK(s2p::KvmInput::MapWindowClientToDisplayNorm(1280, 450, 2560, 900, 1920, 1080, nx, ny),
+          "Pillarbox center should return inside=true");
+    CHECK(std::abs(nx - 0.5f) < 0.001f && std::abs(ny - 0.5f) < 0.001f, "Pillarbox center mismatch");
+
+    // 3. Letterbox: 16:9 (1600x900) inside 1600x1200 -> 150px black bars top & bottom
+    CHECK(!s2p::KvmInput::MapWindowClientToDisplayNorm(800, 50, 1600, 1200, 1920, 1080, nx, ny),
+          "Top letterbox bar should return inside=false");
+    CHECK(ny == 0.0f && std::abs(nx - 0.5f) < 0.001f, "Top letterbox clamp mismatch");
+
+    // 4. Virtual desktop multi-monitor mapping (Primary 0..1920 + Virtual 1920..3840)
+    int32_t dx = -1, dy = -1;
+    RECT rightMon{ 1920, 0, 3840, 1080 };
+    s2p::KvmInput::ComputeVirtualDesktopAbs(rightMon, 0.0f, 0.0f, 0, 0, 3840, 1080, dx, dy);
+    CHECK(std::abs(dx - 32776) <= 1 && dy == 0, "Right monitor top-left virtual desk mapping mismatch");
+
+    s2p::KvmInput::ComputeVirtualDesktopAbs(rightMon, 1.0f, 1.0f, 0, 0, 3840, 1080, dx, dy);
+    CHECK(dx == 65535 && dy == 65535, "Right monitor bottom-right virtual desk mapping mismatch");
+
+    // 5. Negative left monitor mapping (-1920..0 left of primary 0..1920)
+    RECT leftMon{ -1920, 0, 0, 1080 };
+    s2p::KvmInput::ComputeVirtualDesktopAbs(leftMon, 0.0f, 0.5f, -1920, 0, 3840, 1080, dx, dy);
+    CHECK(dx == 0 && std::abs(dy - 32768) <= 32, "Negative-left monitor mapping mismatch");
+
+    std::cout << "[PASS] TestKvmInput\n";
+}
+
 } // namespace
 
 int main() {
@@ -380,6 +419,7 @@ int main() {
     TestLoopbackNetworking();
     TestClipboardSync();
     TestFileTransfer();
+    TestKvmInput();
 
     CoUninitialize();
 

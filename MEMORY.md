@@ -6,9 +6,9 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Phase 2B (Quick File Transfer) — Bereit zur CI-Verifikation`
-- **Status:** Shared Clipboard (Phase 2A) ist CI-grün (`43332884439`). Phase 2B (`FileTransfer` auf dediziertem `TCP 48214` Full-Duplex-Kanal mit 64-KB-Chunks, CRC32, Path-Sanitization, Auto-Rename bei Kollision & Drag&Drop auf Haupt- und Render-Fenster) ist implementiert. Als nächstes folgt Phase 3 (KVM Maus/Tastatur PC -> Surface, treiberfrei).
-- **Next Step:** CI für Phase 2B prüfen, anschließend Phase 3 (`KvmInput` mit `SendInput`) umsetzen und abschließend gründlich debuggen & stresstesten.
+- **Phase:** `Phase 3 (KVM Maus/Tastatur) — Implementiert, bereit fuer CI-Verifikation & Final Audit`
+- **Status:** Shared Clipboard (Phase 2A), Quick File Transfer (Phase 2B inkl. `SanitizeFilename`-Fix) und treiberfreies KVM (Phase 3 via `WM_*` -> `SendInput`) sind komplett implementiert und verdrahtet.
+- **Next Step:** GitHub Actions Windows CI (`Release|x64` Build + 6 Unit-/Integrations-Testsuiten + `infverif`/`Inf2Cat`) fuer Phase 2B + Phase 3 pruefen, Compiler-Warnings & Edge-Cases auditieren.
 
 ---
 
@@ -27,7 +27,7 @@
 1. **Sprache & Stack: Reines C++20 (Win32 + D3D11 + DXGI + Media Foundation + Winsock2 + UMDF2 `IddCx`)**
    - *Warum gegen .NET 8 + C++ Core:* Spart die ~70 MB Runtime / P/Invoke-Interop-Schicht, spart RAM auf dem 8-GB-Surface, verhindert GC-Microruckler und hält App + GPU-Pipeline + Treiber in einer einheitlichen Solution (`Screen2PC.sln`).
 2. **PC bleibt komplett treiberfrei (Pure User-Mode):**
-   - `Screen2PC.Receiver.exe` nutzt nur Standard-Win32/D3D11/Media Foundation -> keinerlei Konflikt mit Kernel-Anti-Cheat auf dem Gaming-PC.
+   - `Screen2PC.Receiver.exe` nutzt nur Standard-Win32/D3D11/Media Foundation -> keinerlei Konflikt mit Kernel-Anti-Cheat auf dem Gaming-PC. Auch KVM erfasst Eingaben nur ueber normale Fenster-Messages (`WM_*`) des aktiven Streamfensters (kein `SetWindowsHookEx` Global Hook!).
 3. **Virtuelle Monitore auf dem Surface (`Screen2PC.Driver` — UMDF v2 `IddCx`):**
    - Minimaler User-Mode-Display-Treiber ohne Kernel-`.sys`.
    - Kommunikation `Sender <-> Driver` über Named Pipe `\\.\pipe\Screen2PC_VDD` (mit `Authenticated Users` ACL) + Fallback `%ProgramData%\Screen2PC\monitors.cfg` (umgeht das bekannte `IndirectKmd.sys` `CreateFile` Access-Denied-Problem nach Reboots).
@@ -35,7 +35,7 @@
 4. **Dual-Codec-Strategie (Ausfallsicher + Maximum Qualität/Speed):**
    - **Standard (`H.264 Low-Latency`):** Hardware-Encoding via Media Foundation MFT (AMD VCN auf Surface) -> Hardware-Decoding (Nvidia RTX 4070 NVDEC auf PC), 20–35 Mbit/s pro Monitor, Software-MFT-Fallback integriert.
    - **Sharp-Modus / Fallback (`Lossless Dirty-Rect Delta`):** Nutzt `DXGI` Dirty-Rects + schnellen Lossless-Tile-Codec (4:4:4 RGB, perfekt scharfer Text für Code/Office, minimale Bandbreite bei statischem Desktop).
-5. **Transport:** UDP Broadcast Discovery (`48210`) + TCP Control (`48211`) + dedizierte `TCP_NODELAY`-Streams pro Monitor (`48212+`) mit Queue-Cap (kein Packet-Loss-Artefakt-Schmieren wie bei ungeschütztem UDP, gleichzeitig keine Bufferbloat-Latenz).
+5. **Transport:** UDP Broadcast Discovery (`48210`) + TCP Control (`48211`, inkl. `ClipboardSync` & `KvmMouse`/`KvmKey`) + dedizierte `TCP_NODELAY`-Streams pro Monitor (`48212+`) + dedizierter File-Transfer-Kanal (`48214`) mit CRC32-Chunking.
 
 ---
 
@@ -44,12 +44,12 @@
 |---|---|
 | `MEMORY.md` | Zentrale Planungs-, Architektur- & Changelog-Datei |
 | `Screen2PC.sln`, `packages.config`, `Directory.Build.props` | VS 2022 Solution + WDK/SDK NuGet-Integration fuer CI |
-| `src/common/` | `Protocol.h`, `Logger`, `NetSocket` (UDP/TCP), `CodecH264` (MF GPU+CPU), `CodecDelta` (Lossless RLE), `ClipboardSync` (CF_UNICODETEXT + CF_DIB), `FileTransfer` (TCP 48214 CRC32 Chunk-Transfer) |
+| `src/common/` | `Protocol.h`, `Logger`, `NetSocket` (UDP/TCP), `CodecH264` (MF GPU+CPU), `CodecDelta` (Lossless RLE), `ClipboardSync` (`CF_UNICODETEXT` + `CF_DIB`), `FileTransfer` (TCP `48214` CRC32 Chunk-Transfer), `KvmInput` (Aspect-Letterbox-Mapping + Virtual-Desktop `SendInput`) |
 | `src/driver/` | UMDF v2 `IddCx 1.2` Virtual Display Driver (`Screen2PCDriver.dll`, `Screen2PCDriver.inf`, Named Pipe) |
 | `src/driversetup/` | Eigenstaendiges CLI (`Screen2PC.DriverSetup.exe`) fuer SetupAPI/Devnode Install/Remove/Status |
 | `src/sender/` | Surface App (`DxgiCapture`, `VirtualDisplayCtl`, `SenderEngine`, Win32 Tray/GUI + `Ctrl+Shift+K`) |
-| `src/receiver/` | PC App (`D3D11Renderer` mit Cursor-Overlay & `F11`/`ESC`, `ReceiverEngine`, Win32 Tray/GUI) |
-| `src/tests/` | Automatisierte Unit- & Integrationstests (`Screen2PC.Tests.exe`) |
+| `src/receiver/` | PC App (`D3D11Renderer` mit Cursor-Overlay, KVM-Capture, Drag&Drop & `F11`/`ESC`/`Ctrl+Alt+K`, `ReceiverEngine`, Win32 Tray/GUI) |
+| `src/tests/` | Automatisierte Unit- & Integrationstests (`Screen2PC.Tests.exe`, 6 Testsuiten inkl. KVM & FileTransfer) |
 | `scripts/` | `install_driver.ps1` & `uninstall_driver.ps1` (nur fuer Surface!) |
 | `.github/workflows/ci.yml` | Automatischer Windows x64 Build, Testlauf, `infverif`/`Inf2Cat` & Artifact ZIP |
 
@@ -66,4 +66,5 @@
 | 2026-11-12 | CI Verifikation | GitHub Actions Run gruen (`43330726483` / `43331141875`): MSBuild `Release|x64`, `Screen2PC.Tests.exe` (4/4 Testsuiten bestanden), `infverif.exe`, `Inf2Cat.exe` & Artifact `Screen2PC-Windows-x64.zip` komplett erfolgreich |
 | 2026-11-13 | Phase 1: Deep Debug & Hardening | `ReceiverEngine` Control-Mutex-Deadlock (`m_ctrlSendMutex` + `WaitReadable`) gefixt; `TcpSocket::SendPacket` auf Single-Send gebuendelt; `D3D11Renderer` `m_quadCb` & `WM_PAINT`/`WM_SIZE`-Repaint optimiert; `H264Encoder` Staging-Texture gecached; `Driver` `AdapterInitFinished`-Race & Fehler-Cleanup gefixt; `DisplayMode::ExtendSecondary` (nur PC-Monitor 2) + `SetDisplayConfig`-Extend-Fallback + `sender.ini`/`receiver.ini` Settings-Persistenz + `1080p` H.264/Delta-Corruption/Large-TCP-Tests ergaenzt |
 | 2026-11-13 | Phase 2A: Shared Clipboard | `ClipboardSync` (`HWND_MESSAGE` + `AddClipboardFormatListener`, `CF_UNICODETEXT` bis 2 MB + `CF_DIB` bis 16 MB, 64-Bit FNV-1a Anti-Echo, `OpenClipboard`-Retry) erstellt und in `Protocol.h`, `SenderEngine`, `ReceiverEngine`, Sender/Receiver UI (inkl. INI-Persistenz) und Unit-Tests verdrahtet (CI gruen `43332884439`) |
-| 2026-11-13 | Phase 2B: Quick File Transfer | `FileTransfer` (`TCP 48214` Full-Duplex, 64-KB-Chunks + CRC32-Pruefung, `.part`-Tempdatei, Path-Traversal-Sanitization, Auto-Rename `datei (1).ext`) erstellt und via `WM_DROPFILES` Drag&Drop (Hauptfenster + `D3D11Renderer`-Fenster), Dateiauswahl-Dialog (`GetOpenFileNameW`), Ordner-Button & Loopback-Test verdrahtet |
+| 2026-11-13 | Phase 2B: Quick File Transfer | `FileTransfer` (`TCP 48214` Full-Duplex, 64-KB-Chunks + CRC32-Pruefung, `.part`-Tempdatei, Path-Traversal-Sanitization, Auto-Rename `datei (1).ext`) erstellt und via `WM_DROPFILES` Drag&Drop (Hauptfenster + `D3D11Renderer`-Fenster), Dateiauswahl-Dialog (`GetOpenFileNameW`), Ordner-Button & Loopback-Test verdrahtet; `SanitizeFilename` Drive-Prefix-Fix ergaenzt |
+| 2026-11-13 | Phase 3: Pure User-Mode KVM | `KvmInput` (Aspect-Letterbox-Mapping + Multi-Monitor Virtual Desktop `SendInput`), `MsgType::KvmMouse`/`KvmKey`, `D3D11Renderer` Maus-/Tastaturerfassung + `Ctrl+Alt+K`-Toggle + `WM_KILLFOCUS`-Modifier-Release, `ReceiverEngine`/`SenderEngine` Forwarding & Injektion, Checkboxen/INI in Sender/Receiver, Thread-Join-Race in `SenderEngine::Disconnect` gefixt & `TestKvmInput` ergaenzt |

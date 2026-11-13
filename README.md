@@ -22,11 +22,14 @@
    ```
    *(Falls Windows Code Integrity den selbstsignierten lokalen Treiber mit Fehler 52 blockiert: auf dem Surface `bcdedit /set testsigning on` ausfuehren und neu starten — **niemals** auf dem PC.)*
 3. Starte **`Screen2PC.Sender.exe`**.
-4. Waehle den automatisch gefundenen PC (oder gib die PC-IP ein), waehle Modus (**Erweitern Alle Monitore**, **Erweitern Monitor 1** oder **Spiegeln**) sowie Codec:
+4. Waehle den automatisch gefundenen PC (oder gib die PC-IP ein), waehle Modus (**Erweitern Alle Monitore**, **Erweitern Monitor 1**, **Erweitern Monitor 2** oder **Spiegeln**) sowie Codec:
    - **H.264 Low-Latency:** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC (inkl. CPU-MFT-Fallback).
    - **Delta Lossless (4:4:4):** Nutzt DXGI-Dirty-Rects + verlustfreien Tile-RLE-Codec fuer gestochen scharfen Text/Code.
 5. Klicke **Verbinden** (oder jederzeit global via **`Ctrl + Shift + K`**).
    - Im Vollbild auf dem PC schaltet **`F11`** / **`ESC`** zwischen randlosem Vollbild und Fenster um.
+   - **Geteilte Zwischenablage:** Text & Bilder automatisch zwischen Surface und PC synchronisieren (optional per Checkbox abschaltbar).
+   - **Quick File Transfer:** Dateien einfach per **Drag & Drop** ins Hauptfenster oder direkt in ein gestreamtes Monitorfenster ziehen (oder *"Datei(en) senden..."* nutzen); empfangene Dateien landen in `%USERPROFILE%\Downloads\Screen2PC`.
+   - **KVM (Maus & Tastatur PC -> Surface):** Steuere das Surface direkt mit PC-Maus und -Tastatur im Streamfenster (umschaltbar per **`Strg + Alt + K`** oder Checkbox; komplett ohne Global Hooks auf dem PC).
 
 ---
 
@@ -36,8 +39,8 @@
 |---|---|---|---|
 | `Screen2PC.Driver` (`IddCx 1.2`) | Nur Surface | UMDF v2 User-Mode Display Driver | Erzeugt 0..2 virtuelle Monitore dynamisch in der exakten Aufloesung der PC-Monitore ohne Kernel-`.sys`. Kommunikation via Named Pipe `\\.\pipe\Screen2PC_VDD` (mit `AU`-ACL) + `%ProgramData%\Screen2PC\monitors.cfg` umgeht das bekannte `IndirectKmd` `CreateFile` Access-Denied-Problem. |
 | `Screen2PC.DriverSetup` | Nur Surface | SetupAPI / NewDev / CfgMgr32 | Eigenstaendiges CLI zur Treiber-Installation ohne externes `devcon.exe`. |
-| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + Winsock2 | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus. |
-| `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 + Media Foundation (DXVA/NVDEC) + Winsock2 | Reiner User-Mode-Prozess. Kein Treiber, kein Kernel-Hook, Anti-Cheat-sicher. |
+| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + Winsock2 | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus; `SendInput` im User-Mode fuer KVM. |
+| `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 + Media Foundation (DXVA/NVDEC) + Winsock2 | Reiner User-Mode-Prozess. Kein Treiber, kein Kernel-Hook (`SetWindowsHookEx`), Anti-Cheat-sicher. |
 
 ### Warum reines C++20 statt ".NET 8 + C++ Core"?
 - **Vorteile von .NET 8 + C++ Core:** Schnellere GUI-Entwicklung (WPF/WinUI 3, XAML Data-Binding), komfortables Settings-/JSON-Handling.
@@ -49,5 +52,6 @@
 
 ## Ports & Sicherheit
 - **UDP `48210`:** Lokale LAN-Broadcast-Erkennung (Auto-Discovery)
-- **TCP `48211`:** Control- & Handshake-Kanal (`Hello`, `StartSession`, `Heartbeat`, `RequestKeyframe`)
+- **TCP `48211`:** Control-, Clipboard- (`ClipboardSync`), KVM- (`KvmMouse`/`KvmKey`) & Heartbeat-Kanal
 - **TCP `48212` / `48213`:** Dedizierte `TCP_NODELAY`-Videostreams pro Monitor (Monitor 1 & Monitor 2)
+- **TCP `48214`:** Dedizierter bidirektionaler Dateitransfer-Kanal mit 64-KB-Chunks & CRC32-Pruefsumme

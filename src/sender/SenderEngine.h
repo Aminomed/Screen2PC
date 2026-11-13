@@ -76,6 +76,7 @@ public:
     SenderStatus GetStatus() const;
     bool IsConnected() const { return m_connected.load(); }
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
+    void SetKvmEnabled(bool enabled) { m_kvmEnabled = enabled; }
     size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
 private:
@@ -84,6 +85,7 @@ private:
         uint32_t targetPcMonitor = 0;
         uint32_t adapterIndex = 0;
         uint32_t outputIndex = 0;
+        RECT     desktopRect{};
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t refreshHz = 60;
@@ -116,6 +118,7 @@ private:
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_clipboardEnabled{true};
+    std::atomic<bool> m_kvmEnabled{true};
     bool m_createdVirtualDisplays = false;
 
     TcpSocket m_controlSock;

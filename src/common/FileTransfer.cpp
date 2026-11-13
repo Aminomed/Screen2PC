@@ -53,10 +53,11 @@ std::wstring FileTransfer::SanitizeFilename(const std::wstring& rawName) {
     size_t pos = rawName.find_last_of(L"/\\");
     std::wstring name = (pos == std::wstring::npos) ? rawName : rawName.substr(pos + 1);
 
-    // Strip any leading drive prefix if present (e.g. "C:foo")
-    size_t colon = name.find(L':');
-    if (colon != std::wstring::npos) {
-        name = name.substr(colon + 1);
+    // Strip any leading single-letter Windows drive prefix if present (e.g. "C:foo")
+    if (name.size() >= 2 &&
+        ((name[0] >= L'A' && name[0] <= L'Z') || (name[0] >= L'a' && name[0] <= L'z')) &&
+        name[1] == L':') {
+        name = name.substr(2);
     }
 
     std::wstring cleaned;

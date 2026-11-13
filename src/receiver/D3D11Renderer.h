@@ -6,17 +6,21 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
+#include "../common/Protocol.h"
 
 namespace s2p {
 
 class D3D11Renderer {
 public:
     using FileDropCallback = std::function<void(const std::vector<std::wstring>&)>;
+    using KvmMouseCallback = std::function<void(const KvmMouseEvent&)>;
+    using KvmKeyCallback   = std::function<void(const KvmKeyEvent&)>;
 
     D3D11Renderer() = default;
     ~D3D11Renderer();
@@ -25,6 +29,12 @@ public:
     D3D11Renderer& operator=(const D3D11Renderer&) = delete;
 
     void SetFileDropCallback(FileDropCallback cb) { m_fileDropCb = std::move(cb); }
+    void SetKvmCallbacks(KvmMouseCallback mouseCb, KvmKeyCallback keyCb) {
+        m_kvmMouseCb = std::move(mouseCb);
+        m_kvmKeyCb = std::move(keyCb);
+    }
+    void SetKvmEnabled(bool enabled);
+    bool IsKvmEnabled() const { return m_kvmEnabled; }
 
     // Must be called from the thread that will pump messages & Present() for this window.
     bool Create(uint32_t monitorIndex,
@@ -78,6 +88,8 @@ private:
     bool CreateDeviceAndShaders();
     bool CreateSwapChain(uint32_t w, uint32_t h);
     void ResizeSwapChain(uint32_t w, uint32_t h);
+    void UpdateTitle();
+    void EmitMouseEvent(uint8_t action, int32_t clientX, int32_t clientY, int32_t wheelDelta = 0);
     void UpdateCursorTexture(uint8_t shapeType,
                              uint32_t width,
                              uint32_t height,
@@ -94,6 +106,7 @@ private:
     bool m_fullscreen = true;
     bool m_closedByUser = false;
     bool m_needRepaint = false;
+    bool m_kvmEnabled = true;
 
     HWND m_hwnd = nullptr;
 
@@ -122,6 +135,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cursorTex;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_cursorSrv;
     FileDropCallback m_fileDropCb;
+    KvmMouseCallback m_kvmMouseCb;
+    KvmKeyCallback m_kvmKeyCb;
+    std::chrono::steady_clock::time_point m_lastKvmMove{};
 };
 
 } // namespace s2p

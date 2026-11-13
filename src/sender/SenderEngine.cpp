@@ -1,5 +1,6 @@
 #include "SenderEngine.h"
 #include "VirtualDisplayCtl.h"
+#include "../common/KvmInput.h"
 #include "../common/Logger.h"
 
 #include <algorithm>
@@ -217,6 +218,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->targetPcMonitor = startReq.streams[i].monitorIndex;
         w->adapterIndex = captureOutputs[i].adapterIndex;
         w->outputIndex = captureOutputs[i].outputIndex;
+        w->desktopRect = captureOutputs[i].desktopRect;
         w->width = captureOutputs[i].width;
         w->height = captureOutputs[i].height;
         w->refreshHz = startReq.streams[i].refreshHz;
@@ -424,6 +426,27 @@ void SenderEngine::ControlLoop() {
                     std::memcpy(&ch, payload.data(), sizeof(ch));
                     if (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize) {
                         m_clipboard.ApplyRemote(ch.kind, ch.hash64, payload.data() + sizeof(ch), ch.dataSize);
+                    }
+                } else if (hdr.type == static_cast<uint16_t>(MsgType::KvmMouse) &&
+                           payload.size() >= sizeof(KvmMouseEvent)) {
+                    if (m_kvmEnabled.load()) {
+                        KvmMouseEvent ev{};
+                        std::memcpy(&ev, payload.data(), sizeof(ev));
+                        if (!m_workers.empty()) {
+                            size_t idx = (ev.monitorIndex < m_workers.size()) ? ev.monitorIndex : 0;
+                            RECT rect = m_workers[idx]->desktopRect;
+                            if (rect.right <= rect.left || rect.bottom <= rect.top) {
+                                rect = RECT{ 0, 0, static_cast<LONG>(m_workers[idx]->width), static_cast<LONG>(m_workers[idx]->height) };
+                            }
+                            KvmInput::InjectMouse(ev, rect);
+                        }
+                    }
+                } else if (hdr.type == static_cast<uint16_t>(MsgType::KvmKey) &&
+                           payload.size() >= sizeof(KvmKeyEvent)) {
+                    if (m_kvmEnabled.load()) {
+                        KvmKeyEvent ev{};
+                        std::memcpy(&ev, payload.data(), sizeof(ev));
+                        KvmInput::InjectKey(ev);
                     }
                 }
             } else {
@@ -656,6 +679,10 @@ void SenderEngine::Disconnect() {
         m_controlSock.Close();
     }
 
+    if (m_controlThread.joinable()) {
+        m_controlThread.join();
+    }
+
     for (auto& w : m_workers) {
         w->stop = true;
     }
@@ -663,10 +690,6 @@ void SenderEngine::Disconnect() {
         if (w->thread.joinable()) w->thread.join();
     }
     m_workers.clear();
-
-    if (m_controlThread.joinable()) {
-        m_controlThread.join();
-    }
 
     if (m_createdVirtualDisplays) {
         VirtualDisplayCtl::ClearMonitors();

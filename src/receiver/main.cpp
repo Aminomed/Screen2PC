@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
@@ -33,6 +34,7 @@ constexpr int IDC_BTN_FIREWALL = 205;
 constexpr int IDC_CHK_CLIPBOARD= 206;
 constexpr int IDC_BTN_SENDFILE = 207;
 constexpr int IDC_BTN_OPEN_DL  = 208;
+constexpr int IDC_CHK_KVM      = 209;
 
 constexpr int IDM_SHOW = 3001;
 constexpr int IDM_EXIT = 3002;
@@ -65,6 +67,14 @@ bool LoadClipboardPref() {
 
 void SaveClipboardPref(bool enabled) {
     WritePrivateProfileStringW(L"Receiver", L"ClipboardSync", enabled ? L"1" : L"0", GetReceiverIniPath().c_str());
+}
+
+bool LoadKvmPref() {
+    return GetPrivateProfileIntW(L"Receiver", L"KvmEnabled", 1, GetReceiverIniPath().c_str()) != 0;
+}
+
+void SaveKvmPref(bool enabled) {
+    WritePrivateProfileStringW(L"Receiver", L"KvmEnabled", enabled ? L"1" : L"0", GetReceiverIniPath().c_str());
 }
 
 std::vector<std::wstring> PickFilesDialog(HWND owner) {
@@ -175,13 +185,19 @@ void CreateUiControls(HWND hwnd) {
     SendMessageW(chkClip, BM_SETCHECK, clipPref ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g_engine) g_engine->SetClipboardEnabled(clipPref);
 
-    addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, 16, 156, 250, 32, IDC_BTN_DISCONN);
-    addCtrl(L"BUTTON", L"Windows Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, 276, 156, 260, 32, IDC_BTN_FIREWALL);
+    HWND chkKvm = addCtrl(L"BUTTON", L"KVM: Maus && Tastatur ans Surface senden (Strg+Alt+K im Streamfenster)",
+                          BS_AUTOCHECKBOX | WS_TABSTOP, 16, 150, 520, 24, IDC_CHK_KVM);
+    bool kvmPref = LoadKvmPref();
+    SendMessageW(chkKvm, BM_SETCHECK, kvmPref ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_engine) g_engine->SetKvmEnabled(kvmPref);
 
-    addCtrl(L"BUTTON", L"Datei(en) ans Surface senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 194, 250, 28, IDC_BTN_SENDFILE);
-    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 276, 194, 260, 28, IDC_BTN_OPEN_DL);
+    addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, 16, 184, 250, 32, IDC_BTN_DISCONN);
+    addCtrl(L"BUTTON", L"Windows Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, 276, 184, 260, 32, IDC_BTN_FIREWALL);
 
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 230, 520, 160, IDC_STATS_TEXT, g_monoFont);
+    addCtrl(L"BUTTON", L"Datei(en) ans Surface senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 222, 250, 28, IDC_BTN_SENDFILE);
+    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 276, 222, 260, 28, IDC_BTN_OPEN_DL);
+
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 258, 520, 160, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -229,6 +245,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_CLIPBOARD, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 g_engine->SetClipboardEnabled(checked);
                 SaveClipboardPref(checked);
+            }
+            return 0;
+        case IDC_CHK_KVM:
+            if (g_engine) {
+                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_KVM, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_engine->SetKvmEnabled(checked);
+                SaveKvmPref(checked);
             }
             return 0;
         case IDC_BTN_DISCONN:
@@ -328,6 +351,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     s2p::ReceiverEngine engine;
     g_engine = &engine;
     engine.SetClipboardEnabled(LoadClipboardPref());
+    engine.SetKvmEnabled(LoadKvmPref());
     if (!engine.Start(LoadFullscreenPref())) {
         MessageBoxW(nullptr, L"Konnte Receiver-Port 48211 nicht oeffnen (evtl. laeuft Screen2PC Receiver bereits).",
                     L"Screen2PC Receiver", MB_ICONERROR);
@@ -347,7 +371,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Screen2PC Receiver (PC - Treiberfrei)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 570, 446,
+        CW_USEDEFAULT, CW_USEDEFAULT, 570, 474,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

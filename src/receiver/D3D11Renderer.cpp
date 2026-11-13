@@ -1,4 +1,5 @@
 #include "D3D11Renderer.h"
+#include "../common/KvmInput.h"
 #include "../common/Logger.h"
 
 #include <d3dcompiler.h>
@@ -86,6 +87,61 @@ D3D11Renderer::~D3D11Renderer() {
     Destroy();
 }
 
+void D3D11Renderer::UpdateTitle() {
+    if (!m_hwnd) return;
+    std::wstring title = L"Screen2PC Display " + std::to_wstring(m_monitorIndex + 1) +
+                         L" (" + std::to_wstring(m_srcWidth) + L"x" + std::to_wstring(m_srcHeight) +
+                         L") - F11 Vollbild / ESC Fenster - " +
+                         (m_kvmEnabled ? L"[KVM AN - Strg+Alt+K]" : L"[KVM AUS - Strg+Alt+K]");
+    SetWindowTextW(m_hwnd, title.c_str());
+}
+
+void D3D11Renderer::SetKvmEnabled(bool enabled) {
+    if (!enabled && m_kvmEnabled && m_kvmKeyCb) {
+        const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
+        for (uint16_t vk : mods) {
+            KvmKeyEvent ev{};
+            ev.vk = vk;
+            ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+            ev.isDown = 0;
+            m_kvmKeyCb(ev);
+        }
+    }
+    m_kvmEnabled = enabled;
+    UpdateTitle();
+}
+
+void D3D11Renderer::EmitMouseEvent(uint8_t action, int32_t clientX, int32_t clientY, int32_t wheelDelta) {
+    if (!m_kvmEnabled || !m_kvmMouseCb) return;
+
+    float nx = 0.0f, ny = 0.0f;
+    bool inside = KvmInput::MapWindowClientToDisplayNorm(
+        clientX, clientY, m_winWidth, m_winHeight, m_srcWidth, m_srcHeight, nx, ny);
+
+    bool isButtonUp = (action == kMouseLeftUp || action == kMouseRightUp ||
+                       action == kMouseMidUp || action == kMouseX1Up || action == kMouseX2Up);
+    if (!inside && !isButtonUp) {
+        return;
+    }
+
+    if (action == kMouseMove) {
+        auto now = std::chrono::steady_clock::now();
+        if (m_lastKvmMove.time_since_epoch().count() != 0 &&
+            (now - m_lastKvmMove) < std::chrono::milliseconds(4)) {
+            return;
+        }
+        m_lastKvmMove = now;
+    }
+
+    KvmMouseEvent ev{};
+    ev.monitorIndex = m_monitorIndex;
+    ev.action = action;
+    ev.normX = nx;
+    ev.normY = ny;
+    ev.wheelDelta = wheelDelta;
+    m_kvmMouseCb(ev);
+}
+
 bool D3D11Renderer::Create(uint32_t monitorIndex,
                            const RECT& targetMonitorRect,
                            uint32_t sourceWidth,
@@ -112,9 +168,7 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
     int w = m_fullscreen ? monW : std::min(monW - 160, 1280);
     int h = m_fullscreen ? monH : std::min(monH - 160, 720);
 
-    std::wstring title = L"Screen2PC Display " + std::to_wstring(monitorIndex + 1) +
-                         L" (" + std::to_wstring(m_srcWidth) + L"x" + std::to_wstring(m_srcHeight) +
-                         L") - F11 Vollbild / ESC Fenster";
+    std::wstring title = L"Screen2PC Display " + std::to_wstring(monitorIndex + 1);
 
     m_hwnd = CreateWindowExW(
         0, kRendererClass, title.c_str(), style,
@@ -124,6 +178,7 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
         Logger::Instance().Error("RND-WND", L"CreateWindowExW failed, err=" + std::to_wstring(GetLastError()));
         return false;
     }
+    UpdateTitle();
 
     RECT rc{};
     GetClientRect(m_hwnd, &rc);
@@ -294,6 +349,7 @@ bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
     }
     m_srcWidth = std::max<uint32_t>(width, 1);
     m_srcHeight = std::max<uint32_t>(height, 1);
+    UpdateTitle();
     m_frameSrv.Reset();
     m_frameTex.Reset();
 
@@ -538,15 +594,109 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         }
         return 0;
     }
+    case WM_KILLFOCUS: {
+        if (m_kvmEnabled && m_kvmKeyCb) {
+            const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
+            for (uint16_t vk : mods) {
+                KvmKeyEvent ev{};
+                ev.vk = vk;
+                ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+                ev.isDown = 0;
+                m_kvmKeyCb(ev);
+            }
+        }
+        break;
+    }
     case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
         if (wp == VK_F11) {
             ToggleFullscreen();
             return 0;
-        } else if (wp == VK_ESCAPE && m_fullscreen) {
+        }
+        if (wp == VK_ESCAPE && m_fullscreen) {
             SetFullscreen(false);
             return 0;
         }
+        if ((GetKeyState(VK_CONTROL) < 0) && (GetKeyState(VK_MENU) < 0) && wp == 'K' && ((lp & (1 << 30)) == 0)) {
+            SetKvmEnabled(!m_kvmEnabled);
+            return 0;
+        }
+        if (msg == WM_SYSKEYDOWN && wp == VK_F4) {
+            break;
+        }
+        if (m_kvmEnabled && m_kvmKeyCb) {
+            KvmKeyEvent ev{};
+            ev.vk = static_cast<uint16_t>(wp);
+            ev.scanCode = static_cast<uint16_t>((lp >> 16) & 0xFF);
+            ev.isDown = 1;
+            ev.isExtended = (lp & (1 << 24)) ? 1 : 0;
+            m_kvmKeyCb(ev);
+            return 0;
+        }
         break;
+    }
+    case WM_KEYUP:
+    case WM_SYSKEYUP: {
+        if (wp == VK_F11 || (wp == VK_ESCAPE && m_fullscreen)) {
+            return 0;
+        }
+        if (msg == WM_SYSKEYUP && wp == VK_F4) {
+            break;
+        }
+        if (m_kvmEnabled && m_kvmKeyCb) {
+            KvmKeyEvent ev{};
+            ev.vk = static_cast<uint16_t>(wp);
+            ev.scanCode = static_cast<uint16_t>((lp >> 16) & 0xFF);
+            ev.isDown = 0;
+            ev.isExtended = (lp & (1 << 24)) ? 1 : 0;
+            m_kvmKeyCb(ev);
+            return 0;
+        }
+        break;
+    }
+    case WM_MOUSEMOVE:
+        EmitMouseEvent(kMouseMove, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        break;
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);
+        EmitMouseEvent(kMouseLeftDown, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) ReleaseCapture();
+        EmitMouseEvent(kMouseLeftUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return 0;
+    case WM_RBUTTONDOWN:
+        EmitMouseEvent(kMouseRightDown, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return 0;
+    case WM_RBUTTONUP:
+        EmitMouseEvent(kMouseRightUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return 0;
+    case WM_MBUTTONDOWN:
+        EmitMouseEvent(kMouseMidDown, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return 0;
+    case WM_MBUTTONUP:
+        EmitMouseEvent(kMouseMidUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return 0;
+    case WM_XBUTTONDOWN:
+        EmitMouseEvent((HIWORD(wp) == XBUTTON1) ? kMouseX1Down : kMouseX2Down,
+                       static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return TRUE;
+    case WM_XBUTTONUP:
+        EmitMouseEvent((HIWORD(wp) == XBUTTON1) ? kMouseX1Up : kMouseX2Up,
+                       static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        return TRUE;
+    case WM_MOUSEWHEEL: {
+        POINT pt{ static_cast<LONG>(static_cast<int16_t>(LOWORD(lp))), static_cast<LONG>(static_cast<int16_t>(HIWORD(lp))) };
+        ScreenToClient(hwnd, &pt);
+        EmitMouseEvent(kMouseWheel, pt.x, pt.y, static_cast<int16_t>(HIWORD(wp)));
+        return 0;
+    }
+    case WM_MOUSEHWHEEL: {
+        POINT pt{ static_cast<LONG>(static_cast<int16_t>(LOWORD(lp))), static_cast<LONG>(static_cast<int16_t>(HIWORD(lp))) };
+        ScreenToClient(hwnd, &pt);
+        EmitMouseEvent(kMouseHWheel, pt.x, pt.y, static_cast<int16_t>(HIWORD(wp)));
+        return 0;
+    }
     case WM_DROPFILES: {
         HDROP hDrop = reinterpret_cast<HDROP>(wp);
         UINT count = DragQueryFileW(hDrop, 0xFFFFFFFFu, nullptr, 0);

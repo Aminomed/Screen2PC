@@ -56,12 +56,15 @@ public:
     void DisconnectSession();
     void SetStartFullscreen(bool fs) { m_startFullscreen = fs; }
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
+    void SetKvmEnabled(bool enabled) { m_kvmEnabled = enabled; }
     size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
     ReceiverStatus GetStatus() const;
 
 private:
     void SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data);
+    void SendKvmMouse(const KvmMouseEvent& ev);
+    void SendKvmKey(const KvmKeyEvent& ev);
     struct StreamReceiverWorker {
         uint32_t monitorIndex = 0;
         uint16_t port = kPortStreamBase;
@@ -90,6 +93,7 @@ private:
     std::atomic<bool> m_sessionStop{false};
     std::atomic<bool> m_startFullscreen{true};
     std::atomic<bool> m_clipboardEnabled{true};
+    std::atomic<bool> m_kvmEnabled{true};
 
     UdpSocket m_discoverySock;
     TcpSocket m_controlListenSock;

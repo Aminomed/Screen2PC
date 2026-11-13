@@ -355,6 +355,20 @@ void ReceiverEngine::SendClipboardData(uint32_t kind, uint64_t hash64, const std
     m_activeCtrlSock.SendPacket(MsgType::ClipboardSync, pkt.data(), static_cast<uint32_t>(pkt.size()));
 }
 
+void ReceiverEngine::SendKvmMouse(const KvmMouseEvent& ev) {
+    if (!m_kvmEnabled.load() || m_sessionStop) return;
+    std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
+    if (!m_activeCtrlSock.IsValid()) return;
+    m_activeCtrlSock.SendPacket(MsgType::KvmMouse, &ev, sizeof(ev));
+}
+
+void ReceiverEngine::SendKvmKey(const KvmKeyEvent& ev) {
+    if (!m_kvmEnabled.load() || m_sessionStop) return;
+    std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
+    if (!m_activeCtrlSock.IsValid()) return;
+    m_activeCtrlSock.SendPacket(MsgType::KvmKey, &ev, sizeof(ev));
+}
+
 void ReceiverEngine::RequestKeyframe(uint32_t monitorIndex) {
     std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
     if (!m_activeCtrlSock.IsValid()) return;
@@ -382,6 +396,15 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         return;
     }
 
+    bool lastGlobalKvm = m_kvmEnabled.load();
+    renderer.SetKvmEnabled(lastGlobalKvm);
+    renderer.SetKvmCallbacks(
+        [this](const KvmMouseEvent& ev) { SendKvmMouse(ev); },
+        [this](const KvmKeyEvent& ev) { SendKvmKey(ev); });
+    renderer.SetFileDropCallback([this](const std::vector<std::wstring>& files) {
+        SendFiles(files);
+    });
+
     H264Decoder h264;
     uint32_t h264W = 0, h264H = 0;
     DeltaDecoder delta;
@@ -394,6 +417,11 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     bool needPresent = false;
 
     while (!m_stop && !m_sessionStop && !w->stop && !renderer.IsClosedByUser()) {
+        bool curGlobalKvm = m_kvmEnabled.load();
+        if (curGlobalKvm != lastGlobalKvm) {
+            lastGlobalKvm = curGlobalKvm;
+            renderer.SetKvmEnabled(curGlobalKvm);
+        }
         renderer.PumpMessages();
         if (renderer.NeedsRepaint()) {
             renderer.ClearRepaint();

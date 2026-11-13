@@ -44,6 +44,7 @@ constexpr int IDC_STATS_TEXT    = 110;
 constexpr int IDC_CHK_CLIPBOARD = 111;
 constexpr int IDC_BTN_SENDFILE  = 112;
 constexpr int IDC_BTN_OPEN_DL   = 113;
+constexpr int IDC_CHK_KVM       = 114;
 
 constexpr int IDM_SHOW   = 2001;
 constexpr int IDM_TOGGLE = 2002;
@@ -273,12 +274,18 @@ void CreateUiControls(HWND hwnd) {
     SendMessageW(chkClip, BM_SETCHECK, clipEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g_engine) g_engine->SetClipboardEnabled(clipEnabled);
 
-    addCtrl(L"BUTTON", L"Datei(en) an PC senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 248, 234, 28, IDC_BTN_SENDFILE);
-    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 262, 248, 234, 28, IDC_BTN_OPEN_DL);
+    HWND chkKvm = addCtrl(L"BUTTON", L"KVM: Maus && Tastatur vom PC auf Surface empfangen",
+                          BS_AUTOCHECKBOX | WS_TABSTOP, 16, 246, 480, 22, IDC_CHK_KVM);
+    bool kvmEnabled = LoadSetting(L"KvmEnabled", 1) != 0;
+    SendMessageW(chkKvm, BM_SETCHECK, kvmEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (g_engine) g_engine->SetKvmEnabled(kvmEnabled);
 
-    addCtrl(L"STATIC", L"", 0, 16, 284, 480, 36, IDC_DRIVER_LABEL);
-    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 322, 480, 40, IDC_STATUS_LABEL);
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 366, 480, 120, IDC_STATS_TEXT, g_monoFont);
+    addCtrl(L"BUTTON", L"Datei(en) an PC senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 274, 234, 28, IDC_BTN_SENDFILE);
+    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 262, 274, 234, 28, IDC_BTN_OPEN_DL);
+
+    addCtrl(L"STATIC", L"", 0, 16, 310, 480, 36, IDC_DRIVER_LABEL);
+    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 348, 480, 40, IDC_STATUS_LABEL);
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 392, 480, 120, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -330,6 +337,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_CLIPBOARD, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 g_engine->SetClipboardEnabled(checked);
                 SaveSetting(L"ClipboardSync", checked ? 1 : 0);
+            }
+            return 0;
+        case IDC_CHK_KVM:
+            if (g_engine) {
+                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_KVM, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                g_engine->SetKvmEnabled(checked);
+                SaveSetting(L"KvmEnabled", checked ? 1 : 0);
             }
             return 0;
         case IDC_BTN_SENDFILE:
@@ -477,7 +491,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Screen2PC Sender (Surface)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 530, 538,
+        CW_USEDEFAULT, CW_USEDEFAULT, 530, 564,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

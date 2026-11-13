@@ -66,6 +66,7 @@
     <ClInclude Include="CodecH264.h" />
     <ClInclude Include="ClipboardSync.h" />
     <ClInclude Include="FileTransfer.h" />
+    <ClInclude Include="KvmInput.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Logger.cpp" />
@@ -74,6 +75,7 @@
     <ClCompile Include="CodecH264.cpp" />
     <ClCompile Include="ClipboardSync.cpp" />
     <ClCompile Include="FileTransfer.cpp" />
+    <ClCompile Include="KvmInput.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

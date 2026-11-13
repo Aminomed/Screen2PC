@@ -48,7 +48,27 @@ enum class MsgType : uint16_t {
     // Dedicated TCP File Transfer (port 48214)
     FileMeta         = 31,
     FileChunk        = 32,
-    FileDone         = 33
+    FileDone         = 33,
+
+    // TCP Control - Pure User-Mode KVM Input (PC -> Surface)
+    KvmMouse         = 40,
+    KvmKey           = 41
+};
+
+enum KvmMouseAction : uint8_t {
+    kMouseMove      = 0,
+    kMouseLeftDown  = 1,
+    kMouseLeftUp    = 2,
+    kMouseRightDown = 3,
+    kMouseRightUp   = 4,
+    kMouseMidDown   = 5,
+    kMouseMidUp     = 6,
+    kMouseWheel     = 7,
+    kMouseHWheel    = 8,
+    kMouseX1Down    = 9,
+    kMouseX1Up      = 10,
+    kMouseX2Down    = 11,
+    kMouseX2Up      = 12
 };
 
 enum FrameFlags : uint32_t {
@@ -187,6 +207,23 @@ struct FileDonePayload {
     uint32_t totalCrc32;
     uint8_t  ok;
     uint8_t  pad[3];
+};
+
+struct KvmMouseEvent {
+    uint32_t monitorIndex;
+    uint8_t  action;   // KvmMouseAction
+    uint8_t  pad[3];
+    float    normX;    // 0.0 .. 1.0 inside streamed monitor
+    float    normY;    // 0.0 .. 1.0 inside streamed monitor
+    int32_t  wheelDelta;
+};
+
+struct KvmKeyEvent {
+    uint16_t vk;
+    uint16_t scanCode;
+    uint8_t  isDown;
+    uint8_t  isExtended;
+    uint8_t  pad[2];
 };
 
 #pragma pack(pop)
