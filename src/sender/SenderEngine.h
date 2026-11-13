@@ -71,6 +71,7 @@ public:
     static std::vector<DiscoveredPeer> DiscoverPeers(uint32_t timeoutMs = 750);
 
     bool Connect(const SenderConfig& cfg);
+    void SignalStop();
     void Disconnect();
 
     SenderStatus GetStatus() const;
@@ -80,6 +81,7 @@ public:
     size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
 private:
+    void DisconnectInternal();
     void SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data);
     struct StreamWorker {
         uint32_t targetPcMonitor = 0;
@@ -111,6 +113,7 @@ private:
     void ControlLoop();
     void RunStreamWorker(StreamWorker* w);
 
+    std::mutex m_lifecycleMutex;
     mutable std::mutex m_stateMutex;
     SenderStatus m_status;
     SenderConfig m_cfg;
@@ -127,6 +130,7 @@ private:
     ClipboardSync m_clipboard;
     FileTransfer m_fileTransfer;
 
+    mutable std::mutex m_workersMutex;
     std::vector<std::unique_ptr<StreamWorker>> m_workers;
 };
 

@@ -108,8 +108,10 @@ private:
     std::thread m_fileAcceptThread;
     FileTransfer m_fileTransfer;
 
+    std::mutex m_disconnectMutex;
     mutable std::mutex m_stateMutex;
     ReceiverStatus m_status;
+    mutable std::mutex m_workersMutex;
     std::vector<std::unique_ptr<StreamReceiverWorker>> m_workers;
 };
 

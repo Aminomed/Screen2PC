@@ -248,7 +248,10 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
 
         StreamReceiverWorker* raw = w.get();
         w->thread = std::thread([this, raw]() { RunStreamWorker(raw); });
-        m_workers.push_back(std::move(w));
+        {
+            std::lock_guard<std::mutex> wl(m_workersMutex);
+            m_workers.push_back(std::move(w));
+        }
     }
 
     if (!allListening) {
@@ -334,7 +337,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
             }
         } else {
             int err = WSAGetLastError();
-            if (err != WSAETIMEDOUT && err != 0) {
+            if (err != WSAETIMEDOUT) {
                 Logger::Instance().Warn("RCV-CTL", L"Control connection closed, wsa=" + std::to_wstring(err));
                 break;
             }
@@ -387,7 +390,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         return;
     }
     sock.TuneLowLatency(4 * 1024 * 1024);
-    sock.SetTimeouts(3000, 50); // short recv timeout so PumpMessages stays responsive
+    sock.SetTimeouts(3000, 1500);
 
     D3D11Renderer renderer;
     if (!renderer.Create(w->monitorIndex, w->targetMonitorRect, w->expectedWidth, w->expectedHeight, w->startFullscreen)) {
@@ -428,17 +431,21 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
             needPresent = true;
         }
 
+        int wr = sock.WaitReadable(10);
+        if (wr < 0) {
+            break;
+        }
+        if (wr == 0) {
+            if (needPresent) {
+                renderer.Present();
+                needPresent = false;
+            }
+            continue;
+        }
+
         PacketHeader hdr{};
         std::vector<uint8_t> payload;
         if (!sock.RecvPacket(hdr, payload)) {
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == 0) {
-                if (needPresent) {
-                    renderer.Present();
-                    needPresent = false;
-                }
-                continue;
-            }
             break;
         }
 
@@ -543,18 +550,23 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 }
 
 void ReceiverEngine::StopStreamWorkers() {
-    for (auto& w : m_workers) {
-        w->stop = true;
-        w->listenSock.Close();
+    std::vector<std::unique_ptr<StreamReceiverWorker>> toJoin;
+    {
+        std::lock_guard<std::mutex> wl(m_workersMutex);
+        for (auto& w : m_workers) {
+            w->stop = true;
+            w->listenSock.Close();
+        }
+        toJoin.swap(m_workers);
     }
-    for (auto& w : m_workers) {
+    for (auto& w : toJoin) {
         if (w->thread.joinable()) w->thread.join();
     }
-    m_workers.clear();
 }
 
 void ReceiverEngine::DisconnectSession() {
     m_sessionStop = true;
+    std::lock_guard<std::mutex> dl(m_disconnectMutex);
     m_clipboard.Stop();
     m_fileListenSock.Close();
     if (m_fileAcceptThread.joinable()) m_fileAcceptThread.join();
@@ -587,6 +599,7 @@ ReceiverStatus ReceiverEngine::GetStatus() const {
     }
     st.fileStats = m_fileTransfer.GetStats();
     st.streams.clear();
+    std::lock_guard<std::mutex> wl(m_workersMutex);
     for (const auto& w : m_workers) {
         std::lock_guard<std::mutex> sl(w->statsMutex);
         st.streams.push_back(w->stats);

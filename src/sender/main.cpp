@@ -8,6 +8,7 @@
 #include <objbase.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <iomanip>
 #include <sstream>
@@ -57,6 +58,8 @@ HFONT g_monoFont = nullptr;
 NOTIFYICONDATAW g_nid{};
 std::vector<s2p::DiscoveredPeer> g_peers;
 bool g_scanning = false;
+std::thread g_connectThread;
+std::atomic<bool> g_closing{false};
 
 std::wstring GetIniPath() {
     wchar_t buf[MAX_PATH]{};
@@ -211,12 +214,17 @@ void OnToggleConnect() {
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_CONNECT), FALSE);
     SetDlgItemTextW(g_hwnd, IDC_STATUS_LABEL, L"Status: Verbinde und richte Monitore ein...");
 
-    std::thread([cfg]() {
-        g_engine->Connect(cfg);
-        if (g_hwnd) {
+    if (g_connectThread.joinable()) {
+        g_connectThread.join();
+    }
+    g_connectThread = std::thread([cfg]() {
+        if (g_engine && !g_closing.load()) {
+            g_engine->Connect(cfg);
+        }
+        if (!g_closing.load() && g_hwnd) {
             PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
         }
-    }).detach();
+    });
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -447,9 +455,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        g_closing = true;
         KillTimer(hwnd, TIMER_TELEMETRY);
         UnregisterHotKey(hwnd, HOTKEY_TOGGLE_CONNECT);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (g_engine) g_engine->SignalStop();
+        if (g_connectThread.joinable()) g_connectThread.join();
         if (g_engine) g_engine->Disconnect();
         if (g_font) DeleteObject(g_font);
         if (g_monoFont) DeleteObject(g_monoFont);

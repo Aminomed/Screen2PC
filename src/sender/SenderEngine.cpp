@@ -92,7 +92,8 @@ std::vector<DiscoveredPeer> SenderEngine::DiscoverPeers(uint32_t timeoutMs) {
 }
 
 bool SenderEngine::Connect(const SenderConfig& cfg) {
-    Disconnect();
+    std::lock_guard<std::mutex> lifeLock(m_lifecycleMutex);
+    DisconnectInternal();
 
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);
@@ -184,7 +185,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     }
 
     if (!m_controlSock.SendPacket(MsgType::StartSession, &startReq, sizeof(startReq))) {
-        Disconnect();
+        DisconnectInternal();
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.lastError = L"StartSession konnte nicht gesendet werden.";
         return false;
@@ -193,7 +194,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     if (!m_controlSock.RecvPacket(hdr, payload) ||
         hdr.type != static_cast<uint16_t>(MsgType::SessionAck) ||
         payload.size() < sizeof(SessionAckPayload)) {
-        Disconnect();
+        DisconnectInternal();
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.lastError = L"Keine SessionAck-Antwort vom PC erhalten.";
         return false;
@@ -203,16 +204,18 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     std::memcpy(&ack, payload.data(), sizeof(ack));
     ack.message[_countof(ack.message) - 1] = L'\0';
     if (!ack.accepted) {
-        Disconnect();
+        DisconnectInternal();
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.lastError = std::wstring(L"PC hat Session abgelehnt: ") + ack.message;
         return false;
     }
 
-    // Set shorter recv timeout for non-blocking control loop checks
-    m_controlSock.SetTimeouts(2000, 300);
+    // Set recv timeout for packet reads after WaitReadable wakes
+    m_controlSock.SetTimeouts(2000, 1500);
 
     // Spawn per-monitor capture/encode/stream workers
+    std::vector<std::unique_ptr<StreamWorker>> newWorkers;
+    newWorkers.reserve(streamCount);
     for (uint32_t i = 0; i < streamCount; ++i) {
         auto w = std::make_unique<StreamWorker>();
         w->targetPcMonitor = startReq.streams[i].monitorIndex;
@@ -233,7 +236,11 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
 
         StreamWorker* raw = w.get();
         w->thread = std::thread([this, raw]() { RunStreamWorker(raw); });
-        m_workers.push_back(std::move(w));
+        newWorkers.push_back(std::move(w));
+    }
+    {
+        std::lock_guard<std::mutex> wl(m_workersMutex);
+        m_workers = std::move(newWorkers);
     }
 
     m_connected = true;
@@ -411,6 +418,7 @@ void SenderEngine::ControlLoop() {
                     payload.size() >= sizeof(RequestKeyframePayload)) {
                     RequestKeyframePayload req{};
                     std::memcpy(&req, payload.data(), sizeof(req));
+                    std::lock_guard<std::mutex> wl(m_workersMutex);
                     for (auto& w : m_workers) {
                         if (w->targetPcMonitor == req.monitorIndex) {
                             w->forceKeyframe = true;
@@ -432,12 +440,20 @@ void SenderEngine::ControlLoop() {
                     if (m_kvmEnabled.load()) {
                         KvmMouseEvent ev{};
                         std::memcpy(&ev, payload.data(), sizeof(ev));
-                        if (!m_workers.empty()) {
-                            size_t idx = (ev.monitorIndex < m_workers.size()) ? ev.monitorIndex : 0;
-                            RECT rect = m_workers[idx]->desktopRect;
-                            if (rect.right <= rect.left || rect.bottom <= rect.top) {
-                                rect = RECT{ 0, 0, static_cast<LONG>(m_workers[idx]->width), static_cast<LONG>(m_workers[idx]->height) };
+                        RECT rect{};
+                        bool haveRect = false;
+                        {
+                            std::lock_guard<std::mutex> wl(m_workersMutex);
+                            if (!m_workers.empty()) {
+                                size_t idx = (ev.monitorIndex < m_workers.size()) ? ev.monitorIndex : 0;
+                                rect = m_workers[idx]->desktopRect;
+                                if (rect.right <= rect.left || rect.bottom <= rect.top) {
+                                    rect = RECT{ 0, 0, static_cast<LONG>(m_workers[idx]->width), static_cast<LONG>(m_workers[idx]->height) };
+                                }
+                                haveRect = true;
                             }
+                        }
+                        if (haveRect) {
                             KvmInput::InjectMouse(ev, rect);
                         }
                     }
@@ -451,7 +467,7 @@ void SenderEngine::ControlLoop() {
                 }
             } else {
                 int err = WSAGetLastError();
-                if (err != WSAETIMEDOUT && err != 0) {
+                if (err != WSAETIMEDOUT) {
                     Logger::Instance().Warn("SND-CTL", L"Control socket closed, wsa=" + std::to_wstring(err));
                     m_stop = true;
                     break;
@@ -665,7 +681,18 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     h264.Shutdown();
 }
 
+void SenderEngine::SignalStop() {
+    m_stop = true;
+    m_controlSock.Close();
+}
+
 void SenderEngine::Disconnect() {
+    SignalStop();
+    std::lock_guard<std::mutex> lifeLock(m_lifecycleMutex);
+    DisconnectInternal();
+}
+
+void SenderEngine::DisconnectInternal() {
     m_stop = true;
     m_connected = false;
     m_clipboard.Stop();
@@ -683,13 +710,17 @@ void SenderEngine::Disconnect() {
         m_controlThread.join();
     }
 
-    for (auto& w : m_workers) {
-        w->stop = true;
+    std::vector<std::unique_ptr<StreamWorker>> toJoin;
+    {
+        std::lock_guard<std::mutex> wl(m_workersMutex);
+        for (auto& w : m_workers) {
+            w->stop = true;
+        }
+        toJoin.swap(m_workers);
     }
-    for (auto& w : m_workers) {
+    for (auto& w : toJoin) {
         if (w->thread.joinable()) w->thread.join();
     }
-    m_workers.clear();
 
     if (m_createdVirtualDisplays) {
         VirtualDisplayCtl::ClearMonitors();
@@ -714,6 +745,7 @@ SenderStatus SenderEngine::GetStatus() const {
     s.driverActive = VirtualDisplayCtl::IsDriverActive();
     s.fileStats = m_fileTransfer.GetStats();
     s.streams.clear();
+    std::lock_guard<std::mutex> wl(m_workersMutex);
     for (const auto& w : m_workers) {
         std::lock_guard<std::mutex> sl(w->statsMutex);
         s.streams.push_back(w->stats);

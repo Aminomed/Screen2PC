@@ -44,6 +44,7 @@ HWND g_hwnd = nullptr;
 HFONT g_font = nullptr;
 HFONT g_monoFont = nullptr;
 NOTIFYICONDATAW g_nid{};
+std::thread g_disconnThread;
 
 std::wstring GetReceiverIniPath() {
     wchar_t buf[MAX_PATH]{};
@@ -152,10 +153,12 @@ void UpdateUi() {
 }
 
 void OpenFirewallPortsElevated() {
-    std::wstring args = L"advfirewall firewall add rule name=\"Screen2PC\" dir=in action=allow protocol=TCP localport=48211-48215";
-    ShellExecuteW(g_hwnd, L"runas", L"netsh.exe", args.c_str(), nullptr, SW_HIDE);
-    std::wstring argsUdp = L"advfirewall firewall add rule name=\"Screen2PC Discovery\" dir=in action=allow protocol=UDP localport=48210";
-    ShellExecuteW(g_hwnd, L"runas", L"netsh.exe", argsUdp.c_str(), nullptr, SW_HIDE);
+    const wchar_t* cmdArgs =
+        L"/c netsh advfirewall firewall delete rule name=\"Screen2PC\" >nul 2>&1 & "
+        L"netsh advfirewall firewall delete rule name=\"Screen2PC Discovery\" >nul 2>&1 & "
+        L"netsh advfirewall firewall add rule name=\"Screen2PC\" dir=in action=allow protocol=TCP localport=48211-48215 & "
+        L"netsh advfirewall firewall add rule name=\"Screen2PC Discovery\" dir=in action=allow protocol=UDP localport=48210";
+    ShellExecuteW(g_hwnd, L"runas", L"cmd.exe", cmdArgs, nullptr, SW_HIDE);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -256,7 +259,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case IDC_BTN_DISCONN:
             if (g_engine) {
-                std::thread([]() { g_engine->DisconnectSession(); }).detach();
+                if (g_disconnThread.joinable()) g_disconnThread.join();
+                g_disconnThread = std::thread([]() { if (g_engine) g_engine->DisconnectSession(); });
             }
             return 0;
         case IDC_BTN_FIREWALL:
@@ -323,6 +327,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_TELEMETRY);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         if (g_engine) g_engine->Stop();
+        if (g_disconnThread.joinable()) g_disconnThread.join();
         if (g_font) DeleteObject(g_font);
         if (g_monoFont) DeleteObject(g_monoFont);
         PostQuitMessage(0);
