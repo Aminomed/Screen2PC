@@ -15,12 +15,12 @@
 4. Der Empfaenger erkennt automatisch beide PC-Monitore (z. B. `#1 2560x1440` und `#2 1920x1080`) und wartet im System-Tray.
 
 ### 2. Auf dem Surface (Sender)
-1. Entpacke `Screen2PC-Windows-x64.zip`.
+1. Entpacke `Screen2PC-Windows-x64.zip` (bei Browser-Downloads ggf. ZIP vorher per *Rechtsklick -> Eigenschaften -> Zulassen* entsperren; bei SmartScreen *"Unbekannter Herausgeber"* auf *"Weitere Informationen -> Trotzdem ausfuehren"* klicken — `install_driver.ps1` fuehrt zusaetzlich automatisch `Unblock-File` aus).
 2. *(Optional fuer "Erweitern"-Modus; fuer reines Spiegeln nicht noetig)* Starte PowerShell als Administrator und fuehre einmalig aus:
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\install_driver.ps1
    ```
-   *(Falls Windows Code Integrity den selbstsignierten lokalen Treiber mit Fehler 52 blockiert: auf dem Surface `bcdedit /set testsigning on` ausfuehren und neu starten — **niemals** auf dem PC.)*
+   *(Das Skript installiert das lokale Test-Zertifikat in `Root` + `TrustedPublisher`. Falls Windows Code Integrity trotz Zertifikat Problem 52 meldet, waere `bcdedit /set testsigning on` auf dem Surface noetig, was bei aktivem Secure Boot blockiert ist — alternativ jederzeit treiberfrei mit **Spiegeln** arbeiten.)*
 3. Starte **`Screen2PC.Sender.exe`**.
 4. Waehle den automatisch gefundenen PC (oder gib die PC-IP ein), waehle Modus (**Erweitern Alle Monitore**, **Erweitern Monitor 1**, **Erweitern Monitor 2** oder **Spiegeln**) sowie Codec:
    - **H.264 Low-Latency:** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC (inkl. CPU-MFT-Fallback).

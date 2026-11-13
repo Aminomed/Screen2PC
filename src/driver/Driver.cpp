@@ -297,7 +297,10 @@ void IndirectDeviceContext::InitAdapter() {
 }
 
 void IndirectDeviceContext::OnAdapterInitFinished(NTSTATUS status) {
-    if (!NT_SUCCESS(status)) return;
+    if (!NT_SUCCESS(status)) {
+        OutputDebugStringW(L"Screen2PCDriver: OnAdapterInitFinished failed\n");
+        return;
+    }
     m_adapterReady = true;
     LoadPersistedConfig();
     StartPipeServer();
@@ -414,9 +417,9 @@ void IndirectDeviceContext::RunPipeServer() {
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
 
-    // Allow SYSTEM, Administrators, and Authenticated Users (Session 1 Sender app) R/W access
+    // Allow SYSTEM, Administrators, LOCAL SERVICE (WUDFHost), and Authenticated Users (Sender) access
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)",
+            L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GRGW;;;AU)",
             SDDL_REVISION_1, &pSd, nullptr)) {
         sa.lpSecurityDescriptor = pSd;
     }
@@ -523,15 +526,20 @@ NTSTATUS Screen2PCMonitorGetDefaultModes(IDDCX_MONITOR monitorObject,
     }
 
     std::vector<IDDCX_MONITOR_MODE> modes;
-    modes.push_back(s2p::vdd::CreateIddCxMonitorMode(pref.width, pref.height, pref.refreshHz, IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
-    if (pref.width != 2560 || pref.height != 1440) {
-        modes.push_back(s2p::vdd::CreateIddCxMonitorMode(2560, 1440, 60, IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
-    }
-    if (pref.width != 1920 || pref.height != 1080) {
-        modes.push_back(s2p::vdd::CreateIddCxMonitorMode(1920, 1080, 60, IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
-    }
-    modes.push_back(s2p::vdd::CreateIddCxMonitorMode(1600, 900, 60, IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
-    modes.push_back(s2p::vdd::CreateIddCxMonitorMode(1280, 720, 60, IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
+    auto addMode = [&](DWORD w, DWORD h, DWORD hz) {
+        for (const auto& m : modes) {
+            const auto& si = m.MonitorVideoSignalInfo;
+            if (si.activeSize.cx == w && si.activeSize.cy == h && si.vSyncFreq.Numerator == hz) {
+                return;
+            }
+        }
+        modes.push_back(s2p::vdd::CreateIddCxMonitorMode(w, h, hz, IDDCX_MONITOR_MODE_ORIGIN_DRIVER));
+    };
+    addMode(pref.width, pref.height, pref.refreshHz);
+    addMode(2560, 1440, 60);
+    addMode(1920, 1080, 60);
+    addMode(1600, 900, 60);
+    addMode(1280, 720, 60);
 
     pOutArgs->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(modes.size());
     pOutArgs->PreferredMonitorModeIdx = 0;

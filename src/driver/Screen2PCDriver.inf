@@ -7,16 +7,20 @@
 Signature   = "$Windows NT$"
 Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer    = 2.0
 Provider    = %ManufacturerName%
 CatalogFile = Screen2PCDriver.cat
 DriverVer   = 11/12/2026,1.0.0.0
 PnpLockdown = 1
 
 [Manufacturer]
-%ManufacturerName% = Standard,NT$ARCH$.10.0...17763
+%ManufacturerName% = Standard,NT$ARCH$.10.0...17763,NT$ARCH$.10.0...22000
 
 [Standard.NT$ARCH$.10.0...17763]
 %DeviceName% = Screen2PCDriver_Install, Root\Screen2PCVDD
+
+[Standard.NT$ARCH$.10.0...22000]
+%DeviceName% = Screen2PCDriver_Install_Win11, Root\Screen2PCVDD
 
 [SourceDisksFiles]
 Screen2PCDriver.dll = 1
@@ -27,15 +31,12 @@ Screen2PCDriver.dll = 1
 [DestinationDirs]
 UMDriverCopy = 13
 
+; ================= Windows 10 (1809+) =================
 [Screen2PCDriver_Install.NT]
 CopyFiles = UMDriverCopy
 
 [Screen2PCDriver_Install.NT.HW]
 AddReg = Screen2PCDriver_HW_AddReg
-
-[Screen2PCDriver_HW_AddReg]
-HKR,, "UpperFilters", 0x00010000, "IndirectKmd"
-HKR, "WUDF", "DeviceGroupId", 0x00000000, "Screen2PCVDDPool"
 
 [Screen2PCDriver_Install.NT.Services]
 AddService = WUDFRd, 0x000001fa, WUDFRD_ServiceInstall
@@ -48,16 +49,39 @@ ErrorControl  = 1
 ServiceBinary = %12%\WUDFRd.sys
 
 [Screen2PCDriver_Install.NT.Wdf]
-UmdfService              = Screen2PCDriver, Screen2PCDriver_Install_UMDF
-UmdfServiceOrder         = Screen2PCDriver
+UmdfService                = Screen2PCDriver, Screen2PCDriver_Install_UMDF
+UmdfServiceOrder           = Screen2PCDriver
 UmdfKernelModeClientPolicy = AllowKernelModeClients
-UmdfHostProcessSharing   = ProcessSharingDisabled
-UmdfFileObjectPolicy     = AllowNullAndUnknownFileObjects
-UmdfExtensions           = IddCx0102
+
+; ================= Windows 11 (22000+) =================
+[Screen2PCDriver_Install_Win11.NT]
+Include   = WUDFRD.inf
+Needs     = WUDFRD.NT
+CopyFiles = UMDriverCopy
+
+[Screen2PCDriver_Install_Win11.NT.HW]
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.HW
+AddReg  = Screen2PCDriver_HW_AddReg
+
+[Screen2PCDriver_Install_Win11.NT.Services]
+Include = WUDFRD.inf
+Needs   = WUDFRD.NT.Services
+
+[Screen2PCDriver_Install_Win11.NT.Wdf]
+UmdfService                = Screen2PCDriver, Screen2PCDriver_Install_UMDF
+UmdfServiceOrder           = Screen2PCDriver
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+
+; ================= Common WDF & Registry =================
+[Screen2PCDriver_HW_AddReg]
+HKR,, "UpperFilters", 0x00010000, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", 0x00000000, "Screen2PCVDDPool"
 
 [Screen2PCDriver_Install_UMDF]
 UmdfLibraryVersion = 2.15.0
 ServiceBinary      = %13%\Screen2PCDriver.dll
+UmdfExtensions     = IddCx0102
 
 [UMDriverCopy]
 Screen2PCDriver.dll

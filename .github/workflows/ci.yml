@@ -64,8 +64,8 @@ jobs:
           }
 
           if ($inf2cat) {
-            Write-Host "Running $($inf2cat.FullName) /driver:$pkgDir /os:10_VB_X64"
-            & $inf2cat.FullName "/driver:$pkgDir" "/os:10_VB_X64" "/uselocaltime"
+            Write-Host "Running $($inf2cat.FullName) /driver:$pkgDir /os:10_VB_X64,10_CO_X64,10_NI_X64"
+            & $inf2cat.FullName "/driver:$pkgDir" "/os:10_VB_X64,10_CO_X64,10_NI_X64" "/uselocaltime"
             if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed with exit code $LASTEXITCODE" }
           } else {
             Write-Warning "Inf2Cat.exe not found in NuGet packages."
