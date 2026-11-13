@@ -7,18 +7,24 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace s2p {
 
 class D3D11Renderer {
 public:
+    using FileDropCallback = std::function<void(const std::vector<std::wstring>&)>;
+
     D3D11Renderer() = default;
     ~D3D11Renderer();
 
     D3D11Renderer(const D3D11Renderer&) = delete;
     D3D11Renderer& operator=(const D3D11Renderer&) = delete;
+
+    void SetFileDropCallback(FileDropCallback cb) { m_fileDropCb = std::move(cb); }
 
     // Must be called from the thread that will pump messages & Present() for this window.
     bool Create(uint32_t monitorIndex,

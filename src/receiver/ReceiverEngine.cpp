@@ -260,11 +260,26 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
         return;
     }
 
+    if (!m_fileListenSock.Listen(kPortFileTransfer, 2)) {
+        Logger::Instance().Warn("FILE-RX", L"Could not listen on file transfer port " + std::to_wstring(kPortFileTransfer));
+    }
+
     ack.accepted = 1;
     CopyWideSafe(ack.message, _countof(ack.message), L"OK");
     if (!clientSock.SendPacket(MsgType::SessionAck, &ack, sizeof(ack))) {
+        m_fileListenSock.Close();
         StopStreamWorkers();
         return;
+    }
+
+    if (m_fileListenSock.IsValid()) {
+        m_fileAcceptThread = std::thread([this]() {
+            TcpSocket fsock = m_fileListenSock.Accept(nullptr, 5000);
+            m_fileListenSock.Close();
+            if (fsock.IsValid() && !m_stop && !m_sessionStop) {
+                m_fileTransfer.Start(std::move(fsock));
+            }
+        });
     }
 
     {

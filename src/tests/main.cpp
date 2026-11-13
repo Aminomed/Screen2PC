@@ -16,6 +16,7 @@
 #include "../common/CodecDelta.h"
 #include "../common/CodecH264.h"
 #include "../common/ClipboardSync.h"
+#include "../common/FileTransfer.h"
 
 namespace {
 
