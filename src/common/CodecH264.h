@@ -30,7 +30,8 @@ public:
               uint32_t width,
               uint32_t height,
               uint32_t fps,
-              uint32_t bitrateMbps);
+              uint32_t bitrateMbps,
+              bool allowHardware = true);
 
     void Shutdown();
     bool IsInitialized() const { return m_initialized; }

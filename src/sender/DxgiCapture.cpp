@@ -98,6 +98,11 @@ bool DxgiCapture::Init(uint32_t adapterIndex, uint32_t outputIndex) {
         }
     }
 
+    ComPtr<ID3D10Multithread> mt;
+    if (SUCCEEDED(m_device.As(&mt)) && mt) {
+        mt->SetMultithreadProtected(TRUE);
+    }
+
     D3D11_TEXTURE2D_DESC td{};
     td.Width = m_width;
     td.Height = m_height;

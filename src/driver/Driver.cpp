@@ -552,15 +552,24 @@ NTSTATUS Screen2PCMonitorQueryModes(IDDCX_MONITOR monitorObject,
     }
 
     std::vector<IDDCX_TARGET_MODE> targets;
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(pref.width, pref.height, pref.refreshHz));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(3840, 2160, 60));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(2560, 1440, 144));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(2560, 1440, 60));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(1920, 1080, 144));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(1920, 1080, 60));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(1600, 900, 60));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(1280, 720, 60));
-    targets.push_back(s2p::vdd::CreateIddCxTargetMode(1024, 768, 60));
+    auto addMode = [&](DWORD w, DWORD h, DWORD hz) {
+        for (const auto& t : targets) {
+            const auto& si = t.TargetVideoSignalInfo.targetVideoSignalInfo;
+            if (si.activeSize.cx == w && si.activeSize.cy == h && si.vSyncFreq.Numerator == hz) {
+                return;
+            }
+        }
+        targets.push_back(s2p::vdd::CreateIddCxTargetMode(w, h, hz));
+    };
+    addMode(pref.width, pref.height, pref.refreshHz);
+    addMode(3840, 2160, 60);
+    addMode(2560, 1440, 144);
+    addMode(2560, 1440, 60);
+    addMode(1920, 1080, 144);
+    addMode(1920, 1080, 60);
+    addMode(1600, 900, 60);
+    addMode(1280, 720, 60);
+    addMode(1024, 768, 60);
 
     pOutArgs->TargetModeBufferOutputCount = static_cast<UINT>(targets.size());
     if (pInArgs->TargetModeBufferInputCount >= targets.size()) {

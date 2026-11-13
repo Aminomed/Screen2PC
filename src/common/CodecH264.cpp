@@ -159,7 +159,8 @@ bool H264Encoder::Init(ID3D11Device* d3dDevice,
                        uint32_t width,
                        uint32_t height,
                        uint32_t fps,
-                       uint32_t bitrateMbps) {
+                       uint32_t bitrateMbps,
+                       bool allowHardware) {
     Shutdown();
 
     // H.264 requires even dimensions
@@ -181,19 +182,25 @@ bool H264Encoder::Init(ID3D11Device* d3dDevice,
     m_mfStarted = true;
 
     if (m_device) {
+        Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
+        if (SUCCEEDED(m_device.As(&mt)) && mt) {
+            mt->SetMultithreadProtected(TRUE);
+        }
         UINT resetToken = 0;
         if (SUCCEEDED(MFCreateDXGIDeviceManager(&resetToken, &m_dxgiMgr))) {
             m_dxgiMgr->ResetDevice(m_device.Get(), resetToken);
         }
     }
 
-    // Try hardware encoder first if we have a D3D11 device, otherwise software fallback
+    // Try hardware encoder first if allowed and we have a D3D11 device, otherwise software fallback
     bool ok = false;
-    if (m_device) {
+    if (allowHardware && m_device) {
         ok = InitMft(true);
     }
     if (!ok) {
-        Logger::Instance().Warn("H264_HW_FALLBACK", L"Hardware H.264 MFT unavailable, falling back to software MFT.");
+        if (allowHardware && m_device) {
+            Logger::Instance().Warn("H264_HW_FALLBACK", L"Hardware H.264 MFT unavailable, falling back to software MFT.");
+        }
         ok = InitMft(false);
     }
 
@@ -214,6 +221,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
     m_codecApi.Reset();
     m_isHardware = false;
     m_isAsync = false;
+    m_friendlyName.clear();
 
     MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, MFVideoFormat_H264 };
     UINT32 flags = tryHardware
@@ -248,6 +256,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
     for (auto& candidate : candidates) {
         if (!candidate) continue;
 
+        std::wstring candidateName = tryHardware ? L"Hardware H.264 MFT" : L"Microsoft H.264 MFT";
         Microsoft::WRL::ComPtr<IMFAttributes> attrs;
         if (SUCCEEDED(candidate->GetAttributes(&attrs))) {
             UINT32 nameLen = 0;
@@ -255,7 +264,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
                 std::wstring fname(nameLen + 1, L'\0');
                 if (SUCCEEDED(attrs->GetString(MFT_FRIENDLY_NAME_Attribute, fname.data(), static_cast<UINT32>(fname.size()), &nameLen))) {
                     fname.resize(nameLen);
-                    m_friendlyName = fname;
+                    candidateName = fname;
                 }
             }
             UINT32 asyncFlag = 0;
@@ -369,6 +378,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
         candidate->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
         m_mft = candidate;
+        m_friendlyName = candidateName;
         m_isHardware = tryHardware;
         configured = true;
         break;
@@ -751,6 +761,10 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uin
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         UINT32 d3d11Aware = 0;
         if (m_device && SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) && d3d11Aware != 0) {
+            Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
+            if (SUCCEEDED(m_device.As(&mt)) && mt) {
+                mt->SetMultithreadProtected(TRUE);
+            }
             UINT resetToken = 0;
             if (SUCCEEDED(MFCreateDXGIDeviceManager(&resetToken, &m_dxgiMgr))) {
                 m_dxgiMgr->ResetDevice(m_device.Get(), resetToken);

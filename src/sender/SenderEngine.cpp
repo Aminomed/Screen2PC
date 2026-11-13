@@ -576,6 +576,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     uint64_t windowFrames = 0;
     uint64_t windowBytes = 0;
     bool sentInitialFrame = false;
+    uint32_t consecutiveH264Fails = 0;
 
     while (!m_stop && !w->stop) {
         auto frameStart = std::chrono::steady_clock::now();
@@ -622,7 +623,34 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             if (activeCodec == CodecType::H264) {
                 if (needKey) h264.RequestKeyframe();
                 encodeOk = h264.EncodeTexture(capture.FrameTexture(), NowUs(), encodedPayload, isKeyframe);
-            } else {
+                if (!encodeOk && !sentInitialFrame) {
+                    if (++consecutiveH264Fails >= 4) {
+                        if (h264.IsHardware()) {
+                            Logger::Instance().Warn("SND-WRK", L"GPU H.264 encode failed at runtime; switching to CPU H.264.");
+                            if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, w->targetFps, w->bitrateMbps, false)) {
+                                std::lock_guard<std::mutex> sl(w->statsMutex);
+                                w->stats.codecName = L"H.264 (CPU)";
+                                w->stats.hardwareAccelerated = false;
+                                consecutiveH264Fails = 0;
+                            } else {
+                                activeCodec = CodecType::DeltaLossless;
+                                std::lock_guard<std::mutex> sl(w->statsMutex);
+                                w->stats.codecName = L"Delta Lossless";
+                                w->stats.hardwareAccelerated = false;
+                            }
+                        } else {
+                            Logger::Instance().Warn("SND-WRK", L"H.264 encode failed at runtime; switching to Delta Lossless.");
+                            activeCodec = CodecType::DeltaLossless;
+                            std::lock_guard<std::mutex> sl(w->statsMutex);
+                            w->stats.codecName = L"Delta Lossless";
+                            w->stats.hardwareAccelerated = false;
+                        }
+                    }
+                } else {
+                    consecutiveH264Fails = 0;
+                }
+            }
+            if (activeCodec == CodecType::DeltaLossless) {
                 if (capture.CopyFrameToCpu(cpuBgra, cpuStride)) {
                     encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
                                             cpuStride, dirtyRects, needKey, encodedPayload, isKeyframe);
