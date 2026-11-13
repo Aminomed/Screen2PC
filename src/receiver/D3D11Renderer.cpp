@@ -2,6 +2,7 @@
 #include "../common/Logger.h"
 
 #include <d3dcompiler.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <cstring>
 
@@ -138,6 +139,7 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
 
     ShowWindow(m_hwnd, SW_SHOW);
     UpdateWindow(m_hwnd);
+    DragAcceptFiles(m_hwnd, TRUE);
     return true;
 }
 
@@ -545,6 +547,25 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             return 0;
         }
         break;
+    case WM_DROPFILES: {
+        HDROP hDrop = reinterpret_cast<HDROP>(wp);
+        UINT count = DragQueryFileW(hDrop, 0xFFFFFFFFu, nullptr, 0);
+        std::vector<std::wstring> files;
+        files.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
+            if (len > 0 && len < 32768) {
+                std::wstring path(len, L'\0');
+                DragQueryFileW(hDrop, i, path.data(), len + 1);
+                files.push_back(std::move(path));
+            }
+        }
+        DragFinish(hDrop);
+        if (!files.empty() && m_fileDropCb) {
+            m_fileDropCb(files);
+        }
+        return 0;
+    }
     case WM_CLOSE:
         m_closedByUser = true;
         ShowWindow(hwnd, SW_HIDE);

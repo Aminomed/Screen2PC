@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <objbase.h>
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include "VirtualDisplayCtl.h"
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace {
@@ -29,17 +31,19 @@ constexpr UINT WM_DISCOVERY_DONE = WM_APP + 2;
 constexpr UINT_PTR TIMER_TELEMETRY = 1;
 constexpr int HOTKEY_TOGGLE_CONNECT = 1001;
 
-constexpr int IDC_PEER_COMBO   = 101;
-constexpr int IDC_BTN_SCAN     = 102;
-constexpr int IDC_IP_EDIT      = 103;
-constexpr int IDC_MODE_COMBO   = 104;
-constexpr int IDC_CODEC_COMBO  = 105;
-constexpr int IDC_BITRATE_COMBO= 106;
-constexpr int IDC_BTN_CONNECT  = 107;
-constexpr int IDC_STATUS_LABEL = 108;
-constexpr int IDC_DRIVER_LABEL = 109;
-constexpr int IDC_STATS_TEXT   = 110;
-constexpr int IDC_CHK_CLIPBOARD= 111;
+constexpr int IDC_PEER_COMBO    = 101;
+constexpr int IDC_BTN_SCAN      = 102;
+constexpr int IDC_IP_EDIT       = 103;
+constexpr int IDC_MODE_COMBO    = 104;
+constexpr int IDC_CODEC_COMBO   = 105;
+constexpr int IDC_BITRATE_COMBO = 106;
+constexpr int IDC_BTN_CONNECT   = 107;
+constexpr int IDC_STATUS_LABEL  = 108;
+constexpr int IDC_DRIVER_LABEL  = 109;
+constexpr int IDC_STATS_TEXT    = 110;
+constexpr int IDC_CHK_CLIPBOARD = 111;
+constexpr int IDC_BTN_SENDFILE  = 112;
+constexpr int IDC_BTN_OPEN_DL   = 113;
 
 constexpr int IDM_SHOW   = 2001;
 constexpr int IDM_TOGGLE = 2002;
@@ -97,7 +101,7 @@ void UpdateUiFromState() {
 
     std::wostringstream ss;
     if (st.streams.empty()) {
-        ss << L"Keine aktiven Streams.\r\n\r\nLetzte Log-Meldungen:\r\n";
+        ss << L"Keine aktiven Streams. (Dateien per Drag & Drop ins Fenster ziehen!)\r\n\r\nLetzte Log-Meldungen:\r\n";
         auto logs = s2p::Logger::Instance().GetRecentLines(6);
         for (const auto& l : logs) ss << l << L"\r\n";
     } else {
@@ -108,8 +112,43 @@ void UpdateUiFromState() {
                << std::setprecision(1) << s.mbps << L" Mbit/s  |  "
                << L"Frames: " << s.framesSent << L"\r\n";
         }
+        ss << L"Dateien (Drag & Drop): Gesendet " << st.fileStats.filesSent
+           << L" | Empfangen " << st.fileStats.filesReceived;
+        if (!st.fileStats.lastEvent.empty()) {
+            ss << L" | " << st.fileStats.lastEvent;
+        }
+        ss << L"\r\n";
     }
     SetDlgItemTextW(g_hwnd, IDC_STATS_TEXT, ss.str().c_str());
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SENDFILE), st.fileStats.active ? TRUE : FALSE);
+}
+
+std::vector<std::wstring> PickFilesDialog(HWND owner) {
+    std::vector<wchar_t> buf(32768, L'\0');
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = L"Alle Dateien (*.*)\0*.*\0\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    ofn.lpstrTitle = L"Dateien an PC senden";
+    ofn.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    std::vector<std::wstring> out;
+    if (!GetOpenFileNameW(&ofn)) return out;
+
+    const wchar_t* p = buf.data();
+    std::wstring first = p;
+    p += first.size() + 1;
+    if (*p == L'\0') {
+        out.push_back(first);
+    } else {
+        while (*p != L'\0') {
+            std::wstring name = p;
+            out.push_back(first + L"\\" + name);
+            p += name.size() + 1;
+        }
+    }
+    return out;
 }
 
 void StartAsyncDiscovery() {
@@ -234,9 +273,12 @@ void CreateUiControls(HWND hwnd) {
     SendMessageW(chkClip, BM_SETCHECK, clipEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g_engine) g_engine->SetClipboardEnabled(clipEnabled);
 
-    addCtrl(L"STATIC", L"", 0, 16, 250, 480, 36, IDC_DRIVER_LABEL);
-    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 288, 480, 40, IDC_STATUS_LABEL);
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 332, 480, 120, IDC_STATS_TEXT, g_monoFont);
+    addCtrl(L"BUTTON", L"Datei(en) an PC senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 248, 234, 28, IDC_BTN_SENDFILE);
+    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 262, 248, 234, 28, IDC_BTN_OPEN_DL);
+
+    addCtrl(L"STATIC", L"", 0, 16, 284, 480, 36, IDC_DRIVER_LABEL);
+    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 322, 480, 40, IDC_STATUS_LABEL);
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 366, 480, 120, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -257,6 +299,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         CreateUiControls(hwnd);
+        DragAcceptFiles(hwnd, TRUE);
         RegisterHotKey(hwnd, HOTKEY_TOGGLE_CONNECT, MOD_CONTROL | MOD_SHIFT, 'K');
         SetTimer(hwnd, TIMER_TELEMETRY, 500, nullptr);
 
@@ -289,6 +332,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveSetting(L"ClipboardSync", checked ? 1 : 0);
             }
             return 0;
+        case IDC_BTN_SENDFILE:
+            if (g_engine) {
+                auto files = PickFilesDialog(hwnd);
+                if (!files.empty()) g_engine->SendFiles(files);
+            }
+            return 0;
+        case IDC_BTN_OPEN_DL:
+            ShellExecuteW(hwnd, L"open", s2p::FileTransfer::DefaultDownloadDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
         case IDC_PEER_COMBO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 LRESULT idx = SendDlgItemMessageW(hwnd, IDC_PEER_COMBO, CB_GETCURSEL, 0, 0);
@@ -306,6 +358,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+
+    case WM_DROPFILES:
+        if (g_engine) {
+            HDROP hDrop = reinterpret_cast<HDROP>(wp);
+            UINT count = DragQueryFileW(hDrop, 0xFFFFFFFFu, nullptr, 0);
+            std::vector<std::wstring> files;
+            files.reserve(count);
+            for (UINT i = 0; i < count; ++i) {
+                UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
+                if (len > 0 && len < 32768) {
+                    std::wstring path(len, L'\0');
+                    DragQueryFileW(hDrop, i, path.data(), len + 1);
+                    files.push_back(std::move(path));
+                }
+            }
+            DragFinish(hDrop);
+            if (!files.empty()) {
+                g_engine->SendFiles(files);
+            }
+        }
+        return 0;
 
     case WM_HOTKEY:
         if (wp == HOTKEY_TOGGLE_CONNECT) {
@@ -404,7 +477,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Screen2PC Sender (Surface)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 530, 504,
+        CW_USEDEFAULT, CW_USEDEFAULT, 530, 538,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

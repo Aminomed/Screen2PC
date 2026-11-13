@@ -266,6 +266,105 @@ void TestClipboardSync() {
     std::cout << "[PASS] TestClipboardSync\n";
 }
 
+void TestFileTransfer() {
+    // 1. Path traversal / illegal char sanitization
+    CHECK(s2p::FileTransfer::SanitizeFilename(L"..\\..\\Windows\\System32\\cmd.exe") == L"cmd.exe",
+          "Backslash path traversal not stripped");
+    CHECK(s2p::FileTransfer::SanitizeFilename(L"../../etc/passwd") == L"passwd",
+          "Slash path traversal not stripped");
+    CHECK(s2p::FileTransfer::SanitizeFilename(L"C:evil:name*?.txt") == L"name__.txt",
+          "Illegal Windows chars not sanitized");
+    CHECK(s2p::FileTransfer::SanitizeFilename(L"..") == L"received_file.bin",
+          "Dotdot filename not replaced");
+
+    // 2. CRC32 check ("123456789" -> 0xCBF43926)
+    const char digits[] = "123456789";
+    uint32_t crc = s2p::FileTransfer::ComputeCrc32(digits, 9);
+    CHECK(crc == 0xCBF43926u, "CRC32 standard check vector failed");
+
+    // 3. End-to-end multi-chunk (200 KB) bidirectional loopback TCP transfer
+    wchar_t tempBase[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempBase);
+    std::wstring srcDir = std::wstring(tempBase) + L"s2p_test_src_" + std::to_wstring(GetCurrentProcessId());
+    std::wstring dstDir = std::wstring(tempBase) + L"s2p_test_dst_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(srcDir.c_str(), nullptr);
+    CreateDirectoryW(dstDir.c_str(), nullptr);
+
+    std::wstring srcFile = srcDir + L"\\sample_payload.bin";
+    const size_t fileBytes = 200 * 1024 + 137; // > 3 chunks (64 KB) + unaligned tail
+    std::vector<uint8_t> expected(fileBytes);
+    for (size_t i = 0; i < fileBytes; ++i) {
+        expected[i] = static_cast<uint8_t>((i * 29 + 7) & 0xFF);
+    }
+
+    HANDLE hOut = CreateFileW(srcFile.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(hOut != INVALID_HANDLE_VALUE, "Could not create temp source file");
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hOut, expected.data(), static_cast<DWORD>(expected.size()), &written, nullptr);
+        CloseHandle(hOut);
+    }
+
+    const uint16_t ftPort = 48297;
+    s2p::TcpSocket listener;
+    CHECK(listener.Listen(ftPort, 2), "FileTransfer loopback listener failed");
+
+    s2p::TcpSocket srvSock;
+    std::thread acceptThread([&]() {
+        srvSock = listener.Accept(nullptr, 3000);
+    });
+
+    s2p::TcpSocket cliSock;
+    CHECK(cliSock.Connect("127.0.0.1", ftPort, 2000), "FileTransfer loopback connect failed");
+    acceptThread.join();
+    listener.Close();
+    CHECK(srvSock.IsValid(), "FileTransfer server accept invalid");
+
+    s2p::FileTransfer senderFt;
+    s2p::FileTransfer receiverFt;
+    senderFt.Start(std::move(cliSock), srcDir);
+    receiverFt.Start(std::move(srvSock), dstDir);
+
+    CHECK(senderFt.QueueFiles({ srcFile }) == 1, "QueueFiles failed to enqueue test file");
+
+    bool done = false;
+    for (int i = 0; i < 60; ++i) {
+        if (receiverFt.GetStats().filesReceived >= 1) {
+            done = true;
+            break;
+        }
+        Sleep(50);
+    }
+    CHECK(done, "Loopback file transfer did not finish in time");
+    CHECK(senderFt.GetStats().filesSent == 1, "Sender filesSent count mismatch");
+    CHECK(receiverFt.GetStats().bytesReceived == fileBytes, "Receiver bytesReceived mismatch");
+
+    // Verify exact file bytes on disk
+    std::wstring dstFile = dstDir + L"\\sample_payload.bin";
+    HANDLE hIn = CreateFileW(dstFile.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(hIn != INVALID_HANDLE_VALUE, "Received destination file missing");
+    if (hIn != INVALID_HANDLE_VALUE) {
+        std::vector<uint8_t> actual(fileBytes);
+        DWORD readBytes = 0;
+        ReadFile(hIn, actual.data(), static_cast<DWORD>(actual.size()), &readBytes, nullptr);
+        CloseHandle(hIn);
+        CHECK(readBytes == fileBytes && actual == expected, "Received file content corrupted");
+    }
+
+    // Also test unique destination collision naming when same filename already exists
+    std::wstring collisionPath = s2p::FileTransfer::ResolveUniqueDestPath(dstDir, L"sample_payload.bin");
+    CHECK(collisionPath.find(L"sample_payload (1).bin") != std::wstring::npos, "Unique collision suffix (1) failed");
+
+    senderFt.Stop();
+    receiverFt.Stop();
+    DeleteFileW(srcFile.c_str());
+    DeleteFileW(dstFile.c_str());
+    RemoveDirectoryW(srcDir.c_str());
+    RemoveDirectoryW(dstDir.c_str());
+
+    std::cout << "[PASS] TestFileTransfer\n";
+}
+
 } // namespace
 
 int main() {
@@ -279,6 +378,7 @@ int main() {
     TestColorAndH264();
     TestLoopbackNetworking();
     TestClipboardSync();
+    TestFileTransfer();
 
     CoUninitialize();
 

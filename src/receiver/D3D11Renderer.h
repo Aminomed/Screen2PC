@@ -115,6 +115,7 @@ private:
     uint32_t m_cursorHotY = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cursorTex;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_cursorSrv;
+    FileDropCallback m_fileDropCb;
 };
 
 } // namespace s2p

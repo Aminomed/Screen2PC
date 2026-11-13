@@ -513,6 +513,9 @@ void ReceiverEngine::StopStreamWorkers() {
 void ReceiverEngine::DisconnectSession() {
     m_sessionStop = true;
     m_clipboard.Stop();
+    m_fileListenSock.Close();
+    if (m_fileAcceptThread.joinable()) m_fileAcceptThread.join();
+    m_fileTransfer.Stop();
     {
         std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
         if (m_activeCtrlSock.IsValid()) {
@@ -539,6 +542,7 @@ ReceiverStatus ReceiverEngine::GetStatus() const {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         st = m_status;
     }
+    st.fileStats = m_fileTransfer.GetStats();
     st.streams.clear();
     for (const auto& w : m_workers) {
         std::lock_guard<std::mutex> sl(w->statsMutex);

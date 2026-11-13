@@ -16,6 +16,7 @@
 #include "../common/CodecH264.h"
 #include "../common/CodecDelta.h"
 #include "../common/ClipboardSync.h"
+#include "../common/FileTransfer.h"
 #include "DxgiCapture.h"
 
 namespace s2p {
@@ -56,6 +57,7 @@ struct SenderStatus {
     std::wstring stateText;
     std::wstring lastError;
     std::vector<StreamStats> streams;
+    FileTransferStats fileStats;
 };
 
 class SenderEngine {
@@ -74,6 +76,7 @@ public:
     SenderStatus GetStatus() const;
     bool IsConnected() const { return m_connected.load(); }
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
+    size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
 private:
     void SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data);
@@ -119,6 +122,8 @@ private:
     std::mutex m_controlSendMutex;
     std::thread m_controlThread;
     ClipboardSync m_clipboard;
+    FileTransfer m_fileTransfer;
+
     std::vector<std::unique_ptr<StreamWorker>> m_workers;
 };
 

@@ -9,9 +9,10 @@ namespace s2p {
 constexpr uint32_t kProtocolMagic   = 0x53325031; // "S2P1"
 constexpr uint16_t kProtocolVersion = 1;
 
-constexpr uint16_t kPortDiscovery   = 48210; // UDP Broadcast discovery
-constexpr uint16_t kPortControl     = 48211; // TCP Control & Handshake
-constexpr uint16_t kPortStreamBase  = 48212; // TCP Stream per monitor (48212 + monitorIndex)
+constexpr uint16_t kPortDiscovery    = 48210; // UDP Broadcast discovery
+constexpr uint16_t kPortControl      = 48211; // TCP Control & Handshake
+constexpr uint16_t kPortStreamBase   = 48212; // TCP Stream per monitor (48212 + monitorIndex)
+constexpr uint16_t kPortFileTransfer = 48214; // Dedicated bidirectional TCP File Transfer
 
 constexpr size_t   kMaxMonitors     = 2;
 constexpr size_t   kMaxFrameBytes   = 64 * 1024 * 1024; // 64 MB safety cap
@@ -42,7 +43,12 @@ enum class MsgType : uint16_t {
     StreamEnd        = 22,
 
     // TCP Control - Shared Clipboard & KVM (Phase 2/3)
-    ClipboardSync    = 30
+    ClipboardSync    = 30,
+
+    // Dedicated TCP File Transfer (port 48214)
+    FileMeta         = 31,
+    FileChunk        = 32,
+    FileDone         = 33
 };
 
 enum FrameFlags : uint32_t {
@@ -160,6 +166,27 @@ struct ClipboardHeader {
     uint32_t kind;     // 1 = UTF-16LE text, 2 = CF_DIB image
     uint64_t hash64;
     uint32_t dataSize;
+};
+
+struct FileMetaHeader {
+    uint32_t transferId;
+    uint64_t fileSize;
+    uint32_t nameUtf8Bytes; // followed by UTF-8 sanitized filename
+};
+
+struct FileChunkHeader {
+    uint32_t transferId;
+    uint64_t offset;
+    uint32_t chunkSize;
+    uint32_t crc32; // CRC32 of chunk bytes
+};
+
+struct FileDonePayload {
+    uint32_t transferId;
+    uint64_t totalBytes;
+    uint32_t totalCrc32;
+    uint8_t  ok;
+    uint8_t  pad[3];
 };
 
 #pragma pack(pop)

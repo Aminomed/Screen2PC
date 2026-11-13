@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <objbase.h>
 
 #include <iomanip>
@@ -16,6 +17,7 @@
 #include "ReceiverEngine.h"
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 
 namespace {
@@ -29,6 +31,8 @@ constexpr int IDC_BTN_DISCONN  = 203;
 constexpr int IDC_STATS_TEXT   = 204;
 constexpr int IDC_BTN_FIREWALL = 205;
 constexpr int IDC_CHK_CLIPBOARD= 206;
+constexpr int IDC_BTN_SENDFILE = 207;
+constexpr int IDC_BTN_OPEN_DL  = 208;
 
 constexpr int IDM_SHOW = 3001;
 constexpr int IDM_EXIT = 3002;
@@ -63,6 +67,34 @@ void SaveClipboardPref(bool enabled) {
     WritePrivateProfileStringW(L"Receiver", L"ClipboardSync", enabled ? L"1" : L"0", GetReceiverIniPath().c_str());
 }
 
+std::vector<std::wstring> PickFilesDialog(HWND owner) {
+    std::vector<wchar_t> buf(32768, L'\0');
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = L"Alle Dateien (*.*)\0*.*\0\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = static_cast<DWORD>(buf.size());
+    ofn.lpstrTitle = L"Dateien ans Surface senden";
+    ofn.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    std::vector<std::wstring> out;
+    if (!GetOpenFileNameW(&ofn)) return out;
+
+    const wchar_t* p = buf.data();
+    std::wstring first = p;
+    p += first.size() + 1;
+    if (*p == L'\0') {
+        out.push_back(first);
+    } else {
+        while (*p != L'\0') {
+            std::wstring name = p;
+            out.push_back(first + L"\\" + name);
+            p += name.size() + 1;
+        }
+    }
+    return out;
+}
+
 void UpdateUi() {
     if (!g_hwnd || !g_engine) return;
     auto st = g_engine->GetStatus();
@@ -82,6 +114,7 @@ void UpdateUi() {
     }
     SetDlgItemTextW(g_hwnd, IDC_INFO_LABEL, hdr.str().c_str());
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_DISCONN), st.sessionActive ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SENDFILE), st.fileStats.active ? TRUE : FALSE);
 
     std::wostringstream body;
     if (!st.sessionActive) {
@@ -98,6 +131,12 @@ void UpdateUi() {
                  << std::setprecision(1) << s.mbps << L" Mbit/s  |  "
                  << L"Frames: " << s.framesReceived << L"\r\n";
         }
+        body << L"Dateien (Drag & Drop): Gesendet " << st.fileStats.filesSent
+             << L" | Empfangen " << st.fileStats.filesReceived;
+        if (!st.fileStats.lastEvent.empty()) {
+            body << L" | " << st.fileStats.lastEvent;
+        }
+        body << L"\r\n";
     }
     SetDlgItemTextW(g_hwnd, IDC_STATS_TEXT, body.str().c_str());
 }
@@ -139,7 +178,10 @@ void CreateUiControls(HWND hwnd) {
     addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, 16, 156, 250, 32, IDC_BTN_DISCONN);
     addCtrl(L"BUTTON", L"Windows Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, 276, 156, 260, 32, IDC_BTN_FIREWALL);
 
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 200, 520, 160, IDC_STATS_TEXT, g_monoFont);
+    addCtrl(L"BUTTON", L"Datei(en) ans Surface senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 194, 250, 28, IDC_BTN_SENDFILE);
+    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 276, 194, 260, 28, IDC_BTN_OPEN_DL);
+
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 230, 520, 160, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -158,6 +200,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         CreateUiControls(hwnd);
+        DragAcceptFiles(hwnd, TRUE);
         SetTimer(hwnd, TIMER_TELEMETRY, 500, nullptr);
 
         g_nid.cbSize = sizeof(g_nid);
@@ -196,6 +239,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BTN_FIREWALL:
             OpenFirewallPortsElevated();
             return 0;
+        case IDC_BTN_SENDFILE:
+            if (g_engine) {
+                auto files = PickFilesDialog(hwnd);
+                if (!files.empty()) g_engine->SendFiles(files);
+            }
+            return 0;
+        case IDC_BTN_OPEN_DL:
+            ShellExecuteW(hwnd, L"open", s2p::FileTransfer::DefaultDownloadDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
         case IDM_SHOW:
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
@@ -205,6 +257,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+
+    case WM_DROPFILES:
+        if (g_engine) {
+            HDROP hDrop = reinterpret_cast<HDROP>(wp);
+            UINT count = DragQueryFileW(hDrop, 0xFFFFFFFFu, nullptr, 0);
+            std::vector<std::wstring> files;
+            files.reserve(count);
+            for (UINT i = 0; i < count; ++i) {
+                UINT len = DragQueryFileW(hDrop, i, nullptr, 0);
+                if (len > 0 && len < 32768) {
+                    std::wstring path(len, L'\0');
+                    DragQueryFileW(hDrop, i, path.data(), len + 1);
+                    files.push_back(std::move(path));
+                }
+            }
+            DragFinish(hDrop);
+            if (!files.empty()) {
+                g_engine->SendFiles(files);
+            }
+        }
+        return 0;
 
     case WM_TIMER:
         if (wp == TIMER_TELEMETRY) UpdateUi();
@@ -274,7 +347,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, L"Screen2PC Receiver (PC - Treiberfrei)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 570, 418,
+        CW_USEDEFAULT, CW_USEDEFAULT, 570, 446,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

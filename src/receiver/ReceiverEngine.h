@@ -14,6 +14,7 @@
 #include "../common/Protocol.h"
 #include "../common/NetSocket.h"
 #include "../common/ClipboardSync.h"
+#include "../common/FileTransfer.h"
 
 namespace s2p {
 
@@ -37,6 +38,7 @@ struct ReceiverStatus {
     std::vector<MonitorDesc> localMonitors;
     std::vector<std::string> localIps;
     std::vector<ReceiverStreamStats> streams;
+    FileTransferStats fileStats;
 };
 
 class ReceiverEngine {
@@ -54,6 +56,7 @@ public:
     void DisconnectSession();
     void SetStartFullscreen(bool fs) { m_startFullscreen = fs; }
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
+    size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
     ReceiverStatus GetStatus() const;
 
@@ -97,6 +100,9 @@ private:
     TcpSocket m_activeCtrlSock;
 
     ClipboardSync m_clipboard;
+    TcpSocket m_fileListenSock;
+    std::thread m_fileAcceptThread;
+    FileTransfer m_fileTransfer;
 
     mutable std::mutex m_stateMutex;
     ReceiverStatus m_status;

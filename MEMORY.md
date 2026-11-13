@@ -6,9 +6,9 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Phase 2A (Shared Clipboard) — Bereit zur CI-Verifikation`
-- **Status:** Core-MVP, Deep Debug (Phase 1) und Bidirektionale Zwischenablage (Phase 2A: Text & Bilder mit Anti-Echo-Hash & OpenClipboard-Retry) implementiert. Als naechstes folgen Phase 2B (Quick File Transfer) und Phase 3 (KVM Maus/Tastatur PC -> Surface).
-- **Next Step:** CI für Phase 2A prüfen, anschließend Quick File Transfer (`TCP 48214`) und KVM (`SendInput`, 100% treiberfrei auf PC) umsetzen.
+- **Phase:** `Phase 2B (Quick File Transfer) — Bereit zur CI-Verifikation`
+- **Status:** Shared Clipboard (Phase 2A) ist CI-grün (`43332884439`). Phase 2B (`FileTransfer` auf dediziertem `TCP 48214` Full-Duplex-Kanal mit 64-KB-Chunks, CRC32, Path-Sanitization, Auto-Rename bei Kollision & Drag&Drop auf Haupt- und Render-Fenster) ist implementiert. Als nächstes folgt Phase 3 (KVM Maus/Tastatur PC -> Surface, treiberfrei).
+- **Next Step:** CI für Phase 2B prüfen, anschließend Phase 3 (`KvmInput` mit `SendInput`) umsetzen und abschließend gründlich debuggen & stresstesten.
 
 ---
 
@@ -44,7 +44,7 @@
 |---|---|
 | `MEMORY.md` | Zentrale Planungs-, Architektur- & Changelog-Datei |
 | `Screen2PC.sln`, `packages.config`, `Directory.Build.props` | VS 2022 Solution + WDK/SDK NuGet-Integration fuer CI |
-| `src/common/` | `Protocol.h`, `Logger`, `NetSocket` (UDP/TCP), `CodecH264` (MF GPU+CPU), `CodecDelta` (Lossless RLE), `ClipboardSync` (CF_UNICODETEXT + CF_DIB) |
+| `src/common/` | `Protocol.h`, `Logger`, `NetSocket` (UDP/TCP), `CodecH264` (MF GPU+CPU), `CodecDelta` (Lossless RLE), `ClipboardSync` (CF_UNICODETEXT + CF_DIB), `FileTransfer` (TCP 48214 CRC32 Chunk-Transfer) |
 | `src/driver/` | UMDF v2 `IddCx 1.2` Virtual Display Driver (`Screen2PCDriver.dll`, `Screen2PCDriver.inf`, Named Pipe) |
 | `src/driversetup/` | Eigenstaendiges CLI (`Screen2PC.DriverSetup.exe`) fuer SetupAPI/Devnode Install/Remove/Status |
 | `src/sender/` | Surface App (`DxgiCapture`, `VirtualDisplayCtl`, `SenderEngine`, Win32 Tray/GUI + `Ctrl+Shift+K`) |
@@ -65,4 +65,5 @@
 | 2026-11-12 | Codec & Scripts | `H264Decoder` um Trennung zwischen Macroblock-Padding (`m_codedHeight`, z. B. `1088` bei `1080p` / `368` bei `360p`) und sichtbarer Aperture (`MF_MT_MINIMUM_DISPLAY_APERTURE`) + DXVA-Crop erweitert; `$RootDir` in `install_driver.ps1`/`uninstall_driver.ps1` fuer entpacktes Release-ZIP gefixt; Hotkey-Reentry-Guard im Sender ergaenzt |
 | 2026-11-12 | CI Verifikation | GitHub Actions Run gruen (`43330726483` / `43331141875`): MSBuild `Release|x64`, `Screen2PC.Tests.exe` (4/4 Testsuiten bestanden), `infverif.exe`, `Inf2Cat.exe` & Artifact `Screen2PC-Windows-x64.zip` komplett erfolgreich |
 | 2026-11-13 | Phase 1: Deep Debug & Hardening | `ReceiverEngine` Control-Mutex-Deadlock (`m_ctrlSendMutex` + `WaitReadable`) gefixt; `TcpSocket::SendPacket` auf Single-Send gebuendelt; `D3D11Renderer` `m_quadCb` & `WM_PAINT`/`WM_SIZE`-Repaint optimiert; `H264Encoder` Staging-Texture gecached; `Driver` `AdapterInitFinished`-Race & Fehler-Cleanup gefixt; `DisplayMode::ExtendSecondary` (nur PC-Monitor 2) + `SetDisplayConfig`-Extend-Fallback + `sender.ini`/`receiver.ini` Settings-Persistenz + `1080p` H.264/Delta-Corruption/Large-TCP-Tests ergaenzt |
-| 2026-11-13 | Phase 2A: Shared Clipboard | `ClipboardSync` (`HWND_MESSAGE` + `AddClipboardFormatListener`, `CF_UNICODETEXT` bis 2 MB + `CF_DIB` bis 16 MB, 64-Bit FNV-1a Anti-Echo, `OpenClipboard`-Retry) erstellt und in `Protocol.h`, `SenderEngine`, `ReceiverEngine`, Sender/Receiver UI (inkl. INI-Persistenz) und Unit-Tests verdrahtet |
+| 2026-11-13 | Phase 2A: Shared Clipboard | `ClipboardSync` (`HWND_MESSAGE` + `AddClipboardFormatListener`, `CF_UNICODETEXT` bis 2 MB + `CF_DIB` bis 16 MB, 64-Bit FNV-1a Anti-Echo, `OpenClipboard`-Retry) erstellt und in `Protocol.h`, `SenderEngine`, `ReceiverEngine`, Sender/Receiver UI (inkl. INI-Persistenz) und Unit-Tests verdrahtet (CI gruen `43332884439`) |
+| 2026-11-13 | Phase 2B: Quick File Transfer | `FileTransfer` (`TCP 48214` Full-Duplex, 64-KB-Chunks + CRC32-Pruefung, `.part`-Tempdatei, Path-Traversal-Sanitization, Auto-Rename `datei (1).ext`) erstellt und via `WM_DROPFILES` Drag&Drop (Hauptfenster + `D3D11Renderer`-Fenster), Dateiauswahl-Dialog (`GetOpenFileNameW`), Ordner-Button & Loopback-Test verdrahtet |

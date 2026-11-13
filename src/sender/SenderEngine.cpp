@@ -239,6 +239,16 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     m_clipboard.Start([this](uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
         SendClipboardData(kind, hash64, data);
     });
+
+    {
+        TcpSocket fileSock;
+        if (fileSock.Connect(cfg.targetIp, kPortFileTransfer, 2000)) {
+            m_fileTransfer.Start(std::move(fileSock));
+        } else {
+            Logger::Instance().Warn("FILE-TX", L"Could not connect dedicated file transfer port 48214.");
+        }
+    }
+
     m_controlThread = std::thread(&SenderEngine::ControlLoop, this);
 
     {
@@ -636,6 +646,7 @@ void SenderEngine::Disconnect() {
     m_stop = true;
     m_connected = false;
     m_clipboard.Stop();
+    m_fileTransfer.Stop();
 
     if (m_controlSock.IsValid()) {
         {
@@ -678,6 +689,7 @@ SenderStatus SenderEngine::GetStatus() const {
         s = m_status;
     }
     s.driverActive = VirtualDisplayCtl::IsDriverActive();
+    s.fileStats = m_fileTransfer.GetStats();
     s.streams.clear();
     for (const auto& w : m_workers) {
         std::lock_guard<std::mutex> sl(w->statsMutex);
