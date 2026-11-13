@@ -6,9 +6,9 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Phase 0–3 Abgeschlossen & CI-verifiziert; Deep-Audit & Hardening Pass`
-- **Status:** Shared Clipboard (Phase 2A), Quick File Transfer (Phase 2B), treiberfreies KVM (Phase 3) sowie alle Basis-/Codec-/Treiber-Komponenten sind in Run `43341834757` (`ffa80dc`) mit 0 Projekt-Warnings und 7/7 bestandenen Testsuiten gruen verifiziert. Aktueller Hardening-Commit ergaenzt atomares `TcpSocket`-Lifecycle-Handling, `ReleaseCapture()` bei Focus-Verlust und simultane bidirektionale Full-Duplex-Tests.
-- **Next Step:** Aktuellen Hardening-Commit pushen & CI pruefen, dann Timer bis `06:45 CET` (Credit-Reset-Fenster) abwarten und vor `09:00 CET` finale End-to-End-Abnahme liefern.
+- **Phase:** `Phase 0–3 Komplett & Hardening-Audits CI-verifiziert`
+- **Status:** Alle geplanten Kern- & Ausbauphasen (UMDF2 Virtual Display Driver, H.264/DXVA + Delta Lossless Streaming, Shared Clipboard, Full-Duplex Quick File Transfer, Treiberfreies KVM inkl. Sub-10ms-Polling, Multi-Thread-Hardening & Runtime-MFT-Fallback) sind implementiert und in CI Run `43343658228` (`3a9d368`) mit 0 Projekt-Warnings und 7/7 bestandenen Testsuiten gruen verifiziert.
+- **Next Step:** Auf `06:45 CET` Credit-Reset-Fenster per Timer warten und danach vor `09:00 CET` die finale Abnahme & Bedienungsanleitung an den User liefern.
 
 ---
 
@@ -70,4 +70,4 @@
 | 2026-11-13 | Phase 3: Pure User-Mode KVM | `KvmInput` (Aspect-Letterbox-Mapping + Multi-Monitor Virtual Desktop `SendInput`), `MsgType::KvmMouse`/`KvmKey`, `D3D11Renderer` Maus-/Tastaturerfassung + `Ctrl+Alt+K`-Toggle + `WM_KILLFOCUS`-Modifier-Release, `ReceiverEngine`/`SenderEngine` Forwarding & Injektion, Checkboxen/INI in Sender/Receiver, Thread-Join-Race in `SenderEngine::Disconnect` gefixt & `TestKvmInput` ergaenzt (CI gruen `43341834757`) |
 | 2026-11-13 | Deep Audit & Hardening | `TcpSocket::m_sock` auf `std::atomic<SOCKET>` fuer race-freies paralleles `Close()`/Shutdown umgestellt; `D3D11Renderer` `WM_KILLFOCUS` um `ReleaseCapture()` ergaenzt; `TestFileTransfer` auf simultanen Full-Duplex-Transfer (Senden+Empfangen gleichzeitig) & `TestKvmInput` auf `2560x1440`+`1920x1080`-Geometrie erweitert (CI gruen `43342527594`) |
 | 2026-11-13 | Concurrency & KVM Latency Fix | `SenderEngine`/`ReceiverEngine` `m_workers` via `m_workersMutex` (Swap-before-Join) & `m_lifecycleMutex`/`m_disconnectMutex` vor Datenrennen geschuetzt; getrackte Join-Threads (`g_connectThread`/`g_disconnThread`) statt `.detach()`; TCP-EOF-100%-CPU-Spin (`err == 0` nach `WaitReadable`) gefixt; `RunStreamWorker` auf `WaitReadable(10)` (<10 ms KVM-Reaktionszeit) umgestellt; Firewall-Setup auf einzelnen UAC-Prompt gebuendelt (CI gruen `43343069788`) |
-| 2026-11-13 | Hardware MFT & Driver Polish | `ID3D10Multithread::SetMultithreadProtected(TRUE)` in `DxgiCapture`, `H264Encoder` & `H264Decoder` fuer AMD VCN / Nvidia NVDEC DXGI-Device-Sharing aktiviert; automatischer Runtime-Fallback (`GPU H.264 -> CPU H.264 -> Delta Lossless`) bei MFT-Initialisierungsfehlern im StreamWorker; `Driver` `Screen2PCMonitorQueryModes` dedupliziert |
+| 2026-11-13 | Hardware MFT & Driver Polish | `ID3D10Multithread::SetMultithreadProtected(TRUE)` in `DxgiCapture`, `H264Encoder` & `H264Decoder` fuer AMD VCN / Nvidia NVDEC DXGI-Device-Sharing aktiviert; automatischer Runtime-Fallback (`GPU H.264 -> CPU H.264 -> Delta Lossless`) bei MFT-Initialisierungsfehlern im StreamWorker; `Driver` `Screen2PCMonitorQueryModes` dedupliziert (CI gruen `43343658228`) |
