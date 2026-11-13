@@ -714,7 +714,7 @@ void H264Decoder::Shutdown() {
     m_dxvaEnabled = false;
 }
 
-bool H264Decoder::Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uint32_t width, uint32_t height) {
+bool H264Decoder::Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uint32_t width, uint32_t height, bool allowHardware) {
     Shutdown();
 
     m_width = width;
@@ -760,7 +760,7 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uin
     if (SUCCEEDED(m_mft->GetAttributes(&attrs))) {
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
         UINT32 d3d11Aware = 0;
-        if (m_device && SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) && d3d11Aware != 0) {
+        if (allowHardware && m_device && SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) && d3d11Aware != 0) {
             Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
             if (SUCCEEDED(m_device.As(&mt)) && mt) {
                 mt->SetMultithreadProtected(TRUE);

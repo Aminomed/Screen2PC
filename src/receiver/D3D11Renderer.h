@@ -107,6 +107,7 @@ private:
     bool m_closedByUser = false;
     bool m_needRepaint = false;
     bool m_kvmEnabled = true;
+    uint8_t m_suppressKeyUpMask = 0;
 
     HWND m_hwnd = nullptr;
 

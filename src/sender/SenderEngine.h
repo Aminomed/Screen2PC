@@ -82,8 +82,10 @@ public:
 
 private:
     void DisconnectInternal();
+    void CleanupSessionResources();
     void SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data);
     struct StreamWorker {
+        uint32_t streamIndex = 0;
         uint32_t targetPcMonitor = 0;
         uint32_t adapterIndex = 0;
         uint32_t outputIndex = 0;
@@ -114,6 +116,7 @@ private:
     void RunStreamWorker(StreamWorker* w);
 
     std::mutex m_lifecycleMutex;
+    std::mutex m_cleanupMutex;
     mutable std::mutex m_stateMutex;
     SenderStatus m_status;
     SenderConfig m_cfg;
@@ -122,7 +125,7 @@ private:
     std::atomic<bool> m_connected{false};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
-    bool m_createdVirtualDisplays = false;
+    std::atomic<bool> m_createdVirtualDisplays{false};
 
     TcpSocket m_controlSock;
     std::mutex m_controlSendMutex;

@@ -97,14 +97,17 @@ void D3D11Renderer::UpdateTitle() {
 }
 
 void D3D11Renderer::SetKvmEnabled(bool enabled) {
-    if (!enabled && m_kvmEnabled && m_kvmKeyCb) {
-        const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
-        for (uint16_t vk : mods) {
-            KvmKeyEvent ev{};
-            ev.vk = vk;
-            ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
-            ev.isDown = 0;
-            m_kvmKeyCb(ev);
+    if (!enabled) {
+        m_suppressKeyUpMask = 0;
+        if (m_kvmEnabled && m_kvmKeyCb) {
+            const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
+            for (uint16_t vk : mods) {
+                KvmKeyEvent ev{};
+                ev.vk = vk;
+                ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+                ev.isDown = 0;
+                m_kvmKeyCb(ev);
+            }
         }
     }
     m_kvmEnabled = enabled;
@@ -595,6 +598,7 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         return 0;
     }
     case WM_KILLFOCUS: {
+        m_suppressKeyUpMask = 0;
         if (GetCapture() == hwnd) {
             ReleaseCapture();
         }
@@ -621,7 +625,11 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             return 0;
         }
         if ((GetKeyState(VK_CONTROL) < 0) && (GetKeyState(VK_MENU) < 0) && wp == 'K' && ((lp & (1 << 30)) == 0)) {
-            SetKvmEnabled(!m_kvmEnabled);
+            bool enabling = !m_kvmEnabled;
+            SetKvmEnabled(enabling);
+            if (enabling) {
+                m_suppressKeyUpMask = 0x7;
+            }
             return 0;
         }
         if (msg == WM_SYSKEYDOWN && wp == VK_F4) {
@@ -645,6 +653,20 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         }
         if (msg == WM_SYSKEYUP && wp == VK_F4) {
             break;
+        }
+        if (m_suppressKeyUpMask != 0) {
+            if (wp == 'K' && (m_suppressKeyUpMask & 0x1)) {
+                m_suppressKeyUpMask &= ~0x1;
+                return 0;
+            }
+            if (wp == VK_CONTROL && (m_suppressKeyUpMask & 0x2)) {
+                m_suppressKeyUpMask &= ~0x2;
+                return 0;
+            }
+            if (wp == VK_MENU && (m_suppressKeyUpMask & 0x4)) {
+                m_suppressKeyUpMask &= ~0x4;
+                return 0;
+            }
         }
         if (m_kvmEnabled && m_kvmKeyCb) {
             KvmKeyEvent ev{};

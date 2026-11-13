@@ -410,8 +410,20 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     H264Decoder h264;
     uint32_t h264W = 0, h264H = 0;
+    bool decodedAnyH264 = false;
+    uint32_t consecutiveH264Fails = 0;
+    auto lastKeyframeReq = std::chrono::steady_clock::time_point{};
     DeltaDecoder delta;
     std::vector<uint8_t> cpuBgra;
+
+    auto maybeRequestKeyframe = [&]() {
+        auto now = std::chrono::steady_clock::now();
+        if (lastKeyframeReq.time_since_epoch().count() == 0 ||
+            now - lastKeyframeReq >= std::chrono::milliseconds(1000)) {
+            RequestKeyframe(w->monitorIndex);
+            lastKeyframeReq = now;
+        }
+    };
 
     auto windowStart = std::chrono::steady_clock::now();
     uint64_t windowFrames = 0;
@@ -478,6 +490,8 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                     h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height);
                     h264W = vh.width;
                     h264H = vh.height;
+                    decodedAnyH264 = false;
+                    consecutiveH264Fails = 0;
                     renderer.EnsureFrameTexture(vh.width, vh.height);
                 }
                 if (h264.IsInitialized()) {
@@ -496,8 +510,24 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                         }
                         codecLabel = L"H.264 (CPU)";
                     }
+
+                    if (decodedOk) {
+                        decodedAnyH264 = true;
+                        consecutiveH264Fails = 0;
+                    } else {
+                        ++consecutiveH264Fails;
+                        if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
+                            Logger::Instance().Warn("RCV-DEC", L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
+                            h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false);
+                            consecutiveH264Fails = 0;
+                            RequestKeyframe(w->monitorIndex);
+                            lastKeyframeReq = std::chrono::steady_clock::now();
+                        } else if (consecutiveH264Fails >= 2) {
+                            maybeRequestKeyframe();
+                        }
+                    }
                 } else {
-                    RequestKeyframe(w->monitorIndex);
+                    maybeRequestKeyframe();
                 }
             } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
                 if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
@@ -505,7 +535,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                     decodedOk = true;
                     codecLabel = L"Delta Lossless";
                 } else {
-                    RequestKeyframe(w->monitorIndex);
+                    maybeRequestKeyframe();
                 }
             }
 

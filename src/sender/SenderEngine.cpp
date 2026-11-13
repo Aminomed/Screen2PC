@@ -218,6 +218,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     newWorkers.reserve(streamCount);
     for (uint32_t i = 0; i < streamCount; ++i) {
         auto w = std::make_unique<StreamWorker>();
+        w->streamIndex = i;
         w->targetPcMonitor = startReq.streams[i].monitorIndex;
         w->adapterIndex = captureOutputs[i].adapterIndex;
         w->outputIndex = captureOutputs[i].outputIndex;
@@ -420,7 +421,7 @@ void SenderEngine::ControlLoop() {
                     std::memcpy(&req, payload.data(), sizeof(req));
                     std::lock_guard<std::mutex> wl(m_workersMutex);
                     for (auto& w : m_workers) {
-                        if (w->targetPcMonitor == req.monitorIndex) {
+                        if (w->streamIndex == req.monitorIndex) {
                             w->forceKeyframe = true;
                         }
                     }
@@ -444,11 +445,21 @@ void SenderEngine::ControlLoop() {
                         bool haveRect = false;
                         {
                             std::lock_guard<std::mutex> wl(m_workersMutex);
-                            if (!m_workers.empty()) {
-                                size_t idx = (ev.monitorIndex < m_workers.size()) ? ev.monitorIndex : 0;
-                                rect = m_workers[idx]->desktopRect;
+                            for (const auto& w : m_workers) {
+                                if (w->streamIndex == ev.monitorIndex) {
+                                    rect = w->desktopRect;
+                                    if (rect.right <= rect.left || rect.bottom <= rect.top) {
+                                        rect = RECT{ 0, 0, static_cast<LONG>(w->width), static_cast<LONG>(w->height) };
+                                    }
+                                    haveRect = true;
+                                    break;
+                                }
+                            }
+                            if (!haveRect && !m_workers.empty()) {
+                                const auto& w = m_workers.front();
+                                rect = w->desktopRect;
                                 if (rect.right <= rect.left || rect.bottom <= rect.top) {
-                                    rect = RECT{ 0, 0, static_cast<LONG>(m_workers[idx]->width), static_cast<LONG>(m_workers[idx]->height) };
+                                    rect = RECT{ 0, 0, static_cast<LONG>(w->width), static_cast<LONG>(w->height) };
                                 }
                                 haveRect = true;
                             }
@@ -486,12 +497,16 @@ void SenderEngine::ControlLoop() {
         }
     }
 
+    m_stop = true;
     m_connected = false;
+    CleanupSessionResources();
+
     std::lock_guard<std::mutex> lock(m_stateMutex);
     if (m_status.connected) {
         m_status.connected = false;
-        m_status.stateText = L"Getrennt";
+        m_status.stateText = L"Getrennt (Verbindung beendet)";
     }
+    m_status.streams.clear();
 }
 
 void SenderEngine::SendClipboardData(uint32_t kind, uint64_t hash64, const std::vector<uint8_t>& data) {
@@ -720,6 +735,29 @@ void SenderEngine::Disconnect() {
     DisconnectInternal();
 }
 
+void SenderEngine::CleanupSessionResources() {
+    std::lock_guard<std::mutex> cleanLock(m_cleanupMutex);
+    m_clipboard.Stop();
+    m_fileTransfer.Stop();
+    m_controlSock.Close();
+
+    std::vector<std::unique_ptr<StreamWorker>> toJoin;
+    {
+        std::lock_guard<std::mutex> wl(m_workersMutex);
+        for (auto& w : m_workers) {
+            w->stop = true;
+        }
+        toJoin.swap(m_workers);
+    }
+    for (auto& w : toJoin) {
+        if (w->thread.joinable()) w->thread.join();
+    }
+
+    if (m_createdVirtualDisplays.exchange(false)) {
+        VirtualDisplayCtl::ClearMonitors();
+    }
+}
+
 void SenderEngine::DisconnectInternal() {
     m_stop = true;
     m_connected = false;
@@ -738,22 +776,7 @@ void SenderEngine::DisconnectInternal() {
         m_controlThread.join();
     }
 
-    std::vector<std::unique_ptr<StreamWorker>> toJoin;
-    {
-        std::lock_guard<std::mutex> wl(m_workersMutex);
-        for (auto& w : m_workers) {
-            w->stop = true;
-        }
-        toJoin.swap(m_workers);
-    }
-    for (auto& w : toJoin) {
-        if (w->thread.joinable()) w->thread.join();
-    }
-
-    if (m_createdVirtualDisplays) {
-        VirtualDisplayCtl::ClearMonitors();
-        m_createdVirtualDisplays = false;
-    }
+    CleanupSessionResources();
 
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.connected = false;

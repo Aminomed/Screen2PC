@@ -137,14 +137,18 @@ void TestColorAndH264() {
 
         s2p::H264Encoder enc;
         s2p::H264Decoder dec;
+        s2p::H264Decoder decCpuOnly;
         bool encInit = enc.Init(nullptr, nullptr, w, h, 30, 15);
         bool decInit = dec.Init(nullptr, nullptr, w, h);
+        bool decCpuInit = decCpuOnly.Init(nullptr, nullptr, w, h, false);
         CHECK(encInit, "H264Encoder CPU Init failed");
         CHECK(decInit, "H264Decoder CPU Init failed");
+        CHECK(decCpuInit && !decCpuOnly.IsHardwareDxva(), "H264Decoder allowHardware=false check failed");
 
         if (encInit && decInit) {
             bool gotEncoded = false;
             bool gotDecoded = false;
+            bool gotCpuDecoded = false;
             std::vector<uint8_t> outBgra;
 
             for (int f = 0; f < 10; ++f) {
@@ -154,23 +158,37 @@ void TestColorAndH264() {
                 if (enc.EncodeBgra(bgra.data(), w * 4, static_cast<uint64_t>(f) * 33333ULL, annexB, isKey) && !annexB.empty()) {
                     gotEncoded = true;
                     uint32_t outW = 0, outH = 0;
-                    if (dec.Decode(annexB.data(), annexB.size(), static_cast<uint64_t>(f) * 33333ULL,
+                    if (!gotDecoded &&
+                        dec.Decode(annexB.data(), annexB.size(), static_cast<uint64_t>(f) * 33333ULL,
                                    nullptr, &outBgra, &outW, &outH) && !outBgra.empty()) {
                         CHECK(outW == w && outH == h, "H264 decoded dimensions mismatch");
                         CHECK(outBgra.size() == static_cast<size_t>(w) * h * 4, "H264 decoded buffer byte count mismatch");
                         size_t center = (static_cast<size_t>(h / 2) * w + (w / 2)) * 4;
                         CHECK(outBgra[center + 1] > 150, "H264 decoded center pixel luma unexpectedly dark");
                         gotDecoded = true;
+                    }
+                    if (!gotCpuDecoded && decCpuInit) {
+                        std::vector<uint8_t> cpuOut;
+                        uint32_t cw = 0, ch = 0;
+                        if (decCpuOnly.Decode(annexB.data(), annexB.size(), static_cast<uint64_t>(f) * 33333ULL,
+                                              nullptr, &cpuOut, &cw, &ch) && !cpuOut.empty()) {
+                            CHECK(cw == w && ch == h, "H264Decoder CPU-fallback decoded dimensions mismatch");
+                            gotCpuDecoded = true;
+                        }
+                    }
+                    if (gotDecoded && (!decCpuInit || gotCpuDecoded)) {
                         break;
                     }
                 }
             }
             CHECK(gotEncoded, "H264Encoder produced no Annex-B output");
             CHECK(gotDecoded, "H264Decoder produced no decoded frame");
+            CHECK(gotCpuDecoded, "H264Decoder allowHardware=false produced no decoded frame");
         }
 
         enc.Shutdown();
         dec.Shutdown();
+        decCpuOnly.Shutdown();
     };
 
     testRes(640, 360);
@@ -375,7 +393,18 @@ void TestFileTransfer() {
     std::wstring collisionPath = s2p::FileTransfer::ResolveUniqueDestPath(dstDir, L"sample_payload.bin");
     CHECK(collisionPath.find(L"sample_payload (1).bin") != std::wstring::npos, "Unique collision suffix (1) failed");
 
+    // Verify clean peer-initiated TCP EOF exits RecvWorker without spinning/hanging
     senderFt.Stop();
+    bool peerClosedDetected = false;
+    for (int i = 0; i < 40; ++i) {
+        if (!receiverFt.IsConnected() && !receiverFt.GetStats().active) {
+            peerClosedDetected = true;
+            break;
+        }
+        Sleep(25);
+    }
+    CHECK(peerClosedDetected, "FileTransfer did not detect peer TCP EOF cleanly");
+
     receiverFt.Stop();
     DeleteFileW(srcFile.c_str());
     DeleteFileW(revSrcFile.c_str());

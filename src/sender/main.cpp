@@ -58,6 +58,7 @@ HFONT g_monoFont = nullptr;
 NOTIFYICONDATAW g_nid{};
 std::vector<s2p::DiscoveredPeer> g_peers;
 bool g_scanning = false;
+std::thread g_scanThread;
 std::thread g_connectThread;
 std::atomic<bool> g_closing{false};
 
@@ -156,27 +157,42 @@ std::vector<std::wstring> PickFilesDialog(HWND owner) {
 }
 
 void StartAsyncDiscovery() {
-    if (g_scanning) return;
+    if (g_scanning || g_closing.load()) return;
     g_scanning = true;
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SCAN), FALSE);
     SetDlgItemTextW(g_hwnd, IDC_BTN_SCAN, L"Suche...");
 
-    std::thread([]() {
+    if (g_scanThread.joinable()) {
+        g_scanThread.join();
+    }
+    g_scanThread = std::thread([]() {
         auto* found = new std::vector<s2p::DiscoveredPeer>(s2p::SenderEngine::DiscoverPeers(800));
-        if (g_hwnd) {
+        if (!g_closing.load() && g_hwnd) {
             PostMessageW(g_hwnd, WM_DISCOVERY_DONE, 0, reinterpret_cast<LPARAM>(found));
         } else {
             delete found;
         }
-    }).detach();
+    });
 }
 
 void OnToggleConnect() {
     if (!g_engine || !g_hwnd) return;
     if (!IsWindowEnabled(GetDlgItem(g_hwnd, IDC_BTN_CONNECT))) return;
     if (g_engine->IsConnected()) {
-        g_engine->Disconnect();
-        UpdateUiFromState();
+        EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_CONNECT), FALSE);
+        SetDlgItemTextW(g_hwnd, IDC_STATUS_LABEL, L"Status: Trenne Verbindung...");
+        if (g_connectThread.joinable()) {
+            g_connectThread.join();
+        }
+        g_engine->SignalStop();
+        g_connectThread = std::thread([]() {
+            if (g_engine && !g_closing.load()) {
+                g_engine->Disconnect();
+            }
+            if (!g_closing.load() && g_hwnd) {
+                PostMessageW(g_hwnd, WM_APP + 3, 0, 0);
+            }
+        });
         return;
     }
 
@@ -461,6 +477,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         if (g_engine) g_engine->SignalStop();
         if (g_connectThread.joinable()) g_connectThread.join();
+        if (g_scanThread.joinable()) g_scanThread.join();
         if (g_engine) g_engine->Disconnect();
         if (g_font) DeleteObject(g_font);
         if (g_monoFont) DeleteObject(g_monoFont);

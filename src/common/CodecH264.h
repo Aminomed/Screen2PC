@@ -109,7 +109,7 @@ public:
     H264Decoder(const H264Decoder&) = delete;
     H264Decoder& operator=(const H264Decoder&) = delete;
 
-    bool Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uint32_t width, uint32_t height);
+    bool Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uint32_t width, uint32_t height, bool allowHardware = true);
     void Shutdown();
     bool IsInitialized() const { return m_initialized; }
     bool IsHardwareDxva() const { return m_dxvaEnabled; }

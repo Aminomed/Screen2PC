@@ -327,7 +327,7 @@ void FileTransfer::RecvWorker() {
         std::vector<uint8_t> payload;
         if (!m_sock.RecvPacket(hdr, payload)) {
             int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == 0) continue;
+            if (err == WSAETIMEDOUT) continue;
             break;
         }
 
@@ -418,6 +418,10 @@ void FileTransfer::RecvWorker() {
 
     abortCurrent();
     m_connected = false;
+    {
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        m_stats.active = false;
+    }
     m_queueCv.notify_all();
 }
 
