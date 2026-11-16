@@ -559,6 +559,11 @@ void TestAutostartAndCli() {
     CHECK(s2p::ExtractExePathFromCommand(L"").empty(),
           "ExtractExePathFromCommand failed on empty command");
 
+    CHECK(std::wstring(s2p::kAutostartValueName) == L"Screen2PC Receiver" &&
+          std::wstring(s2p::kAutostartSenderValueName) == L"Screen2PC Sender" &&
+          std::wstring(s2p::kAutostartValueName) != std::wstring(s2p::kAutostartSenderValueName),
+          "Autostart registry value names for Receiver and Sender must be non-empty and distinct");
+
     std::cout << "[PASS] TestAutostartAndCli\n";
 }
 

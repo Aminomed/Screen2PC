@@ -8,6 +8,7 @@
 namespace s2p {
 
 constexpr const wchar_t* kAutostartValueName = L"Screen2PC Receiver";
+constexpr const wchar_t* kAutostartSenderValueName = L"Screen2PC Sender";
 
 // Command-line flag checks (case-insensitive)
 bool HasCliFlag(const wchar_t* cmdLine, const wchar_t* flag);

@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "../common/Autostart.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
 #include "../common/Updater.h"
@@ -53,6 +54,7 @@ constexpr int IDC_BTN_OPEN_DL    = 113;
 constexpr int IDC_CHK_KVM        = 114;
 constexpr int IDC_CHK_AUTOUPDATE = 115;
 constexpr int IDC_BTN_UPDATE     = 116;
+constexpr int IDC_CHK_AUTOSTART  = 117;
 
 constexpr int IDM_SHOW         = 2001;
 constexpr int IDM_TOGGLE       = 2002;
@@ -74,6 +76,7 @@ HWND g_hwnd = nullptr;
 HFONT g_font = nullptr;
 HFONT g_monoFont = nullptr;
 NOTIFYICONDATAW g_nid{};
+UINT g_wmShowExisting = 0;
 std::vector<s2p::DiscoveredPeer> g_peers;
 bool g_scanning = false;
 std::thread g_scanThread;
@@ -403,17 +406,30 @@ void CreateUiControls(HWND hwnd) {
     SendMessageW(chkKvm, BM_SETCHECK, kvmEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g_engine) g_engine->SetKvmEnabled(kvmEnabled);
 
-    addCtrl(L"BUTTON", L"Datei(en) an PC senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 274, 234, 28, IDC_BTN_SENDFILE);
-    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 262, 274, 234, 28, IDC_BTN_OPEN_DL);
+    HWND chkAuto = addCtrl(L"BUTTON", L"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)",
+                           BS_AUTOCHECKBOX | WS_TABSTOP, 16, 272, 480, 22, IDC_CHK_AUTOSTART);
+    SendMessageW(chkAuto, BM_SETCHECK,
+                 s2p::IsAutostartEnabled(s2p::kAutostartSenderValueName) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    addCtrl(L"BUTTON", L"Datei(en) an PC senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 300, 234, 28, IDC_BTN_SENDFILE);
+    addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 262, 300, 234, 28, IDC_BTN_OPEN_DL);
 
     HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start GitHub-Updates pruefen",
-                          BS_AUTOCHECKBOX | WS_TABSTOP, 16, 308, 240, 22, IDC_CHK_AUTOUPDATE);
+                          BS_AUTOCHECKBOX | WS_TABSTOP, 16, 334, 240, 22, IDC_CHK_AUTOUPDATE);
     SendMessageW(chkUpd, BM_SETCHECK, (LoadSetting(L"AutoUpdateCheck", 1) != 0) ? BST_CHECKED : BST_UNCHECKED, 0);
-    addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_PUSHBUTTON | WS_TABSTOP, 262, 306, 234, 28, IDC_BTN_UPDATE);
+    addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_PUSHBUTTON | WS_TABSTOP, 262, 332, 234, 28, IDC_BTN_UPDATE);
 
-    addCtrl(L"STATIC", L"", 0, 16, 342, 480, 36, IDC_DRIVER_LABEL);
-    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 380, 480, 40, IDC_STATUS_LABEL);
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 424, 480, 124, IDC_STATS_TEXT, g_monoFont);
+    addCtrl(L"STATIC", L"", 0, 16, 368, 480, 36, IDC_DRIVER_LABEL);
+    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 406, 480, 40, IDC_STATUS_LABEL);
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 450, 480, 124, IDC_STATS_TEXT, g_monoFont);
+}
+
+void ShowMainWindow(HWND hwnd) {
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -432,6 +448,11 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_wmShowExisting != 0 && msg == g_wmShowExisting) {
+        ShowMainWindow(hwnd);
+        return 0;
+    }
+
     switch (msg) {
     case WM_CREATE:
         CreateUiControls(hwnd);
@@ -454,6 +475,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             StartAsyncUpdateCheck(false);
         }
         return 0;
+
+    case WM_ACTIVATE:
+        if (LOWORD(wp) != WA_INACTIVE) {
+            SendDlgItemMessageW(hwnd, IDC_CHK_AUTOSTART, BM_SETCHECK,
+                                s2p::IsAutostartEnabled(s2p::kAutostartSenderValueName) ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
+        break;
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -478,6 +506,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveSetting(L"KvmEnabled", checked ? 1 : 0);
             }
             return 0;
+        case IDC_CHK_AUTOSTART: {
+            bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_AUTOSTART, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (!s2p::SetAutostartEnabled(checked, s2p::kAutostartSenderValueName)) {
+                SendDlgItemMessageW(hwnd, IDC_CHK_AUTOSTART, BM_SETCHECK,
+                                    s2p::IsAutostartEnabled(s2p::kAutostartSenderValueName) ? BST_CHECKED : BST_UNCHECKED, 0);
+                MessageBoxW(hwnd, L"Autostart-Eintrag in der Registry konnte nicht geschrieben werden.",
+                            L"Screen2PC Sender", MB_ICONWARNING);
+            }
+            return 0;
+        }
         case IDC_CHK_AUTOUPDATE: {
             bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_AUTOUPDATE, BM_GETCHECK, 0, 0) == BST_CHECKED;
             SaveSetting(L"AutoUpdateCheck", checked ? 1 : 0);
@@ -508,12 +546,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case IDM_SHOW:
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            ShowMainWindow(hwnd);
             return 0;
         case IDM_CHECK_UPDATE:
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            ShowMainWindow(hwnd);
             if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
                 PromptAndApplyUpdate(hwnd, g_pendingUpdate);
             } else {
@@ -646,13 +682,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TRAYICON:
         if (lp == WM_LBUTTONDBLCLK) {
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            ShowMainWindow(hwnd);
         } else if (lp == WM_RBUTTONUP) {
             ShowTrayMenu(hwnd);
         } else if (lp == NIN_BALLOONUSERCLICK) {
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
+            ShowMainWindow(hwnd);
             if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
                 PromptAndApplyUpdate(hwnd, g_pendingUpdate);
             }
@@ -683,10 +717,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1);
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    const bool startInTray = s2p::HasTrayLaunchFlag(lpCmdLine);
+    g_wmShowExisting = RegisterWindowMessageW(L"Screen2PC_Sender_ShowWindow");
+
+    HANDLE hSingleMutex = CreateMutexW(nullptr, FALSE, L"Local\\Screen2PC_Sender_SingleInstance");
+    if (hSingleMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!startInTray) {
+            HWND existing = nullptr;
+            for (int i = 0; i < 10; ++i) {
+                existing = FindWindowW(L"Screen2PCSenderWnd", nullptr);
+                if (existing) break;
+                Sleep(50);
+            }
+            if (existing && g_wmShowExisting != 0) {
+                PostMessageW(existing, g_wmShowExisting, 0, 0);
+            }
+        }
+        CloseHandle(hSingleMutex);
+        CoUninitialize();
+        timeEndPeriod(1);
+        return 0;
+    }
+
+    s2p::RefreshAutostartPathIfNeeded(s2p::kAutostartSenderValueName);
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
@@ -694,7 +752,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     s2p::Logger::Instance().Init(L"Screen2PC_Sender.log");
     s2p::WinsockGuard wsa;
     if (!wsa.Ok()) {
-        MessageBoxW(nullptr, L"Winsock2 Initialisierung fehlgeschlagen.", L"Screen2PC Sender", MB_ICONERROR);
+        if (!startInTray) {
+            MessageBoxW(nullptr, L"Winsock2 Initialisierung fehlgeschlagen.", L"Screen2PC Sender", MB_ICONERROR);
+        }
+        if (hSingleMutex) CloseHandle(hSingleMutex);
         CoUninitialize();
         timeEndPeriod(1);
         return 1;
@@ -717,11 +778,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     g_hwnd = CreateWindowExW(
         0, wc.lpszClassName, title.c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 530, 600,
+        CW_USEDEFAULT, CW_USEDEFAULT, 530, 626,
         nullptr, nullptr, hInst, nullptr);
 
-    ShowWindow(g_hwnd, nCmdShow);
-    UpdateWindow(g_hwnd);
+    if (!startInTray) {
+        ShowWindow(g_hwnd, (nCmdShow == SW_HIDE) ? SW_SHOW : nCmdShow);
+        UpdateWindow(g_hwnd);
+    }
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -732,6 +795,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     }
 
     engine.Disconnect();
+    if (hSingleMutex) CloseHandle(hSingleMutex);
     CoUninitialize();
     timeEndPeriod(1);
     return 0;

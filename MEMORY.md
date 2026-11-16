@@ -8,13 +8,13 @@
 ## 0. Current State (Read First!)
 - **Phase:** `PC Task-Manager Autostart, Treiberfreie scRGB-HDR/Gamma-2.2 Farbkalibrierung & GitHub Auto-Updater + Releases`
 - **Status:** Alle 3 neuen User-Wünsche sind implementiert und im grünen CI-Build **Run `43840850872`** (Commit `c2ccc12`, Artifact `14213151821`, **GitHub Release `v1.5.0.25`**, 10/10 Unit-Tests PASS, INF/CAT OK, 0 Build-Fehler) veröffentlicht:
-  1. **PC Autostart (Task-Manager-kompatibel):** Checkbox *"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"* im PC-Receiver (`HKCU\...\Run` mit `"..." --tray` + Windows Task-Manager `StartupApproved\Run`-Sync, `VS_VERSION_INFO` -> `Screen2PC Receiver (PC)`, Single-Instance-Mutex `Screen2PC_Receiver_SingleInstance` mit Fokus-Weiterleitung bei manuellem Doppelklick).
+  1. **Autostart auf PC & Surface (Task-Manager-kompatibel):** Checkbox *"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"* sowohl im PC-Receiver (`Screen2PC Receiver (PC)`) als auch im Surface-Sender (`Screen2PC Sender (Surface)`) über `HKCU\...\Run` mit `"..." --tray`, Windows Task-Manager `StartupApproved\Run`-Sync, `VS_VERSION_INFO` und separaten Single-Instance-Mutexes (`Screen2PC_Receiver_SingleInstance` / `Screen2PC_Sender_SingleInstance`). Auf dem Surface startet der Sender im Tray ohne virtuelle Monitore vorab anzulegen und wartet auf `Ctrl+Shift+K` oder Tray-Klick.
   2. **HDR & Pro-Monitor Farbkalibrierung (100 % treiberfrei auf PC):** `DXGI_FORMAT_R16G16B16A16_FLOAT` `scRGB` (`DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`) auf HDR-Displays + reines Gamma `2.2` EOTF + `DISPLAYCONFIG_SDR_WHITE_LEVEL` Nits-Abgleich (inkl. Cursor-White-Level-Parität), `BT.709`-Colorimetry in `CodecH264` sowie Live-Farbfenster pro Monitor (`receiver.ini` `[ColorMonitor<N>]`).
-  3. **GitHub Auto-Updater & Releases (PC & Surface):** CI erstellt bei jedem Push auf `main` ein öffentliches GitHub Release (`v1.5.0.25` / `v1.5.0.<RunNumber>`, `Screen2PC-Windows-x64.zip`). Sender & Receiver prüfen via WinHTTP unauthentifiziert auf `/repos/Aminomed/Screen2PC/releases/latest`, benachrichtigen bei neuerer Version und aktualisieren atomar per PowerShell-Updater (PC treiberfrei; Surface prüft `Screen2PCDriver.dll`/`.inf` SHA256 und installiert den Treiber nur bei Treiber-Änderung + aktivem Treiber per UAC nach).
+  3. **GitHub Auto-Updater & Releases (PC & Surface):** CI erstellt bei jedem Push auf `main` ein öffentliches GitHub Release (`v1.5.0.<RunNumber>`, `Screen2PC-Windows-x64.zip`). Sender & Receiver prüfen via WinHTTP unauthentifiziert auf `/repos/Aminomed/Screen2PC/releases/latest`, benachrichtigen bei neuerer Version und aktualisieren atomar per PowerShell-Updater (PC treiberfrei; Surface prüft `Screen2PCDriver.dll`/`.inf` SHA256 und installiert den Treiber nur bei Treiber-Änderung + aktivem Treiber per UAC nach).
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build, `infverif.exe /v`, `Inf2Cat.exe`, GitHub Release Publish (`v1.5.0.25`) & `Screen2PC.Tests.exe` laufen via `.github/workflows/ci.yml` (`windows-2022`).
+  - *Build & INF:* Windows-x64 Release-Build, `infverif.exe /v`, `Inf2Cat.exe`, GitHub Release Publish & `Screen2PC.Tests.exe` laufen via `.github/workflows/ci.yml` (`windows-2022`).
   - *Test-Scope:* `Screen2PC.Tests.exe` prüft 10/10 Suiten inkl. `TestAutostartAndCli`, `TestHdrColorPipeline` und `TestUpdaterParsing`; reale Registry/Task-Manager-UI, `IDXGIOutput6`/`scRGB`-SwapChain, `WM_INPUT`/`ClipCursor`, `DxgiCapture`, UMDF2-Treiber & echter HTTPS-Update-Download laufen nur auf realer Windows-Hardware.
-- **Next Step:** Einmalig **Release `v1.5.0.25`** (`Screen2PC-Windows-x64.zip`) auf **PC** und **Surface** herunterladen und entpacken; anschließend auf dem PC Autostart + Task-Manager-Eintrag, HDR- vs. SDR-Farben (ggf. Feintuning über *"Farben & HDR pro Monitor anpassen..."*) und für künftige Versionen den integrierten GitHub Auto-Updater nutzen.
+- **Next Step:** Aktuelles GitHub Release auf **PC** und **Surface** testen (Autostart auf beiden Geräten, HDR- vs. SDR-Farben + Feintuning, sowie 1-Klick-Updater ab `v1.5.0.25+`).
 
 ---
 
@@ -65,7 +65,7 @@
 | `src/common/` (`Screen2PC.Common.vcxproj`) | `Protocol.h`, `Version.h`, `Autostart.h/.cpp`, `ColorProfile.h/.cpp`, `Updater.h/.cpp`, `Logger.h/.cpp`, `NetSocket.h/.cpp`, `CodecH264.h/.cpp` (`BT.709`), `CodecDelta.h/.cpp`, `ClipboardSync.h/.cpp`, `FileTransfer.h/.cpp`, `KvmInput.h/.cpp` |
 | `src/driver/` (`Screen2PC.Driver.vcxproj`) | `DriverProtocol.h`, `Driver.h/.cpp` (UMDF v2 `IddCx 1.2`), `Screen2PCDriver.inf` |
 | `src/driversetup/` (`Screen2PC.DriverSetup.vcxproj`) | `main.cpp` -> `Screen2PC.DriverSetup.exe` |
-| `src/sender/` (`Screen2PC.Sender.vcxproj`) | Surface-App: `SenderEngine.h/.cpp`, `DxgiCapture.h/.cpp`, `VirtualDisplayCtl.h/.cpp`, `Screen2PC.Sender.rc`, `main.cpp` (`winmm`, `25..200 Mbit/s`, GitHub Auto-Updater + SHA256-Treibercheck) |
+| `src/sender/` (`Screen2PC.Sender.vcxproj`) | Surface-App: `SenderEngine.h/.cpp`, `DxgiCapture.h/.cpp`, `VirtualDisplayCtl.h/.cpp`, `Screen2PC.Sender.rc`, `main.cpp` (`winmm`, `25..200 Mbit/s`, Task-Manager Autostart `--tray`, Single-Instance, GitHub Auto-Updater + SHA256-Treibercheck) |
 | `src/receiver/` (`Screen2PC.Receiver.vcxproj`) | PC-App (treiberfrei): `ReceiverEngine.h/.cpp`, `D3D11Renderer.h/.cpp` (`IDXGIOutput6`/`scRGB`/Gamma `2.2`/`ColorCB`, `WM_INPUT`, `ClipCursor`), `Screen2PC.Receiver.rc`, `main.cpp` (Task-Manager Autostart, `--tray`, Single-Instance, Farbkalibrierungs-Dialog, GitHub Auto-Updater) |
 | `src/tests/` (`Screen2PC.Tests.vcxproj`) | `main.cpp` -> `Screen2PC.Tests.exe`: 10 Suiten (Protocol, Delta, Color/H264/BT.709/Version, Loopback, Clipboard, FileTransfer, KVM-Roaming, Autostart/CLI, HDR-Color-Pipeline/INI, Updater-JSON/Version) |
 | `scripts/` | `install_driver.ps1`, `uninstall_driver.ps1` |
@@ -76,13 +76,13 @@
 ## 4. Konfiguration, Hotkeys, Firewall & Pfade
 - **Sender Display-Modi (`DisplayMode`):** `ExtendAll` (`0`), `ExtendPrimary` (`1`), `MirrorPrimary` (`2`), `ExtendSecondary` (`3`).
 - **Hotkeys & Bedienung:**
-  - *Sender (`530x600`):* Globaler Hotkey `Ctrl+Shift+K` (Verbinden/Trennen); `X` minimiert ins Tray; Auto-Update-Checkbox + *"Nach Updates suchen"* + Tray-Menüpunkt.
+  - *Sender (`530x626`):* Globaler Hotkey `Ctrl+Shift+K` (Verbinden/Trennen); `X` minimiert ins Tray; Checkbox *"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"*; Auto-Update-Checkbox + *"Nach Updates suchen"* + Tray-Menüpunkt.
   - *Receiver (`580x550`):* `X` versteckt ins Tray; Button *"Windows Firewall Ports freigeben (Admin)"*; Checkbox *"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"*; Button *"Farben & HDR pro Monitor anpassen..."*; Auto-Update-Checkbox + *"Nach Updates suchen"* + Tray-Menüpunkt.
   - *Streamfenster (`D3D11Renderer`):* `F11` Vollbild-Toggle; `ESC` verlässt Vollbild **und** gibt KVM-Mausfokus frei; Klick ins Bild aktiviert Full-Desktop-KVM-Capture (`WM_INPUT` + `ClipCursor`); `Ctrl+Alt+K` schaltet KVM global um; `Alt+F4` beendet Session (`StopSession`); `WM_DISPLAYCHANGE`/`WM_MOVE` aktualisieren HDR/SDR-SwapChain automatisch.
 - **INI-Konfiguration, Registry & Pfade:**
   - `%APPDATA%\Screen2PC\sender.ini` (`[Sender]`): `LastIp=""`, `ModeIdx=0`, `CodecIdx=0`, `BitrateIdx=2`, `ClipboardSync=1`, `KvmEnabled=1`, `AutoUpdateCheck=1`.
   - `%APPDATA%\Screen2PC\receiver.ini` (`[Receiver]`): `StartFullscreen=1`, `ClipboardSync=1`, `KvmEnabled=1`, `AutoUpdateCheck=1`; `[ColorMonitor0]`, `[ColorMonitor1]`: `HdrOutput=1`, `BrightnessPct=100`, `GammaX100=220`, `ContrastPct=100`, `SaturationPct=100`, `RedGainPct=100`, `GreenGainPct=100`, `BlueGainPct=100`.
-  - Registry (nur optional per Checkbox am PC): `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Screen2PC Receiver` & `StartupApproved\Run`.
+  - Registry (je optional per Checkbox): `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Screen2PC Receiver` / `Screen2PC Sender` & `StartupApproved\Run`.
   - `C:\ProgramData\Screen2PC\monitors.cfg`, `%USERPROFILE%\Downloads\Screen2PC`, `%TEMP%\Screen2PC_*.log`, `%TEMP%\Screen2PC_Update_<pid>\`.
 
 ---
@@ -91,7 +91,7 @@
 1. **Receiver-Session-Limits:** Receiver akzeptiert nur **1** aktive Session gleichzeitig; `DiscoverResp`-Portfelder werden vom Sender beim Connect ignoriert (`48211` / `48212+i` fest).
 2. **Input/UIPI & Hotkey-Details:** `SendInput` am Surface unterliegt Windows-UIPI (ohne Admin-Start keine Steuerung von UAC-/Admin-Fenstern); beim Verlassen via `ESC` wird `m_suppressEscUp` lokal abgefangen. `F11` prüft Repeat-Bit; `Ctrl+Shift+K` (`RegisterHotKey`) könnte künftig `MOD_NOREPEAT` nutzen.
 3. **Codec-/Clipboard-/Socket-Grenzen:** Runtime-H.264-Fallback auf Sender (`GPU->CPU->Delta`) und Receiver (`DXVA->CPU`) greift nur vor dem ersten erfolgreich dekodierten Frame; `ClipboardSync` kappt Text bei `2 MB` (`CF_DIB` bis `16 MB`); `UdpSocket::m_sock` ist kein `std::atomic<SOCKET>`.
-4. **Updater- & HDR-Hinweis:** Das allererste Release (`Screen2PC-Windows-x64.zip`) muss noch manuell von GitHub Releases heruntergeladen und entpackt werden, da erst ab dieser Version der integrierte Auto-Updater enthalten ist; bei künftigen Versionen reicht der 1-Klick-Dialog. Auf dem PC kann je nach Monitor-Panel die Feinkalibrierung (z. B. Brightness/Gamma/RGB-Gain) einmalig im *"Farben & HDR pro Monitor anpassen..."*-Fenster dem SDR-Zweitmonitor angeglichen werden.
+4. **Updater- & HDR-Hinweis:** Das allererste Release (`Screen2PC-Windows-x64.zip`) muss noch manuell von GitHub Releases heruntergeladen und entpackt werden, da erst ab `v1.5.0.25` der integrierte Auto-Updater enthalten ist; bei künftigen Versionen reicht der 1-Klick-Dialog. Auf dem PC kann je nach Monitor-Panel die Feinkalibrierung (z. B. Brightness/Gamma/RGB-Gain) einmalig im *"Farben & HDR pro Monitor anpassen..."*-Fenster dem SDR-Zweitmonitor angeglichen werden.
 
 ---
 
@@ -105,3 +105,4 @@
 | 2026-11-13 | INF Problem-31 Fix (Hardware OK) | `UmdfExtensions = IddCx0102`, Win11 `WUDFRD.inf`, `.cat`-only Signierung & `oem*.inf`-Purge (`f92af3f`, Run `43422111904`) — auf Surface + PC mit 2 Monitoren erfolgreich verifiziert |
 | 2026-11-13 | Full-Desktop KVM, Disconnect-Fix & High-FPS/Bitrate | `WM_INPUT` + `ClipCursor` + `SetCursor(nullptr)` + `StepVirtualDesktopPoint` (`65dfd15`); Disconnect-Crash-Fix (`ClipboardSync`/`FileTransfer`/`SenderEngine`); 30-Hz-Sleep-Bug & Async-MFT-Stall behoben + `timeBeginPeriod(1)` + `25..200 Mbit/s` (`Run 43435633945`) |
 | 2026-11-16 | PC Autostart, scRGB HDR & GitHub Auto-Updater | `Autostart` (`HKCU\Run` + `StartupApproved\Run` Task-Manager-Sync + `--tray` + Single-Instance-Mutex + `.rc` `VERSIONINFO`); `scRGB` (`R16G16B16A16_FLOAT`) HDR + Gamma `2.2` + `DISPLAYCONFIG_SDR_WHITE_LEVEL` + `BT.709` + Live-Farbkalibrierungsfenster; `Updater` (WinHTTP GitHub Release Check & atomares PowerShell Self-Update + CI Release Publishing); 10/10 Unit-Tests (`c2ccc12`, Run `43840850872`, Artifact `14213151821`, Release `v1.5.0.25`) |
+| 2026-11-16 | Surface Sender Autostart (Variante A) | Gleicher Task-Manager-Autostart (`Screen2PC Sender`, `--tray`, `Local\Screen2PC_Sender_SingleInstance`, `WM_ACTIVATE`-Sync) auch in `src/sender/main.cpp` ergänzt |

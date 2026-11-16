@@ -34,6 +34,7 @@
    - **KVM (Maus & Tastatur PC -> Surface):** Klick ins Streamfenster (oder Vollbild-Fokus) bindet die PC-Maus nahtlos auf das gesamte Surface-Desktop-Setup (Du kannst frei ueber alle PC-Monitore **und** direkt auf den physischen Surface-Bildschirm hinueberfahren, um Fenster herueberzuziehen; **`ESC`** oder **`Strg + Alt + K`** gibt die PC-Maus jederzeit wieder frei — komplett ohne Treiber oder Global Hooks auf dem PC).
    - **Bitrate & Flussigkeit:** Einstellbar zwischen **`25 / 50 / 80 (Standard) / 120 / 200 Mbit/s`** bei voller Monitor-Refreshrate (bis 120 Hz).
    - **GitHub Auto-Update (Sender & Empfaenger):** Beide Apps pruefen auf Wunsch beim Start (oder manuell per *"Nach Updates suchen"* Button / Tray-Menue) die neueste Version auf GitHub Releases, laden `Screen2PC-Windows-x64.zip` direkt herunter und aktualisieren sich atomar im Ordner ohne manuelles Entpacken (auf dem Surface wird der Display-Treiber nur bei echten Treiber-Aenderungen neu installiert).
+   - **Autostart im System-Tray auch am Surface (Task-Manager kompatibel):** Ueber die Checkbox **"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"** startet auch `Screen2PC Sender (Surface)` beim Windows-Login unsichtbar (`--tray`) ins Tray — ohne virtuelle Monitore vorab anzulegen — und wartet dort auf **`Strg + Shift + K`** oder Tray-Klick.
 
 ---
 
@@ -43,7 +44,7 @@
 |---|---|---|---|
 | `Screen2PC.Driver` (`IddCx 1.2`) | Nur Surface | UMDF v2 User-Mode Display Driver | Erzeugt 0..2 virtuelle Monitore dynamisch in der exakten Aufloesung der PC-Monitore ohne Kernel-`.sys`. Kommunikation via Named Pipe `\\.\pipe\Screen2PC_VDD` (mit `AU`-ACL) + `%ProgramData%\Screen2PC\monitors.cfg` umgeht das bekannte `IndirectKmd` `CreateFile` Access-Denied-Problem. |
 | `Screen2PC.DriverSetup` | Nur Surface | SetupAPI / NewDev / CfgMgr32 | Eigenstaendiges CLI zur Treiber-Installation ohne externes `devcon.exe`. |
-| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + WinHTTP | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus; `SendInput` im User-Mode fuer KVM; GitHub Release Auto-Updater. |
+| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + WinHTTP | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus; `SendInput` im User-Mode fuer KVM; Task-Manager-Autostart (`--tray`) & GitHub Release Auto-Updater. |
 | `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 (`scRGB` HDR/SDR) + Media Foundation + WinHTTP | Reiner User-Mode-Prozess. Kein Treiber, kein Kernel-Hook (`SetWindowsHookEx`), Anti-Cheat-sicher. Task-Manager-Autostart (`HKCU\...\Run` + `VERSIONINFO`), pro-Monitor HDR/Gamma-2.2-Kalibrierung & Auto-Updater. |
 
 ### Warum reines C++20 statt ".NET 8 + C++ Core"?
