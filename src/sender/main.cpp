@@ -457,7 +457,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         CreateUiControls(hwnd);
         DragAcceptFiles(hwnd, TRUE);
-        RegisterHotKey(hwnd, HOTKEY_TOGGLE_CONNECT, MOD_CONTROL | MOD_SHIFT, 'K');
+        RegisterHotKey(hwnd, HOTKEY_TOGGLE_CONNECT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'K');
         SetTimer(hwnd, TIMER_TELEMETRY, 500, nullptr);
 
         g_nid.cbSize = sizeof(g_nid);
@@ -597,8 +597,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DISCOVERY_DONE: {
         auto* found = reinterpret_cast<std::vector<s2p::DiscoveredPeer>*>(lp);
-        g_peers = *found;
-        delete found;
+        if (found) {
+            g_peers = *found;
+            delete found;
+        } else {
+            g_peers.clear();
+        }
         g_scanning = false;
         EnableWindow(GetDlgItem(hwnd, IDC_BTN_SCAN), TRUE);
         SetDlgItemTextW(hwnd, IDC_BTN_SCAN, L"Suchen");

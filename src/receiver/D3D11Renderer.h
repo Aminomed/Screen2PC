@@ -81,6 +81,8 @@ public:
     void SetFullscreen(bool fullscreen);
     void PumpMessages();
     void Present();
+    bool ConsumeDeviceLost();
+    bool RecreateDeviceAndResources();
     bool NeedsRepaint() const { return m_needRepaint; }
     void ClearRepaint() { m_needRepaint = false; }
 
@@ -102,6 +104,7 @@ private:
     void ResizeSwapChain(uint32_t w, uint32_t h);
     void UpdateTitle();
     void SetKvmCapture(bool captured);
+    void ReleaseRemoteModifiers();
     void UpdateCursorClip();
     void FlushRelativeMouseMove();
     void WarpSurfaceCursorToClientPoint(int32_t clientX, int32_t clientY);
@@ -122,6 +125,7 @@ private:
     bool m_fullscreen = true;
     bool m_closedByUser = false;
     bool m_needRepaint = false;
+    bool m_deviceLost = false;
     bool m_kvmEnabled = true;
     bool m_kvmCaptured = false;
     bool m_escReleasedCapture = false;

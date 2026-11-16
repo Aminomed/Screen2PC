@@ -302,8 +302,18 @@ bool OpenHttpsRequest(const wchar_t* url,
     return true;
 }
 
-bool HttpDownloadToFile(const wchar_t* url, const std::wstring& destPath, uint64_t& outBytes, std::wstring& outErr) {
+bool HttpDownloadToFile(const wchar_t* url,
+                        const std::wstring& destPath,
+                        uint64_t expectedSize,
+                        uint64_t& outBytes,
+                        std::wstring& outErr) {
     outBytes = 0;
+    constexpr uint64_t kMaxDownloadBytes = 128ULL * 1024ULL * 1024ULL;
+    if (expectedSize > kMaxDownloadBytes) {
+        outErr = L"Update-Archiv ueberschreitet Sicherheitslimit (128 MB).";
+        return false;
+    }
+
     WinHttpHandle hSession, hConnect, hRequest;
     uint32_t status = 0;
     if (!OpenHttpsRequest(url, nullptr, hSession, hConnect, hRequest, status, outErr)) {
@@ -322,13 +332,20 @@ bool HttpDownloadToFile(const wchar_t* url, const std::wstring& destPath, uint64
         return false;
     }
 
-    constexpr uint64_t kMaxDownloadBytes = 128ULL * 1024ULL * 1024ULL;
     std::vector<char> buf(65536);
     uint8_t magic[4]{};
     DWORD avail = 0;
     bool ok = true;
 
-    while (WinHttpQueryDataAvailable(hRequest.h, &avail) && avail > 0) {
+    for (;;) {
+        avail = 0;
+        if (!WinHttpQueryDataAvailable(hRequest.h, &avail)) {
+            ok = false;
+            outErr = L"Verbindungsfehler waehrend Update-Download (" + std::to_wstring(GetLastError()) + L").";
+            break;
+        }
+        if (avail == 0) break;
+
         DWORD toRead = std::min<DWORD>(avail, static_cast<DWORD>(buf.size()));
         DWORD readBytes = 0;
         if (!WinHttpReadData(hRequest.h, buf.data(), toRead, &readBytes)) {
@@ -358,6 +375,13 @@ bool HttpDownloadToFile(const wchar_t* url, const std::wstring& destPath, uint64
 
     if (!ok) {
         DeleteFileW(partPath.c_str());
+        return false;
+    }
+
+    if (expectedSize > 0 && outBytes != expectedSize) {
+        DeleteFileW(partPath.c_str());
+        outErr = L"Update-Download unvollstaendig (" + std::to_wstring(outBytes) +
+                 L" von " + std::to_wstring(expectedSize) + L" Bytes erhalten).";
         return false;
     }
 
@@ -634,8 +658,14 @@ UpdateReleaseInfo CheckForGitHubUpdate(const wchar_t* apiUrl) {
     constexpr size_t kMaxJsonBytes = 2 * 1024 * 1024;
     std::string body;
     DWORD avail = 0;
-    while (WinHttpQueryDataAvailable(hRequest.h, &avail) && avail > 0) {
-        if (body.size() + avail > kMaxJsonBytes) {
+    for (;;) {
+        avail = 0;
+        if (!WinHttpQueryDataAvailable(hRequest.h, &avail)) {
+            info.error = L"Verbindungsfehler bei GitHub API-Antwort (" + std::to_wstring(GetLastError()) + L").";
+            return info;
+        }
+        if (avail == 0) break;
+        if (avail > kMaxJsonBytes - body.size()) {
             info.error = L"GitHub-Antwort ist unerwartet gross.";
             return info;
         }
@@ -690,7 +720,8 @@ bool DownloadAndLaunchSelfUpdate(const UpdateReleaseInfo& info,
 
     std::wstring zipPath = updateDir + L"\\Screen2PC-Windows-x64.zip";
     uint64_t downloadedBytes = 0;
-    if (!HttpDownloadToFile(info.downloadUrl.c_str(), zipPath, downloadedBytes, outError)) {
+    if (!HttpDownloadToFile(info.downloadUrl.c_str(), zipPath, info.assetSize, downloadedBytes, outError)) {
+        RemoveDirectoryW(updateDir.c_str());
         return false;
     }
 
@@ -765,15 +796,19 @@ try {
     Get-ChildItem -LiteralPath $TargetDir -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
 
     if ($DriverChanged) {
-        $SetupExe = Join-Path $TargetDir 'Screen2PC.DriverSetup.exe'
-        $InstallPs1 = Join-Path $TargetDir 'install_driver.ps1'
-        if (-not (Test-Path $InstallPs1)) { $InstallPs1 = Join-Path $TargetDir 'scripts\install_driver.ps1' }
-        if ((Test-Path $SetupExe) -and (Test-Path $InstallPs1)) {
-            & $SetupExe --status > $null 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "Virtual Display Treiber wurde geaendert - aktualisiere Treiber (Admin)..." -ForegroundColor Yellow
-                Start-Process powershell.exe -ArgumentList ('-ExecutionPolicy Bypass -File "' + $InstallPs1 + '"') -Verb RunAs -Wait
+        try {
+            $SetupExe = Join-Path $TargetDir 'Screen2PC.DriverSetup.exe'
+            $InstallPs1 = Join-Path $TargetDir 'install_driver.ps1'
+            if (-not (Test-Path $InstallPs1)) { $InstallPs1 = Join-Path $TargetDir 'scripts\install_driver.ps1' }
+            if ((Test-Path $SetupExe) -and (Test-Path $InstallPs1)) {
+                & $SetupExe --status > $null 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Virtual Display Treiber wurde geaendert - aktualisiere Treiber (Admin)..." -ForegroundColor Yellow
+                    Start-Process powershell.exe -ArgumentList ('-ExecutionPolicy Bypass -File "' + $InstallPs1 + '"') -Verb RunAs -Wait
+                }
             }
+        } catch {
+            Write-Warning "Treiber-Update uebersprungen oder abgebrochen: $($_.Exception.Message)"
         }
     }
 
@@ -798,6 +833,8 @@ try {
     {
         std::ofstream ofs(psPath, std::ios::binary | std::ios::trunc);
         if (!ofs) {
+            DeleteFileW(zipPath.c_str());
+            RemoveDirectoryW(updateDir.c_str());
             outError = L"Update-Skript konnte nicht geschrieben werden.";
             return false;
         }
@@ -817,6 +854,9 @@ try {
         SW_SHOWNORMAL);
 
     if (reinterpret_cast<INT_PTR>(res) <= 32) {
+        DeleteFileW(psPath.c_str());
+        DeleteFileW(zipPath.c_str());
+        RemoveDirectoryW(updateDir.c_str());
         outError = L"Updater-Skript konnte nicht gestartet werden (Code " +
                    std::to_wstring(reinterpret_cast<INT_PTR>(res)) + L").";
         return false;

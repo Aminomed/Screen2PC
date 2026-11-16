@@ -2,6 +2,7 @@
 #include "Logger.h"
 #include <iphlpapi.h>
 #include <algorithm>
+#include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -42,8 +43,13 @@ void TcpSocket::Close() {
     }
 }
 
-bool TcpSocket::Connect(const std::string& host, uint16_t port, int timeoutMs) {
+bool TcpSocket::Connect(const std::string& host, uint16_t port, int timeoutMs, const std::atomic<bool>* cancelFlag) {
     Close();
+    if (host.empty() || (cancelFlag && cancelFlag->load())) {
+        return false;
+    }
+    timeoutMs = std::max(1, timeoutMs);
+
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -54,6 +60,10 @@ bool TcpSocket::Connect(const std::string& host, uint16_t port, int timeoutMs) {
 
     addrinfo* res = nullptr;
     if (getaddrinfo(host.c_str(), portStr, &hints, &res) != 0 || !res) {
+        return false;
+    }
+    if (cancelFlag && cancelFlag->load()) {
+        freeaddrinfo(res);
         return false;
     }
 
@@ -76,27 +86,51 @@ bool TcpSocket::Connect(const std::string& host, uint16_t port, int timeoutMs) {
             closesocket(s);
             return false;
         }
-        fd_set writeSet, errSet;
-        FD_ZERO(&writeSet);
-        FD_ZERO(&errSet);
-        FD_SET(s, &writeSet);
-        FD_SET(s, &errSet);
 
-        timeval tv{};
-        tv.tv_sec = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            if (cancelFlag && cancelFlag->load()) {
+                closesocket(s);
+                return false;
+            }
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                closesocket(s);
+                return false;
+            }
+            int remMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+            if (remMs <= 0) remMs = 1;
+            int sliceMs = std::min(remMs, 100);
 
-        int sel = select(0, nullptr, &writeSet, &errSet, &tv);
-        if (sel <= 0 || !FD_ISSET(s, &writeSet) || FD_ISSET(s, &errSet)) {
-            closesocket(s);
-            return false;
-        }
-        int soErr = 0;
-        int optLen = sizeof(soErr);
-        getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &optLen);
-        if (soErr != 0) {
-            closesocket(s);
-            return false;
+            fd_set writeSet, errSet;
+            FD_ZERO(&writeSet);
+            FD_ZERO(&errSet);
+            FD_SET(s, &writeSet);
+            FD_SET(s, &errSet);
+
+            timeval tv{};
+            tv.tv_sec = sliceMs / 1000;
+            tv.tv_usec = (sliceMs % 1000) * 1000;
+
+            int sel = select(0, nullptr, &writeSet, &errSet, &tv);
+            if (sel < 0) {
+                closesocket(s);
+                return false;
+            }
+            if (sel > 0) {
+                if (!FD_ISSET(s, &writeSet) || FD_ISSET(s, &errSet)) {
+                    closesocket(s);
+                    return false;
+                }
+                int soErr = 0;
+                int optLen = sizeof(soErr);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &optLen);
+                if (soErr != 0) {
+                    closesocket(s);
+                    return false;
+                }
+                break;
+            }
         }
     }
 
@@ -199,6 +233,8 @@ int TcpSocket::WaitReadable(int timeoutMs) {
 bool TcpSocket::SendAll(const void* data, size_t len) {
     SOCKET s = m_sock.load();
     if (s == INVALID_SOCKET) return false;
+    if (len == 0) return true;
+    if (!data) return false;
     const char* ptr = static_cast<const char*>(data);
     size_t sent = 0;
     while (sent < len) {
@@ -213,6 +249,8 @@ bool TcpSocket::SendAll(const void* data, size_t len) {
 bool TcpSocket::RecvAll(void* data, size_t len) {
     SOCKET s = m_sock.load();
     if (s == INVALID_SOCKET) return false;
+    if (len == 0) return true;
+    if (!data) return false;
     char* ptr = static_cast<char*>(data);
     size_t recvd = 0;
     while (recvd < len) {
@@ -271,9 +309,9 @@ UdpSocket::~UdpSocket() {
 }
 
 void UdpSocket::Close() {
-    if (m_sock != INVALID_SOCKET) {
-        closesocket(m_sock);
-        m_sock = INVALID_SOCKET;
+    SOCKET s = m_sock.exchange(INVALID_SOCKET);
+    if (s != INVALID_SOCKET) {
+        closesocket(s);
     }
 }
 
@@ -298,7 +336,7 @@ bool UdpSocket::Bind(uint16_t port, bool reuseAddr) {
         closesocket(s);
         return false;
     }
-    m_sock = s;
+    m_sock.store(s);
     return true;
 }
 
@@ -318,17 +356,19 @@ bool UdpSocket::CreateForBroadcast() {
         closesocket(s);
         return false;
     }
-    m_sock = s;
+    m_sock.store(s);
     return true;
 }
 
 bool UdpSocket::SendTo(const std::string& ip, uint16_t port, const void* data, size_t len) {
-    if (m_sock == INVALID_SOCKET) return false;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return false;
+    if (len > 65507 || (len > 0 && !data)) return false;
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) return false;
-    int sent = sendto(m_sock, static_cast<const char*>(data), static_cast<int>(len), 0,
+    int sent = sendto(s, static_cast<const char*>(data), static_cast<int>(len), 0,
                       reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     return sent == static_cast<int>(len);
 }
@@ -343,12 +383,14 @@ bool UdpSocket::Broadcast(uint16_t port, const void* data, size_t len) {
 }
 
 int UdpSocket::RecvFrom(void* buf, size_t bufCap, std::string& outSenderIp, uint16_t& outSenderPort, int timeoutMs) {
-    if (m_sock == INVALID_SOCKET) return -1;
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET || !buf || bufCap == 0) return -1;
+    int cap = static_cast<int>(std::min<size_t>(bufCap, 65536));
 
     if (timeoutMs >= 0) {
         fd_set readSet;
         FD_ZERO(&readSet);
-        FD_SET(m_sock, &readSet);
+        FD_SET(s, &readSet);
         timeval tv{};
         tv.tv_sec = timeoutMs / 1000;
         tv.tv_usec = (timeoutMs % 1000) * 1000;
@@ -359,7 +401,7 @@ int UdpSocket::RecvFrom(void* buf, size_t bufCap, std::string& outSenderIp, uint
 
     sockaddr_in from{};
     int fromLen = sizeof(from);
-    int n = recvfrom(m_sock, static_cast<char*>(buf), static_cast<int>(bufCap), 0,
+    int n = recvfrom(s, static_cast<char*>(buf), cap, 0,
                      reinterpret_cast<sockaddr*>(&from), &fromLen);
     if (n <= 0) return -1;
 

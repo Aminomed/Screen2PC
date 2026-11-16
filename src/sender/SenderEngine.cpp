@@ -32,6 +32,33 @@ void CopyWideSafe(wchar_t* dst, size_t dstChars, const std::wstring& src) {
     wcsncpy_s(dst, dstChars, src.c_str(), _TRUNCATE);
 }
 
+void SleepInterruptible(DWORD totalMs, const std::atomic<bool>& stop) {
+    DWORD elapsed = 0;
+    while (elapsed < totalMs && !stop.load()) {
+        DWORD chunk = std::min<DWORD>(25, totalMs - elapsed);
+        Sleep(chunk);
+        elapsed += chunk;
+    }
+}
+
+bool WaitForControlPacket(TcpSocket& sock,
+                          PacketHeader& hdr,
+                          std::vector<uint8_t>& payload,
+                          int maxWaitMs,
+                          const std::atomic<bool>& stop) {
+    int waited = 0;
+    while (waited < maxWaitMs && !stop.load() && sock.IsValid()) {
+        int step = std::min(100, maxWaitMs - waited);
+        int wr = sock.WaitReadable(step);
+        if (wr < 0) return false;
+        if (wr > 0) {
+            return sock.RecvPacket(hdr, payload);
+        }
+        waited += step;
+    }
+    return false;
+}
+
 } // namespace
 
 SenderEngine::~SenderEngine() {
@@ -123,7 +150,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     m_connecting = true;
     m_createdVirtualDisplays = false;
 
-    if (!m_controlSock.Connect(cfg.targetIp, cfg.controlPort, 3000)) {
+    if (!m_controlSock.Connect(cfg.targetIp, cfg.controlPort, 3000, &m_stop)) {
         m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
@@ -154,7 +181,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
 
     PacketHeader hdr{};
     std::vector<uint8_t> payload;
-    if (!m_controlSock.RecvPacket(hdr, payload) ||
+    if (!WaitForControlPacket(m_controlSock, hdr, payload, 5000, m_stop) ||
         hdr.type != static_cast<uint16_t>(MsgType::HelloReceiver) ||
         payload.size() < sizeof(HelloReceiverPayload)) {
         m_connecting = false;
@@ -213,7 +240,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         return false;
     }
 
-    if (!m_controlSock.RecvPacket(hdr, payload) ||
+    if (!WaitForControlPacket(m_controlSock, hdr, payload, 5000, m_stop) ||
         hdr.type != static_cast<uint16_t>(MsgType::SessionAck) ||
         payload.size() < sizeof(SessionAckPayload)) {
         DisconnectInternal();
@@ -275,14 +302,12 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
 
     {
         TcpSocket fileSock;
-        if (fileSock.Connect(cfg.targetIp, kPortFileTransfer, 2000)) {
+        if (fileSock.Connect(cfg.targetIp, kPortFileTransfer, 2000, &m_stop)) {
             m_fileTransfer.Start(std::move(fileSock));
         } else {
             Logger::Instance().Warn("FILE-TX", L"Could not connect dedicated file transfer port 48214.");
         }
     }
-
-    m_controlThread = std::thread(&SenderEngine::ControlLoop, this);
 
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);
@@ -293,6 +318,8 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         m_status.stateText = L"Verbunden mit " + m_status.peerName + L" (" +
                              std::to_wstring(streamCount) + L" Monitor(e))";
     }
+
+    m_controlThread = std::thread(&SenderEngine::ControlLoop, this);
 
     Logger::Instance().Info("SND-OK", L"Streaming session started with " + std::to_wstring(streamCount) + L" stream(s).");
     return true;
@@ -416,7 +443,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
             }
         }
 
-        Sleep(200);
+        SleepInterruptible(200, m_stop);
     }
 
     outError = L"Virtuelle Monitore wurden unter Windows innerhalb von 5s nicht sichtbar. Pruefe Windows-Anzeigeeinstellungen (Desktop erweitern).";
@@ -457,7 +484,8 @@ void SenderEngine::ControlLoop() {
                            payload.size() >= sizeof(ClipboardHeader)) {
                     ClipboardHeader ch{};
                     std::memcpy(&ch, payload.data(), sizeof(ch));
-                    if (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize) {
+                    if (ch.dataSize > 0 && ch.dataSize <= kMaxClipboardBytes &&
+                        payload.size() >= sizeof(ch) + ch.dataSize) {
                         m_clipboard.ApplyRemote(ch.kind, ch.hash64, payload.data() + sizeof(ch), ch.dataSize);
                     }
                 } else if (hdr.type == static_cast<uint16_t>(MsgType::KvmMouse) &&
@@ -552,11 +580,11 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     TcpSocket sock;
     bool connected = false;
     for (int attempt = 0; attempt < 10 && !m_stop && !w->stop; ++attempt) {
-        if (sock.Connect(w->peerIp, w->streamPort, 1500)) {
+        if (sock.Connect(w->peerIp, w->streamPort, 1500, &m_stop)) {
             connected = true;
             break;
         }
-        Sleep(150);
+        SleepInterruptible(150, m_stop);
     }
     if (!connected) {
         Logger::Instance().Error("SND-WRK", L"Failed to connect stream socket on port " + std::to_wstring(w->streamPort));
@@ -572,12 +600,20 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             capOk = true;
             break;
         }
-        Sleep(200);
+        SleepInterruptible(200, m_stop);
     }
     if (!capOk) {
         Logger::Instance().Error("SND-WRK", L"DxgiCapture::Init failed for adapter=" +
                                  std::to_wstring(w->adapterIndex) + L" output=" + std::to_wstring(w->outputIndex));
         return;
+    }
+
+    if (capture.Width() > 0 && capture.Height() > 0) {
+        w->width = capture.Width();
+        w->height = capture.Height();
+        std::lock_guard<std::mutex> sl(w->statsMutex);
+        w->stats.width = w->width;
+        w->stats.height = w->height;
     }
 
     CodecType activeCodec = w->codec;
@@ -621,14 +657,61 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     bool sentInitialFrame = false;
     uint32_t consecutiveH264Fails = 0;
 
+    ID3D11Device* activeD3dDevice = capture.Device();
+    auto handleDynamicResizeIfNeeded = [&]() {
+        uint32_t cw = capture.Width();
+        uint32_t ch = capture.Height();
+        ID3D11Device* curDev = capture.Device();
+        if (cw == 0 || ch == 0 || !curDev ||
+            (cw == w->width && ch == w->height && curDev == activeD3dDevice)) {
+            return;
+        }
+        Logger::Instance().Info("SND-WRK", L"Capture reset/resize: " +
+                                std::to_wstring(w->width) + L"x" + std::to_wstring(w->height) +
+                                L" -> " + std::to_wstring(cw) + L"x" + std::to_wstring(ch));
+        w->width = cw;
+        w->height = ch;
+        activeD3dDevice = curDev;
+        {
+            std::lock_guard<std::mutex> sl(w->statsMutex);
+            w->stats.width = cw;
+            w->stats.height = ch;
+        }
+        delta.Reset();
+        if (activeCodec == CodecType::H264) {
+            if (!h264.Init(capture.Device(), capture.Context(), cw, ch, w->targetFps, w->bitrateMbps)) {
+                Logger::Instance().Warn("SND-WRK", L"H264Encoder re-init failed after reset/resize; switching to DeltaLossless.");
+                h264.Shutdown();
+                activeCodec = CodecType::DeltaLossless;
+                std::lock_guard<std::mutex> sl(w->statsMutex);
+                w->stats.codecName = L"Delta Lossless";
+                w->stats.hardwareAccelerated = false;
+            } else {
+                std::lock_guard<std::mutex> sl(w->statsMutex);
+                w->stats.codecName = h264.IsHardware() ? L"H.264 (GPU)" : L"H.264 (CPU)";
+                w->stats.hardwareAccelerated = h264.IsHardware();
+            }
+        }
+        sentInitialFrame = false;
+        consecutiveH264Fails = 0;
+    };
+
     while (!m_stop && !w->stop) {
         bool hasNewImage = false;
         std::vector<DeltaRect> dirtyRects;
         CapturedCursor cursor;
         if (!capture.AcquireFrame(acqTimeoutMs, hasNewImage, dirtyRects, cursor)) {
-            Sleep(25);
+            if (!capture.IsInitialized()) {
+                SleepInterruptible(100, m_stop);
+                capture.Init(w->adapterIndex, w->outputIndex);
+            }
+            if (capture.IsInitialized()) {
+                handleDynamicResizeIfNeeded();
+            }
             continue;
         }
+
+        handleDynamicResizeIfNeeded();
 
         if (cursor.updated) {
             CursorUpdateHeader ch{};
@@ -645,13 +728,15 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             ch.hotY = cursor.hotY;
             ch.dataSize = cursor.shapeChanged ? static_cast<uint32_t>(cursor.shapeData.size()) : 0;
 
-            sendPkt.resize(sizeof(CursorUpdateHeader) + ch.dataSize);
-            std::memcpy(sendPkt.data(), &ch, sizeof(CursorUpdateHeader));
-            if (ch.dataSize > 0) {
-                std::memcpy(sendPkt.data() + sizeof(CursorUpdateHeader), cursor.shapeData.data(), ch.dataSize);
-            }
-            if (!sock.SendPacket(MsgType::CursorUpdate, sendPkt.data(), static_cast<uint32_t>(sendPkt.size()))) {
-                break;
+            if (static_cast<size_t>(ch.dataSize) <= kMaxFrameBytes - sizeof(CursorUpdateHeader)) {
+                sendPkt.resize(sizeof(CursorUpdateHeader) + ch.dataSize);
+                std::memcpy(sendPkt.data(), &ch, sizeof(CursorUpdateHeader));
+                if (ch.dataSize > 0) {
+                    std::memcpy(sendPkt.data() + sizeof(CursorUpdateHeader), cursor.shapeData.data(), ch.dataSize);
+                }
+                if (!sock.SendPacket(MsgType::CursorUpdate, sendPkt.data(), static_cast<uint32_t>(sendPkt.size()))) {
+                    break;
+                }
             }
         }
 
@@ -698,7 +783,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 }
             }
 
-            if (encodeOk && !encodedPayload.empty()) {
+            if (encodeOk && !encodedPayload.empty() &&
+                encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
                 VideoFrameHeader vh{};
                 vh.monitorIndex = w->targetPcMonitor;
                 vh.frameIndex = ++frameIndex;

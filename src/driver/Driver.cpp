@@ -191,6 +191,7 @@ void SwapChainProcessor::Run() {
 }
 
 void SwapChainProcessor::RunCore() {
+    if (!m_device || !m_device->Device) return;
     ComPtr<IDXGIDevice> dxgiDevice;
     if (FAILED(m_device->Device.As(&dxgiDevice))) return;
 
@@ -203,12 +204,24 @@ void SwapChainProcessor::RunCore() {
         IDARG_OUT_RELEASEANDACQUIREBUFFER buffer{};
         HRESULT hr = IddCxSwapChainReleaseAndAcquireBuffer(m_hSwapChain, &buffer);
         if (hr == E_PENDING) {
-            HANDLE waits[] = { m_hAvailableBufferEvent, m_hTerminateEvent.Get() };
-            DWORD wr = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, 16);
-            if (wr == WAIT_OBJECT_0 || wr == WAIT_TIMEOUT) {
+            DWORD wr = WAIT_TIMEOUT;
+            if (m_hAvailableBufferEvent && m_hTerminateEvent.IsValid()) {
+                HANDLE waits[] = { m_hAvailableBufferEvent, m_hTerminateEvent.Get() };
+                wr = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, 16);
+                if (wr == WAIT_OBJECT_0 || wr == WAIT_TIMEOUT) {
+                    continue;
+                }
+                break;
+            } else if (m_hTerminateEvent.IsValid()) {
+                wr = WaitForSingleObject(m_hTerminateEvent.Get(), 16);
+                if (wr == WAIT_OBJECT_0) {
+                    break;
+                }
+                continue;
+            } else {
+                Sleep(16);
                 continue;
             }
-            break;
         } else if (SUCCEEDED(hr)) {
             acquiredBuffer.Attach(buffer.MetaData.pSurface);
             acquiredBuffer.Reset();
@@ -365,6 +378,7 @@ DWORD IndirectDeviceContext::ApplyMonitorConfig(uint32_t count, const VddMonitor
         NTSTATUS st = IddCxMonitorCreate(m_adapter, &mc, &mcOut);
         if (!NT_SUCCESS(st)) {
             OutputDebugStringW(L"Screen2PCDriver: IddCxMonitorCreate failed\n");
+            DepartAllMonitorsLocked();
             return static_cast<DWORD>(st);
         }
 
@@ -376,6 +390,7 @@ DWORD IndirectDeviceContext::ApplyMonitorConfig(uint32_t count, const VddMonitor
         if (!NT_SUCCESS(st)) {
             OutputDebugStringW(L"Screen2PCDriver: IddCxMonitorArrival failed\n");
             WdfObjectDelete(mcOut.MonitorObject);
+            DepartAllMonitorsLocked();
             return static_cast<DWORD>(st);
         }
         m_monitors.push_back(mcOut.MonitorObject);
@@ -400,7 +415,7 @@ void IndirectDeviceContext::StopPipeServer() {
     m_stopPipe = true;
     if (m_stopEvent) SetEvent(m_stopEvent);
     if (m_pipeThread) {
-        WaitForSingleObject(m_pipeThread, 2000);
+        WaitForSingleObject(m_pipeThread, INFINITE);
         CloseHandle(m_pipeThread);
         m_pipeThread = nullptr;
     }
@@ -442,17 +457,27 @@ void IndirectDeviceContext::RunPipeServer() {
 
         OVERLAPPED ov{};
         ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) {
+            CloseHandle(hPipe);
+            Sleep(50);
+            continue;
+        }
         BOOL connected = ConnectNamedPipe(hPipe, &ov);
         if (!connected) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                HANDLE waits[] = { ov.hEvent, m_stopEvent };
-                DWORD wr = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+                HANDLE waits[2] = { ov.hEvent, m_stopEvent };
+                DWORD wr = WaitForMultipleObjects(m_stopEvent ? 2 : 1, waits, FALSE, m_stopEvent ? INFINITE : 500);
                 if (wr != WAIT_OBJECT_0) {
                     CancelIo(hPipe);
+                    DWORD dummy = 0;
+                    GetOverlappedResult(hPipe, &ov, &dummy, TRUE);
                     CloseHandle(ov.hEvent);
                     CloseHandle(hPipe);
-                    break;
+                    if (m_stopPipe.load()) {
+                        break;
+                    }
+                    continue;
                 }
                 DWORD dummy = 0;
                 connected = GetOverlappedResult(hPipe, &ov, &dummy, FALSE);
@@ -463,9 +488,40 @@ void IndirectDeviceContext::RunPipeServer() {
         CloseHandle(ov.hEvent);
 
         if (connected && !m_stopPipe.load()) {
+            auto overlappedIo = [&](bool isWrite, void* buf, DWORD len, DWORD& done) -> bool {
+                done = 0;
+                OVERLAPPED opOv{};
+                opOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (!opOv.hEvent) return false;
+                BOOL ok = isWrite
+                    ? WriteFile(hPipe, buf, len, &done, &opOv)
+                    : ReadFile(hPipe, buf, len, &done, &opOv);
+                if (!ok) {
+                    if (GetLastError() != ERROR_IO_PENDING) {
+                        CloseHandle(opOv.hEvent);
+                        return false;
+                    }
+                    HANDLE opWaits[2] = { opOv.hEvent, m_stopEvent };
+                    DWORD owr = WaitForMultipleObjects(m_stopEvent ? 2 : 1, opWaits, FALSE, 3000);
+                    if (owr != WAIT_OBJECT_0) {
+                        CancelIo(hPipe);
+                        DWORD dummy = 0;
+                        GetOverlappedResult(hPipe, &opOv, &dummy, TRUE);
+                        CloseHandle(opOv.hEvent);
+                        return false;
+                    }
+                    if (!GetOverlappedResult(hPipe, &opOv, &done, FALSE)) {
+                        CloseHandle(opOv.hEvent);
+                        return false;
+                    }
+                }
+                CloseHandle(opOv.hEvent);
+                return true;
+            };
+
             VddCommand cmd{};
             DWORD bytesRead = 0;
-            if (ReadFile(hPipe, &cmd, sizeof(cmd), &bytesRead, nullptr) &&
+            if (overlappedIo(false, &cmd, sizeof(cmd), bytesRead) &&
                 bytesRead == sizeof(cmd) && cmd.magic == kVddMagic) {
                 VddReply reply{};
                 reply.magic = kVddMagic;
@@ -478,7 +534,7 @@ void IndirectDeviceContext::RunPipeServer() {
                 }
                 reply.activeMonitors = ActiveMonitorCount();
                 DWORD written = 0;
-                WriteFile(hPipe, &reply, sizeof(reply), &written, nullptr);
+                overlappedIo(true, &reply, sizeof(reply), written);
                 FlushFileBuffers(hPipe);
             }
         }

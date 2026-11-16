@@ -63,6 +63,7 @@ public:
     ID3D11Texture2D* FrameTexture() const { return m_frameTex.Get(); }
     uint32_t Width() const { return m_width; }
     uint32_t Height() const { return m_height; }
+    bool IsInitialized() const { return m_initialized; }
 
     bool CopyFrameToCpu(std::vector<uint8_t>& outBgra, uint32_t& outStrideBytes);
 

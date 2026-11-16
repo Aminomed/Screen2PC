@@ -339,7 +339,11 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
 
     if (m_fileListenSock.IsValid()) {
         m_fileAcceptThread = std::thread([this]() {
-            TcpSocket fsock = m_fileListenSock.Accept(nullptr, 5000);
+            TcpSocket fsock;
+            for (int iter = 0; iter < 50 && !m_stop && !m_sessionStop && m_fileListenSock.IsValid(); ++iter) {
+                fsock = m_fileListenSock.Accept(nullptr, 100);
+                if (fsock.IsValid()) break;
+            }
             m_fileListenSock.Close();
             if (fsock.IsValid() && !m_stop && !m_sessionStop) {
                 m_fileTransfer.Start(std::move(fsock));
@@ -394,7 +398,8 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
                        cpayload.size() >= sizeof(ClipboardHeader)) {
                 ClipboardHeader ch{};
                 std::memcpy(&ch, cpayload.data(), sizeof(ch));
-                if (ch.dataSize > 0 && cpayload.size() >= sizeof(ch) + ch.dataSize) {
+                if (ch.dataSize > 0 && ch.dataSize <= kMaxClipboardBytes &&
+                    cpayload.size() >= sizeof(ch) + ch.dataSize) {
                     m_clipboard.ApplyRemote(ch.kind, ch.hash64, cpayload.data() + sizeof(ch), ch.dataSize);
                 }
             }
@@ -445,10 +450,14 @@ void ReceiverEngine::RequestKeyframe(uint32_t monitorIndex) {
 void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-    TcpSocket sock = w->listenSock.Accept(nullptr, 5000);
+    TcpSocket sock;
+    for (int iter = 0; iter < 50 && !m_stop && !m_sessionStop && !w->stop && w->listenSock.IsValid(); ++iter) {
+        sock = w->listenSock.Accept(nullptr, 100);
+        if (sock.IsValid()) break;
+    }
     w->listenSock.Close();
     if (!sock.IsValid()) {
-        Logger::Instance().Warn("RCV-STRM", L"Timed out waiting for stream connection on port " + std::to_wstring(w->port));
+        Logger::Instance().Warn("RCV-STRM", L"Timed out or canceled waiting for stream connection on port " + std::to_wstring(w->port));
         CoUninitialize();
         return;
     }
@@ -481,6 +490,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     H264Decoder h264;
     uint32_t h264W = 0, h264H = 0;
+    bool h264InitFailed = false;
     bool decodedAnyH264 = false;
     uint32_t consecutiveH264Fails = 0;
     auto lastKeyframeReq = std::chrono::steady_clock::time_point{};
@@ -563,13 +573,23 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                 bool isDxva = false;
 
                 if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
-                    if (!h264.IsInitialized() || h264W != vh.width || h264H != vh.height) {
-                        h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height);
+                    if (h264W != vh.width || h264H != vh.height) {
                         h264W = vh.width;
                         h264H = vh.height;
+                        h264InitFailed = false;
                         decodedAnyH264 = false;
                         consecutiveH264Fails = 0;
-                        renderer.EnsureFrameTexture(vh.width, vh.height);
+                    }
+                    if (!h264.IsInitialized() && !h264InitFailed) {
+                        bool initOk = h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height);
+                        if (!initOk) {
+                            initOk = h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false);
+                        }
+                        if (!initOk) {
+                            h264InitFailed = true;
+                        } else {
+                            renderer.EnsureFrameTexture(vh.width, vh.height);
+                        }
                     }
                     if (h264.IsInitialized()) {
                         renderer.EnsureFrameTexture(vh.width, vh.height);
@@ -595,7 +615,9 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                             ++consecutiveH264Fails;
                             if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
                                 Logger::Instance().Warn("RCV-DEC", L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
-                                h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false);
+                                if (!h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false)) {
+                                    h264InitFailed = true;
+                                }
                                 consecutiveH264Fails = 0;
                                 RequestKeyframe(w->monitorIndex);
                                 lastKeyframeReq = std::chrono::steady_clock::now();
@@ -647,9 +669,29 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
             }
         }
 
+        bool checkDeviceLost = false;
         if (needPresent) {
             renderer.Present();
             needPresent = false;
+            checkDeviceLost = true;
+        } else if (consecutiveH264Fails >= 2) {
+            checkDeviceLost = true;
+        }
+
+        if (checkDeviceLost && renderer.ConsumeDeviceLost()) {
+            h264.Shutdown();
+            h264W = 0;
+            h264H = 0;
+            h264InitFailed = false;
+            decodedAnyH264 = false;
+            consecutiveH264Fails = 0;
+            if (!renderer.RecreateDeviceAndResources()) {
+                Logger::Instance().Error("RCV-D3D", L"Failed recreating D3D11 device after device lost.");
+                break;
+            }
+            delta.Reset();
+            RequestKeyframe(w->monitorIndex);
+            lastKeyframeReq = std::chrono::steady_clock::now();
         }
     }
 

@@ -33,13 +33,16 @@ int FloatToScaledInt(float val, float scale) {
 } // namespace
 
 void ClampColorConfig(MonitorColorConfig& cfg) {
-    cfg.brightnessPct = std::clamp(cfg.brightnessPct, 50.0f, 200.0f);
-    cfg.gamma         = std::clamp(cfg.gamma,         1.60f, 2.80f);
-    cfg.contrastPct   = std::clamp(cfg.contrastPct,   60.0f, 140.0f);
-    cfg.saturationPct = std::clamp(cfg.saturationPct, 50.0f, 160.0f);
-    cfg.redGainPct    = std::clamp(cfg.redGainPct,    70.0f, 130.0f);
-    cfg.greenGainPct  = std::clamp(cfg.greenGainPct,  70.0f, 130.0f);
-    cfg.blueGainPct   = std::clamp(cfg.blueGainPct,   70.0f, 130.0f);
+    auto clampF = [](float v, float lo, float hi, float defVal) {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : defVal;
+    };
+    cfg.brightnessPct = clampF(cfg.brightnessPct, 50.0f, 200.0f, 100.0f);
+    cfg.gamma         = clampF(cfg.gamma,         1.60f, 2.80f, 2.20f);
+    cfg.contrastPct   = clampF(cfg.contrastPct,   60.0f, 140.0f, 100.0f);
+    cfg.saturationPct = clampF(cfg.saturationPct, 50.0f, 160.0f, 100.0f);
+    cfg.redGainPct    = clampF(cfg.redGainPct,    70.0f, 130.0f, 100.0f);
+    cfg.greenGainPct  = clampF(cfg.greenGainPct,  70.0f, 130.0f, 100.0f);
+    cfg.blueGainPct   = clampF(cfg.blueGainPct,   70.0f, 130.0f, 100.0f);
 }
 
 ColorShaderConstants ComputeColorShaderConstants(const MonitorColorConfig& rawCfg,
@@ -49,7 +52,8 @@ ColorShaderConstants ComputeColorShaderConstants(const MonitorColorConfig& rawCf
     MonitorColorConfig cfg = rawCfg;
     ClampColorConfig(cfg);
 
-    float baseOsScale = hdrSwapChain ? std::clamp(osSdrWhiteScale, 1.0f, 12.5f) : 1.0f;
+    float safeOsScale = std::isfinite(osSdrWhiteScale) ? osSdrWhiteScale : 1.0f;
+    float baseOsScale = hdrSwapChain ? std::clamp(safeOsScale, 1.0f, 12.5f) : 1.0f;
     float gammaPower  = hdrSwapChain ? cfg.gamma : (cfg.gamma / 2.20f);
 
     ColorShaderConstants out{};

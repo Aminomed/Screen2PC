@@ -1,5 +1,6 @@
 #include "DxgiCapture.h"
 #include "../common/Logger.h"
+#include <algorithm>
 #include <cstring>
 
 #pragma comment(lib, "dxgi.lib")
@@ -26,6 +27,11 @@ std::vector<DisplayOutputInfo> DxgiCapture::EnumerateOutputs() {
             DXGI_OUTPUT_DESC od{};
             output->GetDesc(&od);
             if (!od.AttachedToDesktop) continue;
+
+            if (od.DesktopCoordinates.right <= od.DesktopCoordinates.left ||
+                od.DesktopCoordinates.bottom <= od.DesktopCoordinates.top) {
+                continue;
+            }
 
             DisplayOutputInfo info{};
             info.adapterIndex = a;
@@ -78,6 +84,10 @@ bool DxgiCapture::Init(uint32_t adapterIndex, uint32_t outputIndex) {
 
     DXGI_OUTPUT_DESC od{};
     output->GetDesc(&od);
+    if (od.DesktopCoordinates.right <= od.DesktopCoordinates.left ||
+        od.DesktopCoordinates.bottom <= od.DesktopCoordinates.top) {
+        return false;
+    }
     m_width = static_cast<uint32_t>(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
     m_height = static_cast<uint32_t>(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
     if (m_width == 0 || m_height == 0) return false;
@@ -157,6 +167,11 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
     if (!m_initialized) return false;
     if (!m_dupl) {
         if (!RecreateDuplication()) {
+            if (m_device && FAILED(m_device->GetDeviceRemovedReason())) {
+                Logger::Instance().Warn("DXGI_DEV", L"D3D11 device lost during duplication recreate.");
+                Shutdown();
+                return false;
+            }
             Sleep(50);
             return true; // transient
         }
@@ -168,12 +183,21 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return true;
     }
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        Logger::Instance().Warn("DXGI_DEV", L"AcquireNextFrame device lost: " + FormatHr(hr));
+        Shutdown();
+        return false;
+    }
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         m_dupl.Reset();
         return true;
     }
     if (FAILED(hr)) {
         Logger::Instance().Warn("DXGI_ACQ", L"AcquireNextFrame failed: " + FormatHr(hr));
+        if (m_device && FAILED(m_device->GetDeviceRemovedReason())) {
+            Shutdown();
+            return false;
+        }
         m_dupl.Reset();
         return true;
     }
@@ -183,11 +207,12 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
         outCursor.visible = (fi.PointerPosition.Visible != FALSE);
         outCursor.x = fi.PointerPosition.Position.x;
         outCursor.y = fi.PointerPosition.Position.y;
-        if (fi.PointerShapeBufferSize > 0) {
+        if (fi.PointerShapeBufferSize > 0 && fi.PointerShapeBufferSize <= 4 * 1024 * 1024) {
             outCursor.shapeData.resize(fi.PointerShapeBufferSize);
             UINT req = 0;
             DXGI_OUTDUPL_POINTER_SHAPE_INFO psi{};
-            if (SUCCEEDED(m_dupl->GetFramePointerShape(fi.PointerShapeBufferSize, outCursor.shapeData.data(), &req, &psi))) {
+            if (SUCCEEDED(m_dupl->GetFramePointerShape(fi.PointerShapeBufferSize, outCursor.shapeData.data(), &req, &psi)) &&
+                req <= outCursor.shapeData.size()) {
                 outCursor.shapeChanged = true;
                 outCursor.shapeType = psi.Type;
                 outCursor.width = psi.Width;
@@ -205,6 +230,13 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
     if (fi.LastPresentTime.QuadPart != 0 && res) {
         ComPtr<ID3D11Texture2D> srcTex;
         if (SUCCEEDED(res.As(&srcTex))) {
+            D3D11_TEXTURE2D_DESC sd{};
+            srcTex->GetDesc(&sd);
+            if (sd.Width != m_width || sd.Height != m_height || sd.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+                m_dupl->ReleaseFrame();
+                Init(m_adapterIndex, m_outputIndex);
+                return false;
+            }
             m_context->CopyResource(m_frameTex.Get(), srcTex.Get());
             outHasNewImage = true;
 
@@ -220,12 +252,14 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
                     auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(m_metaBuf.data());
                     for (UINT i = 0; i < moveCount; ++i) {
                         const RECT& d = moves[i].DestinationRect;
-                        if (d.right > d.left && d.bottom > d.top) {
+                        LONG l = std::max<LONG>(0, d.left);
+                        LONG t = std::max<LONG>(0, d.top);
+                        if (d.right > l && d.bottom > t) {
                             outDirtyRects.push_back({
-                                static_cast<uint32_t>(d.left),
-                                static_cast<uint32_t>(d.top),
-                                static_cast<uint32_t>(d.right - d.left),
-                                static_cast<uint32_t>(d.bottom - d.top)
+                                static_cast<uint32_t>(l),
+                                static_cast<uint32_t>(t),
+                                static_cast<uint32_t>(d.right - l),
+                                static_cast<uint32_t>(d.bottom - t)
                             });
                         }
                     }
@@ -238,12 +272,14 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
                     auto* rects = reinterpret_cast<const RECT*>(m_metaBuf.data());
                     for (UINT i = 0; i < dirtyCount; ++i) {
                         const RECT& r = rects[i];
-                        if (r.right > r.left && r.bottom > r.top) {
+                        LONG l = std::max<LONG>(0, r.left);
+                        LONG t = std::max<LONG>(0, r.top);
+                        if (r.right > l && r.bottom > t) {
                             outDirtyRects.push_back({
-                                static_cast<uint32_t>(r.left),
-                                static_cast<uint32_t>(r.top),
-                                static_cast<uint32_t>(r.right - r.left),
-                                static_cast<uint32_t>(r.bottom - r.top)
+                                static_cast<uint32_t>(l),
+                                static_cast<uint32_t>(t),
+                                static_cast<uint32_t>(r.right - l),
+                                static_cast<uint32_t>(r.bottom - t)
                             });
                         }
                     }
@@ -264,6 +300,10 @@ bool DxgiCapture::CopyFrameToCpu(std::vector<uint8_t>& outBgra, uint32_t& outStr
         return false;
     }
     outStrideBytes = m_width * 4;
+    if (mapped.RowPitch < outStrideBytes) {
+        m_context->Unmap(m_stagingTex.Get(), 0);
+        return false;
+    }
     outBgra.resize(static_cast<size_t>(outStrideBytes) * m_height);
     for (uint32_t y = 0; y < m_height; ++y) {
         std::memcpy(outBgra.data() + static_cast<size_t>(y) * outStrideBytes,

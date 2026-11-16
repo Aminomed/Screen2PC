@@ -3,11 +3,14 @@
 #endif
 #include <windows.h>
 #include <objbase.h>
+#include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -51,6 +54,25 @@ void TestProtocol() {
     auto badSize = hdr;
     badSize.payloadSize = static_cast<uint32_t>(s2p::kMaxFrameBytes + 1);
     CHECK(!s2p::ValidateHeader(badSize), "Oversized payload accepted");
+
+    // Cursor shape buffer validation
+    uint32_t actualH = 0;
+    CHECK(s2p::ValidateCursorShapeBuffer(1, 16, 32, 2, 64, actualH) && actualH == 16,
+          "Valid monochrome cursor buffer rejected");
+    CHECK(!s2p::ValidateCursorShapeBuffer(1, 16, 1, 2, 64, actualH),
+          "Height=1 monochrome cursor accepted");
+    CHECK(s2p::ValidateCursorShapeBuffer(2, 32, 32, 128, 32 * 128, actualH) && actualH == 32,
+          "Valid color cursor buffer rejected");
+    CHECK(s2p::ValidateCursorShapeBuffer(4, 16, 16, 80, 15 * 80 + 16 * 4, actualH) && actualH == 16,
+          "Valid masked color cursor with trailing pitch rejected");
+    CHECK(!s2p::ValidateCursorShapeBuffer(4, 16, 16, 80, 15 * 80 + 16 * 4 - 1, actualH),
+          "Truncated cursor buffer accepted");
+    CHECK(!s2p::ValidateCursorShapeBuffer(2, 16, 16, 60, 16 * 60, actualH),
+          "Undersized cursor pitch accepted");
+    CHECK(!s2p::ValidateCursorShapeBuffer(2, s2p::kMaxCursorDimension + 1, 16, (s2p::kMaxCursorDimension + 1) * 4, 1024 * 1024, actualH),
+          "Oversized cursor width accepted");
+    CHECK(!s2p::ValidateCursorShapeBuffer(3, 16, 16, 64, 16 * 64, actualH),
+          "Unknown cursor shapeType accepted");
 
     std::cout << "[PASS] TestProtocol\n";
 }
@@ -97,7 +119,7 @@ void TestDeltaCodec() {
 
     std::vector<uint8_t> payload2;
     bool isKey2 = true;
-    std::vector<s2p::DeltaRect> hints = { { 200, 100, 32, 32 } };
+    std::vector<s2p::DeltaRect> hints = { { 200, 100, 32, 32 }, { 0xFFFFFFFFu, 0, 20, 20 }, { 5000, 5000, 16, 16 } };
     CHECK(enc.Encode(frame2.data(), w, h, stride, hints, false, payload2, isKey2), "Delta encode partial failed");
     CHECK(!isKey2, "Partial update unexpectedly flagged as keyframe");
     CHECK(payload2.size() < payload1.size() / 4, "Partial delta payload was not significantly smaller");
@@ -120,6 +142,34 @@ void TestDeltaCodec() {
         corrupt.resize(corrupt.size() - 5);
         CHECK(!dec.Decode(corrupt.data(), corrupt.size(), w, h), "Truncated Delta payload unexpectedly accepted");
     }
+
+    // Crafted Delta payload with 32-bit wraparound rect & zero rect must be rejected
+    auto makeSingleRectDelta = [](uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh, uint32_t fw, uint32_t fh) {
+        const size_t hdrBytes = 20 + 16;
+        std::vector<uint8_t> p(hdrBytes + 64, 0);
+        const uint32_t magic = 0x31544C44u; // 'DLT1'
+        const uint32_t zero = 0;
+        const uint32_t rectCount = 1;
+        std::memcpy(p.data() + 0, &magic, 4);
+        std::memcpy(p.data() + 4, &fw, 4);
+        std::memcpy(p.data() + 8, &fh, 4);
+        std::memcpy(p.data() + 12, &zero, 4);
+        std::memcpy(p.data() + 16, &rectCount, 4);
+        std::memcpy(p.data() + 20, &rx, 4);
+        std::memcpy(p.data() + 24, &ry, 4);
+        std::memcpy(p.data() + 28, &rw, 4);
+        std::memcpy(p.data() + 32, &rh, 4);
+        return p;
+    };
+    auto wrapPkt = makeSingleRectDelta(0xFFFFFFFFu, 0, 4, 4, w, h);
+    CHECK(!dec.Decode(wrapPkt.data(), wrapPkt.size(), w, h), "32-bit wraparound Delta rect unexpectedly accepted");
+    auto zeroPkt = makeSingleRectDelta(0, 0, 0, 4, w, h);
+    CHECK(!dec.Decode(zeroPkt.data(), zeroPkt.size(), w, h), "Zero-width Delta rect unexpectedly accepted");
+
+    // Oversized > 64MP dimensions must be rejected before allocation
+    CHECK(!dec.Decode(payload2.data(), payload2.size(), 16384, 4097), "Oversized >64MP Delta decode accepted");
+    CHECK(!enc.Encode(frame1.data(), 16384, 4097, 16384 * 4, {}, true, payload3, isKey3),
+          "Oversized >64MP Delta encode accepted");
 
     std::cout << "[PASS] TestDeltaCodec\n";
 }
@@ -272,7 +322,15 @@ void TestLoopbackNetworking() {
     listener.Close();
     serverThread.join();
 
-    // 2. UDP Loopback packet roundtrip
+    // 1b. Cancelable TcpSocket::Connect aborts cleanly
+    {
+        std::atomic<bool> cancel{ true };
+        s2p::TcpSocket canceledCli;
+        CHECK(!canceledCli.Connect("127.0.0.1", testTcpPort, 5000, &cancel),
+              "Canceled TcpSocket::Connect should return false immediately");
+    }
+
+    // 2. UDP Loopback packet roundtrip + bounds check
     s2p::UdpSocket udpSrv;
     s2p::UdpSocket udpCli;
     CHECK(udpSrv.Bind(testUdpPort, true), "UdpSocket::Bind failed");
@@ -280,6 +338,7 @@ void TestLoopbackNetworking() {
 
     const char msg[] = "S2P_PING";
     CHECK(udpCli.SendTo("127.0.0.1", testUdpPort, msg, sizeof(msg)), "UdpSocket::SendTo failed");
+    CHECK(!udpCli.SendTo("127.0.0.1", testUdpPort, msg, 70000), "Oversized UDP SendTo accepted");
     char recvBuf[64]{};
     std::string fromIp;
     uint16_t fromPort = 0;
@@ -312,6 +371,24 @@ void TestClipboardSync() {
     ch.hash64 = h1;
     ch.dataSize = sizeof(text1);
     CHECK(sizeof(ch) == 16, "Unexpected ClipboardHeader packed size");
+
+    // NormalizeTextPayload hardening checks
+    std::vector<uint8_t> normOut;
+    const uint8_t oddNonNull[3] = { 0x41, 0x00, 0x42 };
+    CHECK(s2p::ClipboardSync::NormalizeTextPayload(oddNonNull, sizeof(oddNonNull), normOut),
+          "NormalizeTextPayload failed on odd non-null buffer");
+    CHECK(normOut.size() == 6 && normOut[4] == 0 && normOut[5] == 0,
+          "NormalizeTextPayload did not align odd text and append UTF-16 NUL");
+
+    const uint8_t nullTerm[4] = { 0x41, 0x00, 0x00, 0x00 };
+    CHECK(s2p::ClipboardSync::NormalizeTextPayload(nullTerm, sizeof(nullTerm), normOut) && normOut.size() == 4,
+          "NormalizeTextPayload altered already NUL-terminated UTF-16 text");
+    CHECK(!s2p::ClipboardSync::NormalizeTextPayload(nullptr, 4, normOut),
+          "NormalizeTextPayload accepted nullptr");
+    CHECK(!s2p::ClipboardSync::NormalizeTextPayload(nullTerm, 0, normOut),
+          "NormalizeTextPayload accepted empty size");
+    CHECK(!s2p::ClipboardSync::NormalizeTextPayload(nullTerm, s2p::kMaxClipboardTextBytes + 2, normOut),
+          "NormalizeTextPayload accepted >kMaxClipboardTextBytes");
 
     std::cout << "[PASS] TestClipboardSync\n";
 }
@@ -526,6 +603,24 @@ void TestKvmInput() {
     s2p::KvmInput::StepVirtualDesktopPoint(4460, 1060, 100, 100, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
     CHECK(nxPx == 4479 && nyPx == 1079 && dx == 65535, "Outer bottom-right Monitor 2 clamping failed");
 
+    // Extreme INT32 deltas & NaN/Inf inputs must stay bounded cleanly without overflow
+    s2p::KvmInput::StepVirtualDesktopPoint(-2000, 500, INT32_MIN, INT32_MAX, roamMons, 3, rLeft, rTop, rW, rH, nxPx, nyPx, dx, dy);
+    CHECK(nxPx >= rLeft && nxPx < 4480 && nyPx >= 0 && nyPx < 1504 && dx >= 0 && dx <= 65535 && dy >= 0 && dy <= 65535,
+          "Extreme INT32 deltas caused out-of-range virtual desktop point");
+
+    s2p::KvmInput::ComputeVirtualDesktopAbs(rightMon,
+                                            std::numeric_limits<float>::quiet_NaN(),
+                                            std::numeric_limits<float>::infinity(),
+                                            0, 0, totalW, totalH, dx, dy);
+    CHECK(dx >= 0 && dx <= 65535 && dy >= 0 && dy <= 65535, "Non-finite norm coords produced out-of-range abs coord");
+
+    s2p::KvmMouseEvent nanEv{};
+    nanEv.action = s2p::kMouseMove;
+    nanEv.isRelative = 1;
+    nanEv.normX = std::numeric_limits<float>::quiet_NaN();
+    nanEv.normY = -std::numeric_limits<float>::infinity();
+    CHECK(!s2p::KvmInput::InjectMouse(nanEv, rightMon), "Non-finite InjectMouse event unexpectedly succeeded");
+
     std::cout << "[PASS] TestKvmInput\n";
 }
 
@@ -629,6 +724,19 @@ void TestHdrColorPipeline() {
           highCfg.contrastPct == 140.0f && highCfg.saturationPct == 160.0f &&
           highCfg.redGainPct == 130.0f && highCfg.greenGainPct == 130.0f && highCfg.blueGainPct == 130.0f,
           "Upper ClampColorConfig bounds failed");
+
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    const float pinf = std::numeric_limits<float>::infinity();
+    s2p::MonitorColorConfig nanCfg{ true, qnan, pinf, -pinf, qnan, qnan, pinf, -pinf };
+    s2p::ClampColorConfig(nanCfg);
+    CHECK(nanCfg.brightnessPct == 100.0f && std::abs(nanCfg.gamma - 2.20f) < 1e-4f &&
+          nanCfg.contrastPct == 100.0f && nanCfg.saturationPct == 100.0f &&
+          nanCfg.redGainPct == 100.0f && nanCfg.greenGainPct == 100.0f && nanCfg.blueGainPct == 100.0f,
+          "Non-finite ClampColorConfig values were not reset to defaults");
+    auto nanCb = s2p::ComputeColorShaderConstants(nanCfg, true, qnan, false);
+    CHECK(std::isfinite(nanCb.params0[0]) && std::isfinite(nanCb.params0[3]) &&
+          std::abs(nanCb.params0[3] - 1.0f) < 1e-4f,
+          "Non-finite osSdrWhiteScale produced invalid shader constants");
 
     // 5. Direct ColorShaderConstants desaturation (saturation = 0 -> BT.709 luma)
     s2p::ColorShaderConstants grayCb{};

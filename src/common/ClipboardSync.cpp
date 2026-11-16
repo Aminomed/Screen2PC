@@ -36,6 +36,22 @@ bool ClipboardSync::ShouldEmit(uint64_t newHash, uint64_t lastRemoteHash) {
     return newHash != 0 && newHash != lastRemoteHash;
 }
 
+bool ClipboardSync::NormalizeTextPayload(const uint8_t* data, size_t size, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!data || size == 0 || size > kMaxClipboardTextBytes) {
+        return false;
+    }
+    out.assign(data, data + size);
+    if (out.size() & 1u) {
+        out.push_back(0);
+    }
+    if (out.size() < 2 || out[out.size() - 2] != 0 || out[out.size() - 1] != 0) {
+        out.push_back(0);
+        out.push_back(0);
+    }
+    return true;
+}
+
 bool ClipboardSync::Start(ChangeCallback onLocalChange) {
     Stop();
     std::lock_guard<std::mutex> lock(m_lifecycleMutex);
@@ -198,7 +214,7 @@ void ClipboardSync::OnClipboardUpdate() {
         if (hData) {
             const void* ptr = GlobalLock(hData);
             size_t sz = GlobalSize(hData);
-            if (ptr && sz >= sizeof(wchar_t) && sz <= 2 * 1024 * 1024) {
+            if (ptr && sz >= sizeof(wchar_t) && sz <= kMaxClipboardTextBytes) {
                 const wchar_t* wptr = static_cast<const wchar_t*>(ptr);
                 size_t maxChars = sz / sizeof(wchar_t);
                 size_t len = wcsnlen(wptr, maxChars);
@@ -246,20 +262,25 @@ bool ClipboardSync::ApplyRemote(uint32_t kind, uint64_t hash64, const uint8_t* d
     if (!m_enabled.load() || !hwnd || !data || size == 0 || size > kMaxClipboardBytes) {
         return false;
     }
-    if (kind != kClipKindText && kind != kClipKindImage) {
+
+    std::vector<uint8_t> normalized;
+    if (kind == kClipKindText) {
+        if (!NormalizeTextPayload(data, size, normalized)) {
+            return false;
+        }
+    } else if (kind == kClipKindImage) {
+        if (size < sizeof(BITMAPINFOHEADER)) {
+            return false;
+        }
+        normalized.assign(data, data + size);
+    } else {
         return false;
     }
 
     auto* req = new ApplyRequest();
     req->kind = kind;
-    req->data.assign(data, data + size);
-
-    // Ensure null termination on text
+    req->data = std::move(normalized);
     if (kind == kClipKindText) {
-        if (req->data.size() < 2 || req->data[req->data.size() - 2] != 0 || req->data[req->data.size() - 1] != 0) {
-            req->data.push_back(0);
-            req->data.push_back(0);
-        }
         req->hash64 = ComputeHash64(req->data.data(), req->data.size());
     } else {
         req->hash64 = hash64 ? hash64 : ComputeHash64(req->data.data(), req->data.size());

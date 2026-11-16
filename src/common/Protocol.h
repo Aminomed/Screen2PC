@@ -245,4 +245,43 @@ inline bool ValidateHeader(const PacketHeader& h) {
            h.payloadSize <= kMaxFrameBytes;
 }
 
+constexpr uint32_t kMaxCursorDimension = 1024;
+
+inline bool ValidateCursorShapeBuffer(uint8_t shapeType,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      uint32_t pitch,
+                                      size_t dataSize,
+                                      uint32_t& outActualHeight) {
+    outActualHeight = 0;
+    if (width == 0 || height == 0 ||
+        width > kMaxCursorDimension || height > kMaxCursorDimension) {
+        return false;
+    }
+
+    if (shapeType == 1) {
+        if (height < 2) return false;
+        uint32_t actualH = height / 2;
+        size_t minPitch = (static_cast<size_t>(width) + 7) / 8;
+        if (pitch < minPitch) return false;
+        size_t maskBytes = static_cast<size_t>(actualH) * pitch;
+        if (maskBytes > dataSize / 2) return false;
+        outActualHeight = actualH;
+        return true;
+    }
+
+    if (shapeType == 2 || shapeType == 4) {
+        size_t minPitch = static_cast<size_t>(width) * 4;
+        if (pitch < minPitch) return false;
+        size_t lastRowOffset = static_cast<size_t>(height - 1) * pitch;
+        if (lastRowOffset > dataSize || minPitch > (dataSize - lastRowOffset)) {
+            return false;
+        }
+        outActualHeight = height;
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace s2p

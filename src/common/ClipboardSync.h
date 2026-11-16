@@ -15,6 +15,7 @@ namespace s2p {
 constexpr uint32_t kClipKindText  = 1; // UTF-16LE null-terminated text
 constexpr uint32_t kClipKindImage = 2; // CF_DIB packed bitmap
 constexpr size_t   kMaxClipboardBytes = 16 * 1024 * 1024; // 16 MB cap
+constexpr size_t   kMaxClipboardTextBytes = 2 * 1024 * 1024; // 2 MB UTF-16LE cap
 
 class ClipboardSync {
 public:
@@ -38,6 +39,7 @@ public:
     // Pure helpers (unit-testable without interactive desktop)
     static uint64_t ComputeHash64(const void* data, size_t size);
     static bool ShouldEmit(uint64_t newHash, uint64_t lastRemoteHash);
+    static bool NormalizeTextPayload(const uint8_t* data, size_t size, std::vector<uint8_t>& out);
 
 private:
     void ThreadMain();

@@ -34,6 +34,7 @@ namespace {
 constexpr UINT WM_TRAYICON          = WM_APP + 10;
 constexpr UINT WM_UPDATE_CHECK_DONE = WM_APP + 11;
 constexpr UINT WM_UPDATE_DL_DONE    = WM_APP + 12;
+constexpr UINT WM_DISCONNECT_DONE   = WM_APP + 13;
 constexpr UINT_PTR TIMER_TELEMETRY  = 1;
 
 constexpr int IDC_INFO_LABEL     = 201;
@@ -96,6 +97,7 @@ UINT g_wmShowExisting = 0;
 std::thread g_disconnThread;
 std::thread g_updateThread;
 std::atomic<bool> g_closing{false};
+std::atomic<bool> g_disconnBusy{false};
 std::atomic<bool> g_updateBusy{false};
 bool g_promptOpen = false;
 s2p::UpdateReleaseInfo g_pendingUpdate{};
@@ -500,7 +502,7 @@ void UpdateUi() {
         if (st.localMonitors[i].isPrimary) hdr << L" (Primary)";
     }
     SetDlgItemTextW(g_hwnd, IDC_INFO_LABEL, hdr.str().c_str());
-    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_DISCONN), st.sessionActive ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_DISCONN), (st.sessionActive && !g_disconnBusy.load()) ? TRUE : FALSE);
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SENDFILE), st.fileStats.active ? TRUE : FALSE);
 
     bool kvmOn = g_engine->IsKvmEnabled();
@@ -692,9 +694,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case IDC_BTN_DISCONN:
-            if (g_engine) {
+            if (g_engine && !g_disconnBusy.exchange(true)) {
+                EnableWindow(GetDlgItem(hwnd, IDC_BTN_DISCONN), FALSE);
                 if (g_disconnThread.joinable()) g_disconnThread.join();
-                g_disconnThread = std::thread([]() { if (g_engine) g_engine->DisconnectSession(); });
+                g_disconnThread = std::thread([]() {
+                    if (g_engine && !g_closing.load()) {
+                        g_engine->DisconnectSession();
+                    }
+                    g_disconnBusy = false;
+                    if (!g_closing.load() && g_hwnd) {
+                        PostMessageW(g_hwnd, WM_DISCONNECT_DONE, 0, 0);
+                    }
+                });
             }
             return 0;
         case IDC_BTN_FIREWALL:
@@ -735,6 +746,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+
+    case WM_DISCONNECT_DONE:
+        UpdateUi();
+        return 0;
 
     case WM_UPDATE_CHECK_DONE: {
         auto* res = reinterpret_cast<UpdateCheckResult*>(lp);

@@ -277,20 +277,23 @@ void D3D11Renderer::SetKvmCapture(bool captured) {
     UpdateTitle();
 }
 
+void D3D11Renderer::ReleaseRemoteModifiers() {
+    if (!m_kvmEnabled || !m_kvmKeyCb) return;
+    const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
+    for (uint16_t vk : mods) {
+        KvmKeyEvent ev{};
+        ev.vk = vk;
+        ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+        ev.isDown = 0;
+        m_kvmKeyCb(ev);
+    }
+}
+
 void D3D11Renderer::SetKvmEnabled(bool enabled) {
     if (!enabled) {
         m_suppressKeyUpMask = 0;
         SetKvmCapture(false);
-        if (m_kvmEnabled && m_kvmKeyCb) {
-            const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
-            for (uint16_t vk : mods) {
-                KvmKeyEvent ev{};
-                ev.vk = vk;
-                ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
-                ev.isDown = 0;
-                m_kvmKeyCb(ev);
-            }
-        }
+        ReleaseRemoteModifiers();
     }
     m_kvmEnabled = enabled;
     if (enabled && m_hwnd && GetForegroundWindow() == m_hwnd && m_fullscreen && !m_escReleasedCapture) {
@@ -415,6 +418,7 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
     m_srcHeight = std::max<uint32_t>(sourceHeight, 1);
     m_fullscreen = startFullscreen;
     m_closedByUser = false;
+    m_deviceLost = false;
     m_kvmCaptured = false;
     m_escReleasedCapture = false;
     m_suppressEscUp = false;
@@ -427,8 +431,8 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
     DWORD style = m_fullscreen ? WS_POPUP : WS_OVERLAPPEDWINDOW;
     int x = m_fullscreen ? targetMonitorRect.left : (targetMonitorRect.left + 80);
     int y = m_fullscreen ? targetMonitorRect.top : (targetMonitorRect.top + 80);
-    int w = m_fullscreen ? monW : std::min(monW - 160, 1280);
-    int h = m_fullscreen ? monH : std::min(monH - 160, 720);
+    int w = m_fullscreen ? monW : std::clamp(monW - 160, std::min(monW, 320), 1280);
+    int h = m_fullscreen ? monH : std::clamp(monH - 160, std::min(monH, 240), 720);
 
     std::wstring title = L"Screen2PC Display " + std::to_wstring(monitorIndex + 1);
 
@@ -480,6 +484,9 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
 
 void D3D11Renderer::Destroy() {
     SetKvmCapture(false);
+    if (m_hwnd && GetCapture() == m_hwnd) {
+        ReleaseCapture();
+    }
     m_cursorSrv.Reset();
     m_cursorTex.Reset();
     m_frameSrv.Reset();
@@ -496,6 +503,8 @@ void D3D11Renderer::Destroy() {
     m_device.Reset();
     m_hdrSwapChain = false;
     m_monitorIsHdr = false;
+    m_deviceLost = false;
+    m_needSwapChainRebuild = false;
     m_currentMonitor = nullptr;
 
     if (m_hwnd) {
@@ -587,6 +596,7 @@ bool D3D11Renderer::CreateDeviceAndShaders() {
 }
 
 void D3D11Renderer::CreateDefaultCursorTexture() {
+    if (!m_device) return;
     const uint32_t w = 16;
     const uint32_t h = 24;
     std::vector<uint8_t> bgra(w * h * 4, 0);
@@ -625,6 +635,7 @@ void D3D11Renderer::CreateDefaultCursorTexture() {
 }
 
 bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
+    if (!m_device || !m_hwnd) return false;
     m_rtv.Reset();
     m_swapChain.Reset();
     if (m_context) {
@@ -700,7 +711,7 @@ bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
 }
 
 void D3D11Renderer::RebuildSwapChainIfNeeded() {
-    if (!m_hwnd) return;
+    if (!m_hwnd || !m_device) return;
     HMONITOR curMon = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
     if (!m_needSwapChainRebuild && curMon == m_currentMonitor) {
         return;
@@ -724,12 +735,17 @@ void D3D11Renderer::RebuildSwapChainIfNeeded() {
 }
 
 void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
-    if (!m_swapChain || w == 0 || h == 0) return;
+    if (!m_swapChain || !m_context || !m_device || w == 0 || h == 0) return;
     m_winWidth = w;
     m_winHeight = h;
     m_rtv.Reset();
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
-    if (SUCCEEDED(m_swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0))) {
+    HRESULT hr = m_swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        m_deviceLost = true;
+        return;
+    }
+    if (SUCCEEDED(hr)) {
         ComPtr<ID3D11Texture2D> backBuf;
         if (SUCCEEDED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuf)))) {
             m_device->CreateRenderTargetView(backBuf.Get(), nullptr, &m_rtv);
@@ -739,11 +755,14 @@ void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
 }
 
 bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
-    if (m_frameTex && m_srcWidth == width && m_srcHeight == height) {
+    if (!m_device) return false;
+    uint32_t targetW = std::max<uint32_t>(width, 1);
+    uint32_t targetH = std::max<uint32_t>(height, 1);
+    if (m_frameTex && m_srcWidth == targetW && m_srcHeight == targetH) {
         return true;
     }
-    m_srcWidth = std::max<uint32_t>(width, 1);
-    m_srcHeight = std::max<uint32_t>(height, 1);
+    m_srcWidth = targetW;
+    m_srcHeight = targetH;
     UpdateTitle();
     m_frameSrv.Reset();
     m_frameTex.Reset();
@@ -766,8 +785,11 @@ bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
 }
 
 void D3D11Renderer::UploadCpuBgra(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height) {
-    if (!bgra || width == 0 || height == 0) return;
-    if (!EnsureFrameTexture(width, height)) return;
+    if (!m_context || !bgra || width == 0 || height == 0 ||
+        static_cast<uint64_t>(strideBytes) < static_cast<uint64_t>(width) * 4) {
+        return;
+    }
+    if (!EnsureFrameTexture(width, height) || !m_frameTex) return;
     m_context->UpdateSubresource(m_frameTex.Get(), 0, nullptr, bgra, strideBytes, 0);
 }
 
@@ -799,17 +821,16 @@ void D3D11Renderer::UpdateCursorTexture(uint8_t shapeType,
                                         uint32_t pitch,
                                         const uint8_t* data,
                                         size_t dataSize) {
+    if (!m_device || !data) return;
     // Convert Monochrome (1), Color (2), or MaskedColor (4) to BGRA32
-    uint32_t actualH = height;
-    if (shapeType == 1) {
-        // DXGI monochrome height includes both AND and XOR masks
-        actualH = std::max<uint32_t>(1, height / 2);
+    uint32_t actualH = 0;
+    if (!ValidateCursorShapeBuffer(shapeType, width, height, pitch, dataSize, actualH)) {
+        return;
     }
 
     std::vector<uint8_t> bgra(static_cast<size_t>(width) * actualH * 4, 0);
     if (shapeType == 2 || shapeType == 4) {
         for (uint32_t y = 0; y < actualH; ++y) {
-            if (static_cast<size_t>(y) * pitch + width * 4 > dataSize) break;
             const uint8_t* srcRow = data + static_cast<size_t>(y) * pitch;
             uint8_t* dstRow = bgra.data() + static_cast<size_t>(y) * width * 4;
             for (uint32_t x = 0; x < width; ++x) {
@@ -825,33 +846,31 @@ void D3D11Renderer::UpdateCursorTexture(uint8_t shapeType,
         }
     } else if (shapeType == 1) {
         const size_t maskBytes = static_cast<size_t>(actualH) * pitch;
-        if (maskBytes * 2 <= dataSize) {
-            for (uint32_t y = 0; y < actualH; ++y) {
-                const uint8_t* andRow = data + static_cast<size_t>(y) * pitch;
-                const uint8_t* xorRow = data + maskBytes + static_cast<size_t>(y) * pitch;
-                uint8_t* dstRow = bgra.data() + static_cast<size_t>(y) * width * 4;
-                for (uint32_t x = 0; x < width; ++x) {
-                    uint8_t bit = static_cast<uint8_t>(0x80 >> (x & 7));
-                    bool andBit = (andRow[x >> 3] & bit) != 0;
-                    bool xorBit = (xorRow[x >> 3] & bit) != 0;
-                    if (!andBit && !xorBit) { // Black
-                        dstRow[x * 4 + 0] = 0;
-                        dstRow[x * 4 + 1] = 0;
-                        dstRow[x * 4 + 2] = 0;
-                        dstRow[x * 4 + 3] = 255;
-                    } else if (!andBit && xorBit) { // White
-                        dstRow[x * 4 + 0] = 255;
-                        dstRow[x * 4 + 1] = 255;
-                        dstRow[x * 4 + 2] = 255;
-                        dstRow[x * 4 + 3] = 255;
-                    } else if (andBit && !xorBit) { // Transparent
-                        dstRow[x * 4 + 3] = 0;
-                    } else { // Inverted -> semi-opaque highlight
-                        dstRow[x * 4 + 0] = 180;
-                        dstRow[x * 4 + 1] = 180;
-                        dstRow[x * 4 + 2] = 180;
-                        dstRow[x * 4 + 3] = 160;
-                    }
+        for (uint32_t y = 0; y < actualH; ++y) {
+            const uint8_t* andRow = data + static_cast<size_t>(y) * pitch;
+            const uint8_t* xorRow = data + maskBytes + static_cast<size_t>(y) * pitch;
+            uint8_t* dstRow = bgra.data() + static_cast<size_t>(y) * width * 4;
+            for (uint32_t x = 0; x < width; ++x) {
+                uint8_t bit = static_cast<uint8_t>(0x80 >> (x & 7));
+                bool andBit = (andRow[x >> 3] & bit) != 0;
+                bool xorBit = (xorRow[x >> 3] & bit) != 0;
+                if (!andBit && !xorBit) { // Black
+                    dstRow[x * 4 + 0] = 0;
+                    dstRow[x * 4 + 1] = 0;
+                    dstRow[x * 4 + 2] = 0;
+                    dstRow[x * 4 + 3] = 255;
+                } else if (!andBit && xorBit) { // White
+                    dstRow[x * 4 + 0] = 255;
+                    dstRow[x * 4 + 1] = 255;
+                    dstRow[x * 4 + 2] = 255;
+                    dstRow[x * 4 + 3] = 255;
+                } else if (andBit && !xorBit) { // Transparent
+                    dstRow[x * 4 + 3] = 0;
+                } else { // Inverted -> semi-opaque highlight
+                    dstRow[x * 4 + 0] = 180;
+                    dstRow[x * 4 + 1] = 180;
+                    dstRow[x * 4 + 2] = 180;
+                    dstRow[x * 4 + 3] = 160;
                 }
             }
         }
@@ -889,6 +908,8 @@ void D3D11Renderer::SetFullscreen(bool fullscreen) {
         SetWindowLongPtrW(m_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
         int w = m_targetRect.right - m_targetRect.left;
         int h = m_targetRect.bottom - m_targetRect.top;
+        if (w <= 0) w = static_cast<int>(m_srcWidth);
+        if (h <= 0) h = static_cast<int>(m_srcHeight);
         SetWindowPos(m_hwnd, HWND_TOP, m_targetRect.left, m_targetRect.top, w, h,
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
         if (m_kvmEnabled && GetForegroundWindow() == m_hwnd) {
@@ -899,8 +920,10 @@ void D3D11Renderer::SetFullscreen(bool fullscreen) {
         SetWindowLongPtrW(m_hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
         int monW = m_targetRect.right - m_targetRect.left;
         int monH = m_targetRect.bottom - m_targetRect.top;
-        int w = std::min(monW - 120, 1280);
-        int h = std::min(monH - 120, 720);
+        if (monW <= 0) monW = static_cast<int>(m_srcWidth);
+        if (monH <= 0) monH = static_cast<int>(m_srcHeight);
+        int w = std::clamp(monW - 120, std::min(monW, 320), 1280);
+        int h = std::clamp(monH - 120, std::min(monH, 240), 720);
         SetWindowPos(m_hwnd, HWND_NOTOPMOST, m_targetRect.left + 60, m_targetRect.top + 60, w, h,
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
     }
@@ -921,7 +944,7 @@ void D3D11Renderer::PumpMessages() {
 
 void D3D11Renderer::Present() {
     RebuildSwapChainIfNeeded();
-    if (!m_swapChain || !m_rtv || !m_frameSrv) return;
+    if (!m_context || !m_swapChain || !m_rtv || !m_frameSrv) return;
 
     const float clearHdr[4] = { 0.0004f, 0.0004f, 0.0008f, 1.0f };
     const float clearSdr[4] = { 0.02f, 0.02f, 0.03f, 1.0f };
@@ -989,7 +1012,57 @@ void D3D11Renderer::Present() {
     }
 
     // Immediate present (syncInterval = 0) for minimum display latency on LAN
-    m_swapChain->Present(0, 0);
+    HRESULT hr = m_swapChain->Present(0, 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        Logger::Instance().Warn("RND-D3D", L"DXGI device lost during Present: " + FormatHr(hr));
+        m_deviceLost = true;
+    }
+}
+
+bool D3D11Renderer::ConsumeDeviceLost() {
+    if (!m_deviceLost && m_device && FAILED(m_device->GetDeviceRemovedReason())) {
+        m_deviceLost = true;
+    }
+    bool lost = m_deviceLost;
+    m_deviceLost = false;
+    return lost;
+}
+
+bool D3D11Renderer::RecreateDeviceAndResources() {
+    if (!m_hwnd || !IsWindow(m_hwnd)) return false;
+
+    m_cursorSrv.Reset();
+    m_cursorTex.Reset();
+    m_frameSrv.Reset();
+    m_frameTex.Reset();
+    m_colorCb.Reset();
+    m_quadCb.Reset();
+    m_alphaBlend.Reset();
+    m_sampler.Reset();
+    m_ps.Reset();
+    m_vs.Reset();
+    m_rtv.Reset();
+    m_swapChain.Reset();
+    m_context.Reset();
+    m_device.Reset();
+
+    m_currentMonitor = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
+    MonitorHdrInfo hdrInfo{};
+    QueryMonitorHdrInfo(m_currentMonitor, hdrInfo);
+    m_monitorIsHdr = hdrInfo.isHdr;
+    m_osSdrWhiteScale = hdrInfo.sdrWhiteScale;
+    m_needSwapChainRebuild = false;
+
+    if (!CreateDeviceAndShaders() ||
+        !CreateSwapChain(m_winWidth, m_winHeight) ||
+        !EnsureFrameTexture(m_srcWidth, m_srcHeight)) {
+        return false;
+    }
+
+    m_deviceLost = false;
+    m_needRepaint = true;
+    UpdateTitle();
+    return true;
 }
 
 LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1045,16 +1118,7 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         if (GetCapture() == hwnd) {
             ReleaseCapture();
         }
-        if (m_kvmEnabled && m_kvmKeyCb) {
-            const uint16_t mods[] = { VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN };
-            for (uint16_t vk : mods) {
-                KvmKeyEvent ev{};
-                ev.vk = vk;
-                ev.scanCode = static_cast<uint16_t>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
-                ev.isDown = 0;
-                m_kvmKeyCb(ev);
-            }
-        }
+        ReleaseRemoteModifiers();
         break;
     }
     case WM_INPUT: {
@@ -1182,18 +1246,30 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         EmitMouseEvent(kMouseLeftUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
         return 0;
     case WM_RBUTTONDOWN:
+        if (GetFocus() != hwnd) {
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
         EmitMouseEvent(kMouseRightDown, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
         return 0;
     case WM_RBUTTONUP:
         EmitMouseEvent(kMouseRightUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
         return 0;
     case WM_MBUTTONDOWN:
+        if (GetFocus() != hwnd) {
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
         EmitMouseEvent(kMouseMidDown, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
         return 0;
     case WM_MBUTTONUP:
         EmitMouseEvent(kMouseMidUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
         return 0;
     case WM_XBUTTONDOWN:
+        if (GetFocus() != hwnd) {
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+        }
         EmitMouseEvent((HIWORD(wp) == XBUTTON1) ? kMouseX1Down : kMouseX2Down,
                        static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
         return TRUE;
@@ -1234,6 +1310,7 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     case WM_CLOSE:
         SetKvmCapture(false);
+        ReleaseRemoteModifiers();
         m_closedByUser = true;
         ShowWindow(hwnd, SW_HIDE);
         return 0;

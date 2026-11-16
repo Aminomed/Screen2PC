@@ -38,7 +38,7 @@ public:
     SOCKET Handle() const { return m_sock.load(); }
     void Close();
 
-    bool Connect(const std::string& host, uint16_t port, int timeoutMs = 3000);
+    bool Connect(const std::string& host, uint16_t port, int timeoutMs = 3000, const std::atomic<bool>* cancelFlag = nullptr);
     bool Listen(uint16_t port, int backlog = 8);
     TcpSocket Accept(std::string* outPeerIp = nullptr, int timeoutMs = -1);
 
@@ -70,14 +70,14 @@ public:
     bool Bind(uint16_t port, bool reuseAddr = true);
     bool CreateForBroadcast();
     void Close();
-    bool IsValid() const { return m_sock != INVALID_SOCKET; }
+    bool IsValid() const { return m_sock.load() != INVALID_SOCKET; }
 
     bool SendTo(const std::string& ip, uint16_t port, const void* data, size_t len);
     bool Broadcast(uint16_t port, const void* data, size_t len);
     int  RecvFrom(void* buf, size_t bufCap, std::string& outSenderIp, uint16_t& outSenderPort, int timeoutMs);
 
 private:
-    SOCKET m_sock = INVALID_SOCKET;
+    std::atomic<SOCKET> m_sock{ INVALID_SOCKET };
 };
 
 struct DiscoveredPeer {

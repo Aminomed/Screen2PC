@@ -107,7 +107,10 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
                           bool forceKeyframe,
                           std::vector<uint8_t>& outPayload,
                           bool& outIsKeyframe) {
-    if (!bgraFrame || width == 0 || height == 0 || strideBytes < width * 4) {
+    if (!bgraFrame || width == 0 || height == 0 ||
+        width > 16384 || height > 16384 ||
+        static_cast<uint64_t>(width) * height > 64ULL * 1024ULL * 1024ULL ||
+        static_cast<uint64_t>(strideBytes) < static_cast<uint64_t>(width) * 4) {
         return false;
     }
 
@@ -127,8 +130,8 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
         for (const auto& r : hints) {
             uint32_t x0 = std::min(r.x, width);
             uint32_t y0 = std::min(r.y, height);
-            uint32_t x1 = std::min(r.x + r.w, width);
-            uint32_t y1 = std::min(r.y + r.h, height);
+            uint32_t x1 = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(r.x) + r.w, width));
+            uint32_t y1 = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(r.y) + r.h, height));
             if (x1 > x0 && y1 > y0) {
                 rects.push_back({x0, y0, x1 - x0, y1 - y0});
             }
@@ -214,7 +217,11 @@ bool DeltaDecoder::Decode(const uint8_t* payload,
 
     DeltaBlobHeader bh{};
     std::memcpy(&bh, payload, sizeof(bh));
-    if (bh.magic != kDeltaMagic || bh.width == 0 || bh.height == 0) return false;
+    if (bh.magic != kDeltaMagic || bh.width == 0 || bh.height == 0 ||
+        bh.width > 16384 || bh.height > 16384 ||
+        static_cast<uint64_t>(bh.width) * bh.height > 64ULL * 1024ULL * 1024ULL) {
+        return false;
+    }
     if (expectedWidth != 0 && (bh.width != expectedWidth || bh.height != expectedHeight)) {
         return false;
     }
@@ -226,16 +233,24 @@ bool DeltaDecoder::Decode(const uint8_t* payload,
     }
 
     size_t pos = sizeof(DeltaBlobHeader);
+    if (static_cast<uint64_t>(bh.rectCount) * sizeof(DeltaRectHeader) > payloadSize - pos) {
+        return false;
+    }
+
     std::vector<uint32_t> linearPixels;
 
     for (uint32_t i = 0; i < bh.rectCount; ++i) {
-        if (pos + sizeof(DeltaRectHeader) > payloadSize) return false;
+        if (payloadSize - pos < sizeof(DeltaRectHeader)) return false;
         DeltaRectHeader rh{};
         std::memcpy(&rh, payload + pos, sizeof(rh));
         pos += sizeof(rh);
 
-        if (pos + rh.compressedBytes > payloadSize) return false;
-        if (rh.x + rh.w > m_width || rh.y + rh.h > m_height) return false;
+        if (rh.compressedBytes > payloadSize - pos) return false;
+        if (rh.w == 0 || rh.h == 0) return false;
+        if (static_cast<uint64_t>(rh.x) + rh.w > m_width ||
+            static_cast<uint64_t>(rh.y) + rh.h > m_height) {
+            return false;
+        }
 
         size_t pxCount = static_cast<size_t>(rh.w) * rh.h;
         linearPixels.resize(pxCount);

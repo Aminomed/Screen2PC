@@ -98,8 +98,8 @@ void KvmInput::ComputeVirtualDesktopAbs(const RECT& targetRect,
                                         int32_t vHeight,
                                         int32_t& outDx,
                                         int32_t& outDy) {
-    float nx = std::clamp(normX, 0.0f, 1.0f);
-    float ny = std::clamp(normY, 0.0f, 1.0f);
+    float nx = std::isfinite(normX) ? std::clamp(normX, 0.0f, 1.0f) : 0.0f;
+    float ny = std::isfinite(normY) ? std::clamp(normY, 0.0f, 1.0f) : 0.0f;
 
     int32_t monW = std::max<int32_t>(1, targetRect.right - targetRect.left);
     int32_t monH = std::max<int32_t>(1, targetRect.bottom - targetRect.top);
@@ -131,10 +131,10 @@ void KvmInput::StepVirtualDesktopPoint(int32_t curX,
                                        int32_t& outNewY,
                                        int32_t& outDx,
                                        int32_t& outDy) {
-    int32_t maxX = vLeft + std::max<int32_t>(1, vWidth) - 1;
-    int32_t maxY = vTop + std::max<int32_t>(1, vHeight) - 1;
-    int32_t rawX = std::clamp<int32_t>(curX + deltaX, vLeft, maxX);
-    int32_t rawY = std::clamp<int32_t>(curY + deltaY, vTop, maxY);
+    int64_t maxX = static_cast<int64_t>(vLeft) + std::max<int32_t>(1, vWidth) - 1;
+    int64_t maxY = static_cast<int64_t>(vTop) + std::max<int32_t>(1, vHeight) - 1;
+    int32_t rawX = static_cast<int32_t>(std::clamp<int64_t>(static_cast<int64_t>(curX) + deltaX, vLeft, maxX));
+    int32_t rawY = static_cast<int32_t>(std::clamp<int64_t>(static_cast<int64_t>(curY) + deltaY, vTop, maxY));
 
     if (monitorRects && monitorCount > 0) {
         auto isInside = [](int32_t x, int32_t y, const RECT& r) -> bool {
@@ -231,6 +231,10 @@ void KvmInput::StepVirtualDesktopPoint(int32_t curX,
 }
 
 bool KvmInput::InjectMouse(const KvmMouseEvent& ev, const RECT& targetDesktopRect) {
+    if (!std::isfinite(ev.normX) || !std::isfinite(ev.normY)) {
+        return false;
+    }
+
     int32_t vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
     int32_t vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
     int32_t vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -266,8 +270,10 @@ bool KvmInput::InjectMouse(const KvmMouseEvent& ev, const RECT& targetDesktopRec
             }
 
             const auto& mons = GetCachedMonitorRectsLocked(now);
-            int32_t dpx = static_cast<int32_t>(std::llround(ev.normX));
-            int32_t dpy = static_cast<int32_t>(std::llround(ev.normY));
+            double rdx = std::clamp(static_cast<double>(ev.normX), -100000.0, 100000.0);
+            double rdy = std::clamp(static_cast<double>(ev.normY), -100000.0, 100000.0);
+            int32_t dpx = static_cast<int32_t>(std::llround(rdx));
+            int32_t dpy = static_cast<int32_t>(std::llround(rdy));
             StepVirtualDesktopPoint(g_virtualPosX, g_virtualPosY, dpx, dpy,
                                     mons.data(), mons.size(),
                                     vLeft, vTop, vWidth, vHeight,
