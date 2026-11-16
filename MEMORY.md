@@ -6,15 +6,15 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Systematisches Stability-, Race-/Deadlock- & Bounds-Debugging (Pre-Release CI Verification)`
-- **Status:** Vollstaendiges Code-Audit & Hardening ueber **Driver**, **Common**, **Sender**, **Receiver** und **Unit-Tests** lokal abgeschlossen (wird jetzt gepusht und per GitHub Actions Windows CI verifiziert; bisheriges stabiles Release `v1.5.0.26` / Commit `b0adff2`):
+- **Phase:** `Stabilitäts-, Concurrency-, Bounds- & Recovery-Hardening (Release v1.5.0.27)`
+- **Status:** Alle Stabilitäts-, Deadlock-/Race-, Bounds- & GPU-Recovery-Fixes sowie erweiterten Unit-Tests sind im grünen CI-Build **Run `43858802633`** (Commit `b0a55ed`, Artifact `14222816676`, **GitHub Release `v1.5.0.27`**, 10/10 Unit-Tests PASS, INF/CAT OK, 0 Build-Fehler/Warnungen) veröffentlicht:
   1. **Deadlock-, Race- & Disconnect-Fixes:** Abbrechbare `TcpSocket::Connect` (100ms-Slices) + `WaitForControlPacket`/`SleepInterruptible` in `SenderEngine`; `m_status.connected` vor Thread-Start; 100ms-Accept-Polling in `ReceiverEngine`; `g_disconnBusy` + `WM_DISCONNECT_DONE` in `receiver/main.cpp`; `std::atomic<SOCKET>` in `UdpSocket`; `MOD_NOREPEAT` fuer `Ctrl+Shift+K`.
   2. **Driver-, Capture-, Codec- & GPU-Recovery:** Asynchrones `overlappedIo` (3s Timeout + `CancelIo`/`GetOverlappedResult`) & Monitor-Rollback im UMDF-Treiber (`Driver.cpp`); Async-MFT-Warmup-Deadlock & Multi-Kandidaten-Enumeration in `CodecH264`; Laufzeit-Capture-Reset (`DXGI_ERROR_DEVICE_REMOVED`/`RESET`), Aufloesungswechsel & `ID3D11Device`-Reset-Erkennung in `DxgiCapture`/`SenderEngine`; DXGI-Device-Lost-Wiederherstellung (`ConsumeDeviceLost`/`RecreateDeviceAndResources`) & `ReleaseRemoteModifiers` in `D3D11Renderer`/`ReceiverEngine`.
   3. **Integer-Overflow-, Bounds-, NaN- & Updater-Haertung:** `ValidateCursorShapeBuffer` (inkl. `1024x1024`-Limit), `16384x16384` / `64 MP` Caps & `uint64_t`-Stride/Rect-Checks in `CodecDelta`/`CodecH264`; `std::isfinite`-Schutz in `KvmInput` & `ColorProfile`; `NormalizeTextPayload` in `ClipboardSync`; `expectedSize`/JSON-Checks/Temp-Cleanup/`$DriverChanged`-`try/catch` in `Updater`; erweiterte Regressionstests in `src/tests/main.cpp`.
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build, `infverif.exe /v`, `Inf2Cat.exe`, GitHub Release Publish (`v1.5.0.<RunNumber>`) & `Screen2PC.Tests.exe` laufen via `.github/workflows/ci.yml` (`windows-2022`).
-  - *Test-Scope:* `Screen2PC.Tests.exe` prüft 10/10 Suiten inkl. `TestProtocol` (`ValidateCursorShapeBuffer`), `TestDeltaCodec` (Overflow/Wraparound/64MP), `TestLoopbackNetworking` (Cancel-Connect/UDP-Cap), `TestClipboardSync` (`NormalizeTextPayload`), `TestKvmInput` (`INT32_MIN/MAX`/`NaN`/`Inf`), `TestHdrColorPipeline` (`NaN`/`Inf`), `TestAutostartAndCli` & `TestUpdaterParsing`; reale GPU/TDR/UMDF2/Registry/LAN-Tests laufen auf PC & Surface.
-- **Next Step:** Änderungen nach `origin/main` pushen, grüne GitHub Actions CI (`MSBuild`, `Screen2PC.Tests.exe`, `infverif`, `Inf2Cat`, Release) verifizieren, anschließendes CI-Ergebnis in `MEMORY.md` stempeln und auf PC & Surface testen.
+  - *Build & INF:* Windows-x64 Release-Build (0 Warnungen, 0 Fehler), `infverif.exe /v` (`INF is VALID`), `Inf2Cat.exe` (`Errors: None`), GitHub Release **`v1.5.0.27`** (`Screen2PC-Windows-x64.zip`, `949351` Bytes) & `Screen2PC.Tests.exe` (10/10 PASS) via `.github/workflows/ci.yml`.
+  - *Test-Scope:* `Screen2PC.Tests.exe` prüft 10/10 Suiten inkl. `ValidateCursorShapeBuffer`, Delta-Overflow/Wraparound/64MP, Cancel-Connect/UDP-Cap, `NormalizeTextPayload`, `INT32_MIN/MAX`/`NaN`/`Inf`-KVM & Color-Clamping, `TestAutostartAndCli`, `TestHdrColorPipeline` & `TestUpdaterParsing`; reale GPU/TDR/UMDF2/Registry/LAN-Tests laufen auf PC & Surface.
+- **Next Step:** Release **`v1.5.0.27`** per Auto-Updater (oder ZIP) auf **PC** und **Surface** installieren und Autostart, HDR-Farben, KVM-Roaming sowie Connect/Trennen/Resume im Live-Betrieb prüfen.
 
 ---
 
