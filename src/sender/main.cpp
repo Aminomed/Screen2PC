@@ -19,6 +19,7 @@
 
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
+#include "../common/Updater.h"
 #include "SenderEngine.h"
 #include "VirtualDisplayCtl.h"
 
@@ -29,29 +30,44 @@
 
 namespace {
 
-constexpr UINT WM_TRAYICON = WM_APP + 1;
-constexpr UINT WM_DISCOVERY_DONE = WM_APP + 2;
-constexpr UINT_PTR TIMER_TELEMETRY = 1;
+constexpr UINT WM_TRAYICON          = WM_APP + 1;
+constexpr UINT WM_DISCOVERY_DONE    = WM_APP + 2;
+constexpr UINT WM_UPDATE_CHECK_DONE = WM_APP + 4;
+constexpr UINT WM_UPDATE_DL_DONE    = WM_APP + 5;
+constexpr UINT_PTR TIMER_TELEMETRY  = 1;
 constexpr int HOTKEY_TOGGLE_CONNECT = 1001;
 
-constexpr int IDC_PEER_COMBO    = 101;
-constexpr int IDC_BTN_SCAN      = 102;
-constexpr int IDC_IP_EDIT       = 103;
-constexpr int IDC_MODE_COMBO    = 104;
-constexpr int IDC_CODEC_COMBO   = 105;
-constexpr int IDC_BITRATE_COMBO = 106;
-constexpr int IDC_BTN_CONNECT   = 107;
-constexpr int IDC_STATUS_LABEL  = 108;
-constexpr int IDC_DRIVER_LABEL  = 109;
-constexpr int IDC_STATS_TEXT    = 110;
-constexpr int IDC_CHK_CLIPBOARD = 111;
-constexpr int IDC_BTN_SENDFILE  = 112;
-constexpr int IDC_BTN_OPEN_DL   = 113;
-constexpr int IDC_CHK_KVM       = 114;
+constexpr int IDC_PEER_COMBO     = 101;
+constexpr int IDC_BTN_SCAN       = 102;
+constexpr int IDC_IP_EDIT        = 103;
+constexpr int IDC_MODE_COMBO     = 104;
+constexpr int IDC_CODEC_COMBO    = 105;
+constexpr int IDC_BITRATE_COMBO  = 106;
+constexpr int IDC_BTN_CONNECT    = 107;
+constexpr int IDC_STATUS_LABEL   = 108;
+constexpr int IDC_DRIVER_LABEL   = 109;
+constexpr int IDC_STATS_TEXT     = 110;
+constexpr int IDC_CHK_CLIPBOARD  = 111;
+constexpr int IDC_BTN_SENDFILE   = 112;
+constexpr int IDC_BTN_OPEN_DL    = 113;
+constexpr int IDC_CHK_KVM        = 114;
+constexpr int IDC_CHK_AUTOUPDATE = 115;
+constexpr int IDC_BTN_UPDATE     = 116;
 
-constexpr int IDM_SHOW   = 2001;
-constexpr int IDM_TOGGLE = 2002;
-constexpr int IDM_EXIT   = 2003;
+constexpr int IDM_SHOW         = 2001;
+constexpr int IDM_TOGGLE       = 2002;
+constexpr int IDM_EXIT         = 2003;
+constexpr int IDM_CHECK_UPDATE = 2004;
+
+struct UpdateCheckResult {
+    s2p::UpdateReleaseInfo info;
+    bool userInitiated = false;
+};
+
+struct UpdateDownloadResult {
+    bool ok = false;
+    std::wstring error;
+};
 
 s2p::SenderEngine* g_engine = nullptr;
 HWND g_hwnd = nullptr;
@@ -62,8 +78,12 @@ std::vector<s2p::DiscoveredPeer> g_peers;
 bool g_scanning = false;
 std::thread g_scanThread;
 std::thread g_connectThread;
+std::thread g_updateThread;
 std::atomic<bool> g_closing{false};
 std::atomic<bool> g_connectBusy{false};
+std::atomic<bool> g_updateBusy{false};
+bool g_promptOpen = false;
+s2p::UpdateReleaseInfo g_pendingUpdate{};
 
 std::wstring GetIniPath() {
     wchar_t buf[MAX_PATH]{};
@@ -89,6 +109,74 @@ std::wstring LoadLastIp() {
     wchar_t buf[128]{};
     GetPrivateProfileStringW(L"Sender", L"LastIp", L"", buf, _countof(buf), GetIniPath().c_str());
     return std::wstring(buf);
+}
+
+std::wstring DefaultUpdateButtonText() {
+    if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
+        return L"Update verfuegbar: v" + s2p::FormatAppVersion(g_pendingUpdate.version);
+    }
+    return L"Nach Updates suchen (v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L")";
+}
+
+void StartAsyncUpdateCheck(bool userInitiated) {
+    if (g_closing.load()) return;
+    if (g_updateBusy.exchange(true)) {
+        return;
+    }
+    if (g_hwnd && userInitiated) {
+        EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_UPDATE), FALSE);
+        SetDlgItemTextW(g_hwnd, IDC_BTN_UPDATE, L"Pruefe GitHub...");
+    }
+    if (g_updateThread.joinable()) g_updateThread.join();
+    g_updateThread = std::thread([userInitiated]() {
+        auto* res = new UpdateCheckResult{};
+        res->info = s2p::CheckForGitHubUpdate();
+        res->userInitiated = userInitiated;
+        if (!g_closing.load() && g_hwnd) {
+            PostMessageW(g_hwnd, WM_UPDATE_CHECK_DONE, 0, reinterpret_cast<LPARAM>(res));
+        } else {
+            delete res;
+            g_updateBusy = false;
+        }
+    });
+}
+
+void PromptAndApplyUpdate(HWND hwnd, const s2p::UpdateReleaseInfo& info) {
+    if (!info.valid || !info.updateAvailable || g_promptOpen || g_closing.load()) return;
+    g_promptOpen = true;
+
+    std::wostringstream msg;
+    msg << L"Es ist ein neues Screen2PC-Update auf GitHub verfuegbar!\r\n\r\n"
+        << L"Installierte Version: v" << s2p::FormatAppVersion(s2p::CurrentAppVersion()) << L"\r\n"
+        << L"Neue Version:         v" << s2p::FormatAppVersion(info.version)
+        << L" (" << info.tagName << L")\r\n\r\n"
+        << L"Moechtest du das Update jetzt automatisch herunterladen, entpacken und installieren?\r\n"
+        << L"(Der Virtual Display Treiber wird nur bei Aenderungen aktualisiert. Die App startet automatisch neu.)";
+
+    int ans = MessageBoxW(hwnd, msg.str().c_str(), L"Screen2PC Update verfuegbar", MB_YESNO | MB_ICONINFORMATION);
+    g_promptOpen = false;
+    if (ans != IDYES || g_closing.load()) {
+        return;
+    }
+
+    if (g_updateBusy.exchange(true)) {
+        return;
+    }
+    EnableWindow(GetDlgItem(hwnd, IDC_BTN_UPDATE), FALSE);
+    SetDlgItemTextW(hwnd, IDC_BTN_UPDATE, L"Lade Update herunter...");
+
+    if (g_updateThread.joinable()) g_updateThread.join();
+    s2p::UpdateReleaseInfo copyInfo = info;
+    g_updateThread = std::thread([copyInfo]() {
+        auto* dlRes = new UpdateDownloadResult{};
+        dlRes->ok = s2p::DownloadAndLaunchSelfUpdate(copyInfo, false, true, dlRes->error);
+        if (!g_closing.load() && g_hwnd) {
+            PostMessageW(g_hwnd, WM_UPDATE_DL_DONE, 0, reinterpret_cast<LPARAM>(dlRes));
+        } else {
+            delete dlRes;
+            g_updateBusy = false;
+        }
+    });
 }
 
 void UpdateUiFromState() {
@@ -318,9 +406,14 @@ void CreateUiControls(HWND hwnd) {
     addCtrl(L"BUTTON", L"Datei(en) an PC senden...", BS_PUSHBUTTON | WS_TABSTOP, 16, 274, 234, 28, IDC_BTN_SENDFILE);
     addCtrl(L"BUTTON", L"Downloads\\Screen2PC oeffnen", BS_PUSHBUTTON | WS_TABSTOP, 262, 274, 234, 28, IDC_BTN_OPEN_DL);
 
-    addCtrl(L"STATIC", L"", 0, 16, 310, 480, 36, IDC_DRIVER_LABEL);
-    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 348, 480, 40, IDC_STATUS_LABEL);
-    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 392, 480, 120, IDC_STATS_TEXT, g_monoFont);
+    HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start GitHub-Updates pruefen",
+                          BS_AUTOCHECKBOX | WS_TABSTOP, 16, 308, 240, 22, IDC_CHK_AUTOUPDATE);
+    SendMessageW(chkUpd, BM_SETCHECK, (LoadSetting(L"AutoUpdateCheck", 1) != 0) ? BST_CHECKED : BST_UNCHECKED, 0);
+    addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_PUSHBUTTON | WS_TABSTOP, 262, 306, 234, 28, IDC_BTN_UPDATE);
+
+    addCtrl(L"STATIC", L"", 0, 16, 342, 480, 36, IDC_DRIVER_LABEL);
+    addCtrl(L"STATIC", L"Status: Bereit", 0, 16, 380, 480, 40, IDC_STATUS_LABEL);
+    addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 16, 424, 480, 124, IDC_STATS_TEXT, g_monoFont);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -330,6 +423,7 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, IDM_SHOW, L"Fenster oeffnen");
     AppendMenuW(menu, MF_STRING, IDM_TOGGLE,
                 (g_engine && g_engine->IsConnected()) ? L"Trennen" : L"Verbinden");
+    AppendMenuW(menu, MF_STRING, IDM_CHECK_UPDATE, L"Nach Updates suchen");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Beenden");
     SetForegroundWindow(hwnd);
@@ -356,6 +450,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         UpdateUiFromState();
         StartAsyncDiscovery();
+        if (LoadSetting(L"AutoUpdateCheck", 1) != 0) {
+            StartAsyncUpdateCheck(false);
+        }
         return 0;
 
     case WM_COMMAND:
@@ -381,6 +478,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveSetting(L"KvmEnabled", checked ? 1 : 0);
             }
             return 0;
+        case IDC_CHK_AUTOUPDATE: {
+            bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_AUTOUPDATE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            SaveSetting(L"AutoUpdateCheck", checked ? 1 : 0);
+            return 0;
+        }
+        case IDC_BTN_UPDATE:
+            if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
+                PromptAndApplyUpdate(hwnd, g_pendingUpdate);
+            } else {
+                StartAsyncUpdateCheck(true);
+            }
+            return 0;
         case IDC_BTN_SENDFILE:
             if (g_engine) {
                 auto files = PickFilesDialog(hwnd);
@@ -401,6 +510,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_SHOW:
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
+            return 0;
+        case IDM_CHECK_UPDATE:
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
+                PromptAndApplyUpdate(hwnd, g_pendingUpdate);
+            } else {
+                StartAsyncUpdateCheck(true);
+            }
             return 0;
         case IDM_EXIT:
             DestroyWindow(hwnd);
@@ -463,6 +581,64 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_UPDATE_CHECK_DONE: {
+        auto* res = reinterpret_cast<UpdateCheckResult*>(lp);
+        g_updateBusy = false;
+        EnableWindow(GetDlgItem(hwnd, IDC_BTN_UPDATE), TRUE);
+
+        if (res && !g_closing.load()) {
+            if (res->info.valid && res->info.updateAvailable) {
+                g_pendingUpdate = res->info;
+                SetDlgItemTextW(hwnd, IDC_BTN_UPDATE, DefaultUpdateButtonText().c_str());
+
+                if (!res->userInitiated && !IsWindowVisible(hwnd)) {
+                    g_nid.uFlags = NIF_INFO;
+                    g_nid.dwInfoFlags = NIIF_INFO;
+                    wcscpy_s(g_nid.szInfoTitle, L"Screen2PC Update verfuegbar");
+                    std::wstring tip = L"Neue Version v" + s2p::FormatAppVersion(res->info.version) +
+                                       L" auf GitHub verfuegbar. Hier klicken zum Aktualisieren.";
+                    wcsncpy_s(g_nid.szInfo, tip.c_str(), _TRUNCATE);
+                    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+                    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+                } else {
+                    PromptAndApplyUpdate(hwnd, res->info);
+                }
+            } else {
+                SetDlgItemTextW(hwnd, IDC_BTN_UPDATE, DefaultUpdateButtonText().c_str());
+                if (res->userInitiated) {
+                    if (!res->info.valid) {
+                        std::wstring errMsg = L"Update-Pruefung auf GitHub fehlgeschlagen:\r\n" + res->info.error;
+                        MessageBoxW(hwnd, errMsg.c_str(), L"Screen2PC Update", MB_ICONWARNING);
+                    } else {
+                        std::wstring okMsg = L"Screen2PC Sender ist auf dem neuesten Stand (v" +
+                                             s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L").";
+                        MessageBoxW(hwnd, okMsg.c_str(), L"Screen2PC Update", MB_ICONINFORMATION);
+                    }
+                }
+            }
+        }
+        delete res;
+        return 0;
+    }
+
+    case WM_UPDATE_DL_DONE: {
+        auto* dlRes = reinterpret_cast<UpdateDownloadResult*>(lp);
+        g_updateBusy = false;
+        if (dlRes && dlRes->ok) {
+            delete dlRes;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        EnableWindow(GetDlgItem(hwnd, IDC_BTN_UPDATE), TRUE);
+        SetDlgItemTextW(hwnd, IDC_BTN_UPDATE, DefaultUpdateButtonText().c_str());
+        if (dlRes && !g_closing.load()) {
+            std::wstring msg = L"Update konnte nicht gestartet werden:\r\n" + dlRes->error;
+            MessageBoxW(hwnd, msg.c_str(), L"Screen2PC Update", MB_ICONERROR);
+        }
+        delete dlRes;
+        return 0;
+    }
+
     case WM_APP + 3:
         EnableWindow(GetDlgItem(hwnd, IDC_BTN_CONNECT), TRUE);
         UpdateUiFromState();
@@ -474,6 +650,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetForegroundWindow(hwnd);
         } else if (lp == WM_RBUTTONUP) {
             ShowTrayMenu(hwnd);
+        } else if (lp == NIN_BALLOONUSERCLICK) {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
+                PromptAndApplyUpdate(hwnd, g_pendingUpdate);
+            }
         }
         return 0;
 
@@ -489,6 +671,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_engine) g_engine->SignalStop();
         if (g_connectThread.joinable()) g_connectThread.join();
         if (g_scanThread.joinable()) g_scanThread.join();
+        if (g_updateThread.joinable()) g_updateThread.join();
         if (g_engine) g_engine->Disconnect();
         if (g_font) DeleteObject(g_font);
         if (g_monoFont) DeleteObject(g_monoFont);
@@ -529,10 +712,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     wc.lpszClassName = L"Screen2PCSenderWnd";
     RegisterClassExW(&wc);
 
+    std::wstring title = L"Screen2PC Sender v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L" (Surface)";
+
     g_hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"Screen2PC Sender (Surface)",
+        0, wc.lpszClassName, title.c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 530, 564,
+        CW_USEDEFAULT, CW_USEDEFAULT, 530, 600,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(g_hwnd, nCmdShow);

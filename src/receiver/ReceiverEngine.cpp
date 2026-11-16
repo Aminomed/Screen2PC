@@ -13,13 +13,20 @@ namespace s2p {
 
 namespace {
 
+struct EnumMonEntry {
+    MonitorDesc desc{};
+    HMONITOR hMon = nullptr;
+};
+
 BOOL CALLBACK MonitorEnumCb(HMONITOR hMon, HDC, LPRECT, LPARAM data) {
-    auto* list = reinterpret_cast<std::vector<MonitorDesc>*>(data);
+    auto* list = reinterpret_cast<std::vector<EnumMonEntry>*>(data);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     if (!GetMonitorInfoW(hMon, &mi)) return TRUE;
 
-    MonitorDesc md{};
+    EnumMonEntry entry{};
+    entry.hMon = hMon;
+    MonitorDesc& md = entry.desc;
     md.left = mi.rcMonitor.left;
     md.top = mi.rcMonitor.top;
     md.right = mi.rcMonitor.right;
@@ -36,8 +43,26 @@ BOOL CALLBACK MonitorEnumCb(HMONITOR hMon, HDC, LPRECT, LPARAM data) {
     }
 
     wcsncpy_s(md.friendlyName, _countof(md.friendlyName), mi.szDevice, _TRUNCATE);
-    list->push_back(md);
+    list->push_back(entry);
     return TRUE;
+}
+
+std::vector<EnumMonEntry> EnumerateLocalMonitorEntries() {
+    std::vector<EnumMonEntry> entries;
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumCb, reinterpret_cast<LPARAM>(&entries));
+    // Sort primary monitor first, then left-to-right
+    std::sort(entries.begin(), entries.end(), [](const EnumMonEntry& a, const EnumMonEntry& b) {
+        if (a.desc.isPrimary != b.desc.isPrimary) return a.desc.isPrimary > b.desc.isPrimary;
+        if (a.desc.left != b.desc.left) return a.desc.left < b.desc.left;
+        return a.desc.top < b.desc.top;
+    });
+    if (entries.size() > kMaxMonitors) {
+        entries.resize(kMaxMonitors);
+    }
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].desc.index = static_cast<uint32_t>(i);
+    }
+    return entries;
 }
 
 void CopyWideSafe(wchar_t* dst, size_t dstChars, const std::wstring& src) {
@@ -52,21 +77,54 @@ ReceiverEngine::~ReceiverEngine() {
 }
 
 std::vector<MonitorDesc> ReceiverEngine::EnumerateLocalMonitors() {
+    auto entries = EnumerateLocalMonitorEntries();
     std::vector<MonitorDesc> list;
-    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumCb, reinterpret_cast<LPARAM>(&list));
-    // Sort primary monitor first, then left-to-right
-    std::sort(list.begin(), list.end(), [](const MonitorDesc& a, const MonitorDesc& b) {
-        if (a.isPrimary != b.isPrimary) return a.isPrimary > b.isPrimary;
-        if (a.left != b.left) return a.left < b.left;
-        return a.top < b.top;
-    });
-    for (size_t i = 0; i < list.size(); ++i) {
-        list[i].index = static_cast<uint32_t>(i);
-    }
-    if (list.size() > kMaxMonitors) {
-        list.resize(kMaxMonitors);
+    list.reserve(entries.size());
+    for (const auto& e : entries) {
+        list.push_back(e.desc);
     }
     return list;
+}
+
+std::vector<MonitorDesc> ReceiverEngine::EnumerateLocalMonitorsWithHdr(std::vector<MonitorHdrInfo>& outHdr) {
+    auto entries = EnumerateLocalMonitorEntries();
+    std::vector<MonitorDesc> list;
+    list.reserve(entries.size());
+    outHdr.clear();
+    outHdr.reserve(entries.size());
+
+    for (const auto& e : entries) {
+        list.push_back(e.desc);
+        MonitorHdrInfo hdrInfo{};
+        D3D11Renderer::QueryMonitorHdrInfo(e.hMon, hdrInfo);
+        outHdr.push_back(std::move(hdrInfo));
+    }
+    return list;
+}
+
+void ReceiverEngine::RefreshLocalMonitorInfo() {
+    std::vector<MonitorHdrInfo> hdr;
+    auto mons = EnumerateLocalMonitorsWithHdr(hdr);
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    m_status.localMonitors = std::move(mons);
+    m_status.localMonitorHdr = std::move(hdr);
+}
+
+void ReceiverEngine::SetMonitorColorConfig(uint32_t monitorIndex, const MonitorColorConfig& cfg) {
+    if (monitorIndex >= kMaxMonitors) return;
+    MonitorColorConfig clamped = cfg;
+    ClampColorConfig(clamped);
+    {
+        std::lock_guard<std::mutex> lock(m_colorMutex);
+        m_colorConfigs[monitorIndex] = clamped;
+    }
+    m_colorGeneration[monitorIndex].fetch_add(1, std::memory_order_release);
+}
+
+MonitorColorConfig ReceiverEngine::GetMonitorColorConfig(uint32_t monitorIndex) const {
+    if (monitorIndex >= kMaxMonitors) return MonitorColorConfig{};
+    std::lock_guard<std::mutex> lock(m_colorMutex);
+    return m_colorConfigs[monitorIndex];
 }
 
 bool ReceiverEngine::Start(bool startFullscreen) {
@@ -74,7 +132,8 @@ bool ReceiverEngine::Start(bool startFullscreen) {
     m_stop = false;
     m_startFullscreen = startFullscreen;
 
-    auto mons = EnumerateLocalMonitors();
+    std::vector<MonitorHdrInfo> hdr;
+    auto mons = EnumerateLocalMonitorsWithHdr(hdr);
     auto ips = GetLocalIPv4Addresses();
 
     if (!m_discoverySock.Bind(kPortDiscovery, true)) {
@@ -91,6 +150,7 @@ bool ReceiverEngine::Start(bool startFullscreen) {
         m_status = ReceiverStatus{};
         m_status.running = true;
         m_status.localMonitors = mons;
+        m_status.localMonitorHdr = hdr;
         m_status.localIps = ips;
         m_status.stateText = L"Bereit - Warte auf Verbindung vom Surface (Port " +
                              std::to_wstring(kPortControl) + L")";
@@ -189,7 +249,8 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     std::memcpy(&helloSender, payload.data(), sizeof(helloSender));
     helloSender.senderName[_countof(helloSender.senderName) - 1] = L'\0';
 
-    auto mons = EnumerateLocalMonitors();
+    std::vector<MonitorHdrInfo> hdrList;
+    auto mons = EnumerateLocalMonitorsWithHdr(hdrList);
     HelloReceiverPayload helloResp{};
     CopyWideSafe(helloResp.pcName, _countof(helloResp.pcName), GetHostComputerName());
     helloResp.monitorCount = static_cast<uint32_t>(std::min<size_t>(mons.size(), kMaxMonitors));
@@ -231,6 +292,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
 
         auto w = std::make_unique<StreamReceiverWorker>();
         w->monitorIndex = i;
+        w->targetMonitorIndex = targetIdx;
         w->port = static_cast<uint16_t>(kPortStreamBase + i);
         w->targetMonitorRect = RECT{ md.left, md.top, md.right, md.bottom };
         w->expectedWidth = spec.width ? spec.width : md.width;
@@ -296,6 +358,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
         m_status.senderName = helloSender.senderName;
         m_status.senderIp = peerIp;
         m_status.localMonitors = mons;
+        m_status.localMonitorHdr = hdrList;
         m_status.stateText = L"Verbunden mit " + m_status.senderName + L" (" + Utf8ToWide(peerIp) +
                              L") - " + std::to_wstring(streamCount) + L" Display(s)";
     }
@@ -392,7 +455,11 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     sock.TuneLowLatency(4 * 1024 * 1024);
     sock.SetTimeouts(3000, 1500);
 
+    const uint32_t colorIdx = std::min<uint32_t>(w->targetMonitorIndex, kMaxMonitors - 1);
+    uint64_t lastColorGen = m_colorGeneration[colorIdx].load(std::memory_order_acquire);
+
     D3D11Renderer renderer;
+    renderer.SetColorConfig(GetMonitorColorConfig(colorIdx));
     if (!renderer.Create(w->monitorIndex, w->targetMonitorRect, w->expectedWidth, w->expectedHeight, w->startFullscreen)) {
         Logger::Instance().Error("RCV-RND", L"Failed to create D3D11Renderer for monitor " + std::to_wstring(w->monitorIndex));
         CoUninitialize();
@@ -441,6 +508,11 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         if (curGlobalKvm != lastGlobalKvm) {
             lastGlobalKvm = curGlobalKvm;
             renderer.SetKvmEnabled(curGlobalKvm);
+        }
+        uint64_t curColorGen = m_colorGeneration[colorIdx].load(std::memory_order_acquire);
+        if (curColorGen != lastColorGen) {
+            lastColorGen = curColorGen;
+            renderer.SetColorConfig(GetMonitorColorConfig(colorIdx));
         }
         renderer.PumpMessages();
         if (renderer.NeedsRepaint()) {

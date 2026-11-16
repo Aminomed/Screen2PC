@@ -1,0 +1,36 @@
+#include <winresrc.h>
+#include "../common/Version.h"
+
+LANGUAGE LANG_GERMAN, SUBLANG_GERMAN
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION SCREEN2PC_VERSION_MAJOR, SCREEN2PC_VERSION_MINOR, SCREEN2PC_VERSION_PATCH, SCREEN2PC_BUILD_NUMBER
+ PRODUCTVERSION SCREEN2PC_VERSION_MAJOR, SCREEN2PC_VERSION_MINOR, SCREEN2PC_VERSION_PATCH, SCREEN2PC_BUILD_NUMBER
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040704b0"
+        BEGIN
+            VALUE "CompanyName", "Screen2PC"
+            VALUE "FileDescription", "Screen2PC Sender (Surface)"
+            VALUE "FileVersion", SCREEN2PC_VERSION_RC_STR
+            VALUE "InternalName", "Screen2PC.Sender"
+            VALUE "OriginalFilename", "Screen2PC.Sender.exe"
+            VALUE "ProductName", "Screen2PC"
+            VALUE "ProductVersion", SCREEN2PC_VERSION_RC_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0407, 1200
+    END
+END

@@ -3,6 +3,7 @@
 #endif
 #include <windows.h>
 #include <objbase.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,10 @@
 #include <thread>
 #include <vector>
 
+#include "../common/Version.h"
+#include "../common/Autostart.h"
+#include "../common/ColorProfile.h"
+#include "../common/Updater.h"
 #include "../common/Protocol.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
@@ -190,6 +195,31 @@ void TestColorAndH264() {
         dec.Shutdown();
         decCpuOnly.Shutdown();
     };
+
+    // Neutral gray (128, 128, 128) BT.709 Studio round-trip must have zero chromatic cast
+    {
+        const uint32_t gw = 16, gh = 16;
+        std::vector<uint8_t> grayBgra(gw * gh * 4, 0);
+        for (size_t i = 0; i < gw * gh; ++i) {
+            grayBgra[i * 4 + 0] = 128;
+            grayBgra[i * 4 + 1] = 128;
+            grayBgra[i * 4 + 2] = 128;
+            grayBgra[i * 4 + 3] = 255;
+        }
+        std::vector<uint8_t> grayNv12(gw * gh * 3 / 2);
+        std::vector<uint8_t> grayRt(gw * gh * 4);
+        s2p::CpuBgraToNv12(grayBgra.data(), gw * 4, gw, gh, grayNv12.data());
+        s2p::CpuNv12ToBgra(grayNv12.data(), gw, grayNv12.data() + gw * gh, gw, gw, gh, grayRt.data());
+        CHECK(std::abs(static_cast<int>(grayRt[0]) - 128) <= 2 &&
+              std::abs(static_cast<int>(grayRt[1]) - 128) <= 2 &&
+              std::abs(static_cast<int>(grayRt[2]) - 128) <= 2,
+              "BT.709 Studio neutral gray BGRA<->NV12 round-trip shifted");
+        CHECK(grayRt[0] == grayRt[1] && grayRt[1] == grayRt[2],
+              "BT.709 Studio neutral gray introduced color tint");
+    }
+
+    CHECK(std::strcmp(SCREEN2PC_VERSION_RC_STR, SCREEN2PC_VERSION_STR) == 0,
+          "Version.h RC string macro diverges from C++ version string");
 
     testRes(640, 360);
     testRes(1920, 1080); // Macroblock-padded 1088 -> cropped 1080 check
@@ -499,6 +529,245 @@ void TestKvmInput() {
     std::cout << "[PASS] TestKvmInput\n";
 }
 
+void TestAutostartAndCli() {
+    CHECK(s2p::HasCliFlag(L"\"C:\\Program Files\\Screen2PC\\Screen2PC.Receiver.exe\" --TRAY", L"--tray"),
+          "HasCliFlag should match case-insensitively");
+    CHECK(!s2p::HasCliFlag(L"Screen2PC.Receiver.exe --other", L"--tray"),
+          "HasCliFlag should not match absent flag");
+    CHECK(s2p::HasTrayLaunchFlag(L"\"C:\\My App\\Screen2PC.Receiver.exe\" --tray"),
+          "HasTrayLaunchFlag failed on --tray");
+    CHECK(s2p::HasTrayLaunchFlag(L"Screen2PC.Receiver.exe -Minimized"),
+          "HasTrayLaunchFlag failed on -Minimized");
+    CHECK(!s2p::HasTrayLaunchFlag(L"Screen2PC.Receiver.exe"),
+          "HasTrayLaunchFlag unexpectedly matched bare command");
+    CHECK(!s2p::HasTrayLaunchFlag(nullptr),
+          "HasTrayLaunchFlag should handle nullptr safely");
+
+    std::wstring cmd = s2p::BuildAutostartCommand(L"C:\\Tools\\Screen 2 PC\\Screen2PC.Receiver.exe");
+    CHECK(cmd == L"\"C:\\Tools\\Screen 2 PC\\Screen2PC.Receiver.exe\" --tray",
+          "BuildAutostartCommand quoting mismatch");
+    CHECK(s2p::BuildAutostartCommand(L"").empty(), "Empty exe path must build empty command");
+
+    CHECK(s2p::ExtractExePathFromCommand(cmd) == L"C:\\Tools\\Screen 2 PC\\Screen2PC.Receiver.exe",
+          "ExtractExePathFromCommand failed on quoted command with args");
+    CHECK(s2p::ExtractExePathFromCommand(L"\"C:\\App\\rec.exe\"") == L"C:\\App\\rec.exe",
+          "ExtractExePathFromCommand failed on quoted bare command");
+    CHECK(s2p::ExtractExePathFromCommand(L"C:\\App\\rec.exe --tray") == L"C:\\App\\rec.exe",
+          "ExtractExePathFromCommand failed on unquoted command with args");
+    CHECK(s2p::ExtractExePathFromCommand(L"  C:\\App\\rec.exe  ") == L"C:\\App\\rec.exe",
+          "ExtractExePathFromCommand failed on trimmed bare command");
+    CHECK(s2p::ExtractExePathFromCommand(L"").empty(),
+          "ExtractExePathFromCommand failed on empty command");
+
+    std::cout << "[PASS] TestAutostartAndCli\n";
+}
+
+void TestHdrColorPipeline() {
+    s2p::MonitorColorConfig defCfg{};
+
+    // 1. SDR identity (osSdrWhiteScale ignored in SDR mode)
+    auto sdrCb = s2p::ComputeColorShaderConstants(defCfg, false, 3.0f, false);
+    CHECK(std::abs(sdrCb.params0[0] - 1.0f) < 1e-5f &&
+          std::abs(sdrCb.params0[3] - 1.0f) < 1e-5f &&
+          sdrCb.params1[3] < 0.5f,
+          "SDR default shader constants mismatch");
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    s2p::EvaluateColorPixelCpu(0.25f, 0.50f, 0.80f, sdrCb, r, g, b);
+    CHECK(std::abs(r - 0.25f) < 1e-4f && std::abs(g - 0.50f) < 1e-4f && std::abs(b - 0.80f) < 1e-4f,
+          "SDR identity color transform altered pixel values");
+
+    // 2. HDR scRGB + pure Gamma 2.2 + OS SDR White Scale (e.g. 240 nits -> 3.0x 80 nits)
+    auto hdrCb = s2p::ComputeColorShaderConstants(defCfg, true, 3.0f, false);
+    CHECK(std::abs(hdrCb.params0[0] - 2.20f) < 1e-4f &&
+          std::abs(hdrCb.params0[3] - 3.0f) < 1e-4f &&
+          hdrCb.params1[3] > 0.5f,
+          "HDR scRGB shader constants mismatch");
+
+    s2p::EvaluateColorPixelCpu(0.0f, 0.0f, 0.0f, hdrCb, r, g, b);
+    CHECK(std::abs(r) < 1e-5f && std::abs(g) < 1e-5f && std::abs(b) < 1e-5f,
+          "HDR black level did not stay at 0");
+
+    s2p::EvaluateColorPixelCpu(1.0f, 1.0f, 1.0f, hdrCb, r, g, b);
+    CHECK(std::abs(r - 3.0f) < 1e-4f && std::abs(g - 3.0f) < 1e-4f && std::abs(b - 3.0f) < 1e-4f,
+          "HDR peak SDR white did not scale to OS SDR white level");
+
+    const float expectedMid = std::pow(0.5f, 2.20f) * 3.0f;
+    s2p::EvaluateColorPixelCpu(0.5f, 0.5f, 0.5f, hdrCb, r, g, b);
+    CHECK(std::abs(r - expectedMid) < 1e-4f && std::abs(g - expectedMid) < 1e-4f && std::abs(b - expectedMid) < 1e-4f,
+          "HDR mid-gray Gamma 2.2 EOTF mismatch");
+
+    // 3. Cursor white-level parity (forces contrast/saturation = 1.0, keeps brightness & gains)
+    s2p::MonitorColorConfig tunedCfg = defCfg;
+    tunedCfg.brightnessPct = 120.0f;
+    tunedCfg.contrastPct = 130.0f;
+    tunedCfg.saturationPct = 50.0f;
+    auto cursorCb = s2p::ComputeColorShaderConstants(tunedCfg, true, 3.0f, true);
+    CHECK(std::abs(cursorCb.params0[1] - 1.0f) < 1e-5f &&
+          std::abs(cursorCb.params0[2] - 1.0f) < 1e-5f &&
+          std::abs(cursorCb.params0[3] - 3.6f) < 1e-4f,
+          "Cursor shader constants did not force neutral contrast/saturation");
+    s2p::EvaluateColorPixelCpu(1.0f, 0.0f, 0.0f, cursorCb, r, g, b);
+    CHECK(std::abs(r - 3.6f) < 1e-4f && std::abs(g) < 1e-5f && std::abs(b) < 1e-5f,
+          "Cursor chromaticity/brightness parity mismatch");
+
+    // 4. ClampColorConfig bounds
+    s2p::MonitorColorConfig lowCfg{ false, 10.0f, 0.5f, 10.0f, 0.0f, 10.0f, 10.0f, 10.0f };
+    s2p::ClampColorConfig(lowCfg);
+    CHECK(lowCfg.brightnessPct == 50.0f && std::abs(lowCfg.gamma - 1.60f) < 1e-4f &&
+          lowCfg.contrastPct == 60.0f && lowCfg.saturationPct == 50.0f &&
+          lowCfg.redGainPct == 70.0f && lowCfg.greenGainPct == 70.0f && lowCfg.blueGainPct == 70.0f,
+          "Lower ClampColorConfig bounds failed");
+
+    s2p::MonitorColorConfig highCfg{ true, 500.0f, 5.0f, 300.0f, 300.0f, 300.0f, 300.0f, 300.0f };
+    s2p::ClampColorConfig(highCfg);
+    CHECK(highCfg.brightnessPct == 200.0f && std::abs(highCfg.gamma - 2.80f) < 1e-4f &&
+          highCfg.contrastPct == 140.0f && highCfg.saturationPct == 160.0f &&
+          highCfg.redGainPct == 130.0f && highCfg.greenGainPct == 130.0f && highCfg.blueGainPct == 130.0f,
+          "Upper ClampColorConfig bounds failed");
+
+    // 5. Direct ColorShaderConstants desaturation (saturation = 0 -> BT.709 luma)
+    s2p::ColorShaderConstants grayCb{};
+    grayCb.params0[0] = 1.0f;
+    grayCb.params0[1] = 1.0f;
+    grayCb.params0[2] = 0.0f;
+    grayCb.params0[3] = 1.0f;
+    grayCb.params1[0] = 1.0f;
+    grayCb.params1[1] = 1.0f;
+    grayCb.params1[2] = 1.0f;
+    grayCb.params1[3] = 0.0f;
+    s2p::EvaluateColorPixelCpu(0.8f, 0.4f, 0.2f, grayCb, r, g, b);
+    const float expectedLuma = 0.2126f * 0.8f + 0.7152f * 0.4f + 0.0722f * 0.2f;
+    CHECK(std::abs(r - expectedLuma) < 1e-4f && std::abs(r - g) < 1e-5f && std::abs(g - b) < 1e-5f,
+          "BT.709 luma desaturation failed");
+
+    // 6. INI persistence round-trip in %TEMP%
+    wchar_t tempDir[MAX_PATH]{};
+    DWORD tn = GetTempPathW(MAX_PATH, tempDir);
+    CHECK(tn > 0 && tn < MAX_PATH, "GetTempPathW failed");
+    std::wstring iniPath = std::wstring(tempDir) + L"s2p_color_test_" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    DeleteFileW(iniPath.c_str());
+
+    s2p::MonitorColorConfig saved{};
+    saved.hdrOutputEnabled = false;
+    saved.brightnessPct = 135.0f;
+    saved.gamma = 2.35f;
+    saved.contrastPct = 112.0f;
+    saved.saturationPct = 85.0f;
+    saved.redGainPct = 95.0f;
+    saved.greenGainPct = 102.0f;
+    saved.blueGainPct = 108.0f;
+    s2p::SaveMonitorColorConfigIni(iniPath, 0, saved);
+
+    s2p::MonitorColorConfig loaded = s2p::LoadMonitorColorConfigIni(iniPath, 0);
+    CHECK(loaded.hdrOutputEnabled == false &&
+          std::abs(loaded.brightnessPct - 135.0f) < 0.01f &&
+          std::abs(loaded.gamma - 2.35f) < 0.01f &&
+          std::abs(loaded.contrastPct - 112.0f) < 0.01f &&
+          std::abs(loaded.saturationPct - 85.0f) < 0.01f &&
+          std::abs(loaded.redGainPct - 95.0f) < 0.01f &&
+          std::abs(loaded.greenGainPct - 102.0f) < 0.01f &&
+          std::abs(loaded.blueGainPct - 108.0f) < 0.01f,
+          "MonitorColorConfig INI round-trip mismatch");
+
+    s2p::MonitorColorConfig otherMon = s2p::LoadMonitorColorConfigIni(iniPath, 1);
+    CHECK(otherMon == defCfg, "Unconfigured monitor INI section did not return defaults");
+
+    DeleteFileW(iniPath.c_str());
+    std::cout << "[PASS] TestHdrColorPipeline\n";
+}
+
+void TestUpdaterParsing() {
+    s2p::AppVersion v{};
+    CHECK(s2p::ParseVersionString("v1.5.0.25", v) &&
+          v.major == 1 && v.minor == 5 && v.patch == 0 && v.build == 25,
+          "ParseVersionString failed on v1.5.0.25");
+    CHECK(s2p::ParseVersionString("V2.10.3-b42", v) &&
+          v.major == 2 && v.minor == 10 && v.patch == 3 && v.build == 42,
+          "ParseVersionString failed on V2.10.3-b42");
+    CHECK(s2p::ParseVersionString("1.5", v) &&
+          v.major == 1 && v.minor == 5 && v.patch == 0 && v.build == 0,
+          "ParseVersionString failed on short 1.5");
+    CHECK(!s2p::ParseVersionString("abc", v) && !s2p::ParseVersionString("1", v),
+          "ParseVersionString unexpectedly accepted invalid strings");
+
+    s2p::AppVersion v25{ 1, 5, 0, 25 };
+    s2p::AppVersion v24{ 1, 5, 0, 24 };
+    s2p::AppVersion vNextMajor{ 2, 0, 0, 0 };
+    s2p::AppVersion vNextPatch{ 1, 5, 1, 0 };
+    CHECK(s2p::CompareVersions(v25, v24) > 0, "CompareVersions build > failed");
+    CHECK(s2p::CompareVersions(v24, v25) < 0, "CompareVersions build < failed");
+    CHECK(s2p::CompareVersions(v25, v25) == 0, "CompareVersions equal failed");
+    CHECK(s2p::CompareVersions(vNextMajor, v25) > 0, "CompareVersions major failed");
+    CHECK(s2p::CompareVersions(vNextPatch, v25) > 0, "CompareVersions patch failed");
+
+    const std::string releaseJson = R"JSON({
+        "url": "https://api.github.com/repos/Aminomed/Screen2PC/releases/1",
+        "author": {
+            "login": "github-actions[bot]",
+            "tag_name": "v99.9.9.9",
+            "name": "Wrong Nested Name",
+            "draft": true
+        },
+        "tag_name": "v1.5.0.30",
+        "name": null,
+        "draft": false,
+        "prerelease": false,
+        "html_url": "https://github.com/Aminomed/Screen2PC/releases/tag/v1.5.0.30",
+        "body": null,
+        "assets": [
+            {
+                "name": "checksums.txt",
+                "size": 128,
+                "browser_download_url": "https://github.com/Aminomed/Screen2PC/releases/download/v1.5.0.30/checksums.txt"
+            },
+            {
+                "name": "Screen2PC-Windows-x64.zip",
+                "size": 1234567,
+                "browser_download_url": "https://github.com/Aminomed/Screen2PC/releases/download/v1.5.0.30/Screen2PC-Windows-x64.zip"
+            }
+        ]
+    })JSON";
+
+    s2p::UpdateReleaseInfo info{};
+    CHECK(s2p::ParseLatestReleaseJson(releaseJson, v25, info), "ParseLatestReleaseJson failed on valid release");
+    CHECK(info.valid && info.updateAvailable, "Expected valid available update from v1.5.0.25 -> v1.5.0.30");
+    CHECK(info.tagName == L"v1.5.0.30", "Depth-aware parser picked nested author.tag_name instead of root tag_name");
+    CHECK(info.releaseName == L"v1.5.0.30", "Null name should fall back to tagName");
+    CHECK(info.assetSize == 1234567ULL, "Asset size mismatch");
+    CHECK(info.downloadUrl == L"https://github.com/Aminomed/Screen2PC/releases/download/v1.5.0.30/Screen2PC-Windows-x64.zip",
+          "Asset ZIP selection mismatch");
+
+    s2p::UpdateReleaseInfo sameInfo{};
+    CHECK(s2p::ParseLatestReleaseJson(releaseJson, s2p::AppVersion{ 1, 5, 0, 30 }, sameInfo) &&
+          sameInfo.valid && !sameInfo.updateAvailable,
+          "Equal version must report updateAvailable=false");
+
+    s2p::UpdateReleaseInfo newerLocal{};
+    CHECK(s2p::ParseLatestReleaseJson(releaseJson, s2p::AppVersion{ 1, 5, 0, 31 }, newerLocal) &&
+          newerLocal.valid && !newerLocal.updateAvailable,
+          "Newer local build must report updateAvailable=false");
+
+    const std::string draftJson = R"JSON({
+        "tag_name": "v1.5.0.35",
+        "draft": true,
+        "assets": [
+            { "name": "Screen2PC-Windows-x64.zip", "size": 100000, "browser_download_url": "https://example.com/a.zip" }
+        ]
+    })JSON";
+    s2p::UpdateReleaseInfo draftInfo{};
+    CHECK(!s2p::ParseLatestReleaseJson(draftJson, v25, draftInfo), "Draft release must be rejected");
+
+    const std::string noAssetJson = R"JSON({
+        "tag_name": "v1.5.0.35",
+        "draft": false,
+        "assets": []
+    })JSON";
+    s2p::UpdateReleaseInfo noAssetInfo{};
+    CHECK(!s2p::ParseLatestReleaseJson(noAssetJson, v25, noAssetInfo), "Release without ZIP asset must be rejected");
+
+    std::cout << "[PASS] TestUpdaterParsing\n";
+}
+
 } // namespace
 
 int main() {
@@ -514,6 +783,9 @@ int main() {
     TestClipboardSync();
     TestFileTransfer();
     TestKvmInput();
+    TestAutostartAndCli();
+    TestHdrColorPipeline();
+    TestUpdaterParsing();
 
     CoUninitialize();
 

@@ -5,7 +5,9 @@
 #include <d3dcompiler.h>
 #include <shellapi.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -20,6 +22,11 @@ namespace {
 const char* kQuadShaderSrc = R"(
 cbuffer QuadCB : register(b0) {
     float4 rectNorm; // xy = offset in clip space (-1..1), zw = size in clip space
+};
+
+cbuffer ColorCB : register(b1) {
+    float4 params0; // x=gammaPower, y=contrast, z=saturation, w=whiteScale
+    float4 params1; // x=redGain, y=greenGain, z=blueGain, w=isHdrOutput
 };
 
 struct VSOut {
@@ -42,7 +49,17 @@ Texture2D tex0 : register(t0);
 SamplerState samp0 : register(s0);
 
 float4 PSMain(VSOut i) : SV_Target {
-    return tex0.Sample(samp0, i.uv);
+    float4 sampleCol = tex0.Sample(samp0, i.uv);
+    float3 rgb = saturate(sampleCol.rgb);
+    rgb = saturate((rgb - 0.5) * params0.y + 0.5);
+    rgb = pow(max(rgb, 1e-6), params0.x) * step(1e-6, rgb);
+    float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    rgb = lerp(luma.xxx, rgb, params0.z);
+    rgb = max(rgb, 0.0) * params1.xyz * params0.w;
+    if (params1.w < 0.5) {
+        rgb = saturate(rgb);
+    }
+    return float4(rgb, sampleCol.a);
 }
 )";
 
@@ -51,6 +68,42 @@ struct QuadCB {
 };
 
 const wchar_t* kRendererClass = L"Screen2PCRenderWnd";
+
+bool QueryDisplayConfigSdrWhiteScale(const wchar_t* gdiDeviceName, float& outScale) {
+    UINT32 numPaths = 0;
+    UINT32 numModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes) != ERROR_SUCCESS || numPaths == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(), &numModes, modes.data(), nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    for (UINT32 i = 0; i < numPaths; ++i) {
+        const auto& p = paths[i];
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = p.sourceInfo.adapterId;
+        srcName.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) == ERROR_SUCCESS &&
+            _wcsicmp(srcName.viewGdiDeviceName, gdiDeviceName) == 0) {
+            DISPLAYCONFIG_SDR_WHITE_LEVEL sdrWhite{};
+            sdrWhite.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            sdrWhite.header.size = sizeof(sdrWhite);
+            sdrWhite.header.adapterId = p.targetInfo.adapterId;
+            sdrWhite.header.id = p.targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&sdrWhite.header) == ERROR_SUCCESS && sdrWhite.SDRWhiteLevel >= 500) {
+                outScale = std::clamp(static_cast<float>(sdrWhite.SDRWhiteLevel) / 1000.0f, 1.0f, 12.5f);
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
 
 LRESULT CALLBACK StaticRenderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     D3D11Renderer* self = nullptr;
@@ -83,8 +136,83 @@ void RegisterRenderClassOnce() {
 
 } // namespace
 
+bool D3D11Renderer::QueryMonitorHdrInfo(HMONITOR hMon, MonitorHdrInfo& out) {
+    out = MonitorHdrInfo{};
+    out.colorSpaceLabel = L"SDR";
+    if (!hMon) return false;
+
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMon, &mi)) {
+        return false;
+    }
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    bool matched = false;
+    for (UINT ai = 0; !matched; ++ai) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(ai, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+
+        for (UINT oi = 0; !matched; ++oi) {
+            ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(oi, &output) == DXGI_ERROR_NOT_FOUND) break;
+
+            ComPtr<IDXGIOutput6> out6;
+            if (SUCCEEDED(output.As(&out6)) && out6) {
+                DXGI_OUTPUT_DESC1 d1{};
+                if (SUCCEEDED(out6->GetDesc1(&d1))) {
+                    if (d1.Monitor == hMon || _wcsicmp(d1.DeviceName, mi.szDevice) == 0) {
+                        matched = true;
+                        out.isHdr = (d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                        out.colorSpaceLabel = out.isHdr ? L"HDR10" : L"SDR";
+                        break;
+                    }
+                }
+            } else {
+                DXGI_OUTPUT_DESC d{};
+                if (SUCCEEDED(output->GetDesc(&d))) {
+                    if (d.Monitor == hMon || _wcsicmp(d.DeviceName, mi.szDevice) == 0) {
+                        matched = true;
+                        out.isHdr = false;
+                        out.colorSpaceLabel = L"SDR";
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (out.isHdr) {
+        float scale = 2.5f; // Default 200 nits if QueryDisplayConfig is unavailable
+        if (QueryDisplayConfigSdrWhiteScale(mi.szDevice, scale)) {
+            out.sdrWhiteScale = scale;
+        } else {
+            out.sdrWhiteScale = 2.5f;
+        }
+    } else {
+        out.sdrWhiteScale = 1.0f;
+    }
+    return matched;
+}
+
 D3D11Renderer::~D3D11Renderer() {
     Destroy();
+}
+
+void D3D11Renderer::SetColorConfig(const MonitorColorConfig& cfg) {
+    MonitorColorConfig clamped = cfg;
+    ClampColorConfig(clamped);
+    if (clamped.hdrOutputEnabled != m_colorConfig.hdrOutputEnabled && m_monitorIsHdr) {
+        m_needSwapChainRebuild = true;
+    }
+    if (clamped != m_colorConfig) {
+        m_colorConfig = clamped;
+        m_needRepaint = true;
+    }
 }
 
 void D3D11Renderer::UpdateTitle() {
@@ -97,9 +225,10 @@ void D3D11Renderer::UpdateTitle() {
     } else {
         kvmState = L"[KVM BEREIT (Klick ins Bild) - Strg+Alt+K]";
     }
+    std::wstring hdrTag = m_hdrSwapChain ? L" [HDR scRGB]" : L"";
     std::wstring title = L"Screen2PC Display " + std::to_wstring(m_monitorIndex + 1) +
                          L" (" + std::to_wstring(m_srcWidth) + L"x" + std::to_wstring(m_srcHeight) +
-                         L") - F11 Vollbild / ESC Fenster - " + kvmState;
+                         L")" + hdrTag + L" - F11 Vollbild / ESC Fenster - " + kvmState;
     SetWindowTextW(m_hwnd, title.c_str());
 }
 
@@ -311,7 +440,13 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
         Logger::Instance().Error("RND-WND", L"CreateWindowExW failed, err=" + std::to_wstring(GetLastError()));
         return false;
     }
-    UpdateTitle();
+
+    m_currentMonitor = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
+    MonitorHdrInfo hdrInfo{};
+    QueryMonitorHdrInfo(m_currentMonitor, hdrInfo);
+    m_monitorIsHdr = hdrInfo.isHdr;
+    m_osSdrWhiteScale = hdrInfo.sdrWhiteScale;
+    m_needSwapChainRebuild = false;
 
     RAWINPUTDEVICE rid{};
     rid.usUsagePage = 0x01;
@@ -331,6 +466,7 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
         Destroy();
         return false;
     }
+    UpdateTitle();
 
     ShowWindow(m_hwnd, (m_fullscreen && monitorIndex > 0) ? SW_SHOWNOACTIVATE : SW_SHOW);
     UpdateWindow(m_hwnd);
@@ -348,6 +484,7 @@ void D3D11Renderer::Destroy() {
     m_cursorTex.Reset();
     m_frameSrv.Reset();
     m_frameTex.Reset();
+    m_colorCb.Reset();
     m_quadCb.Reset();
     m_alphaBlend.Reset();
     m_sampler.Reset();
@@ -357,6 +494,9 @@ void D3D11Renderer::Destroy() {
     m_swapChain.Reset();
     m_context.Reset();
     m_device.Reset();
+    m_hdrSwapChain = false;
+    m_monitorIsHdr = false;
+    m_currentMonitor = nullptr;
 
     if (m_hwnd) {
         DestroyWindow(m_hwnd);
@@ -435,6 +575,13 @@ bool D3D11Renderer::CreateDeviceAndShaders() {
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(m_device->CreateBuffer(&cbd, nullptr, &m_quadCb))) return false;
 
+    D3D11_BUFFER_DESC ccbd{};
+    ccbd.ByteWidth = sizeof(ColorShaderConstants);
+    ccbd.Usage = D3D11_USAGE_DYNAMIC;
+    ccbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ccbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(m_device->CreateBuffer(&ccbd, nullptr, &m_colorCb))) return false;
+
     CreateDefaultCursorTexture();
     return true;
 }
@@ -478,6 +625,13 @@ void D3D11Renderer::CreateDefaultCursorTexture() {
 }
 
 bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
+    m_rtv.Reset();
+    m_swapChain.Reset();
+    if (m_context) {
+        m_context->OMSetRenderTargets(0, nullptr, nullptr);
+        m_context->Flush();
+    }
+
     ComPtr<IDXGIDevice> dxgiDev;
     ComPtr<IDXGIAdapter> adapter;
     ComPtr<IDXGIFactory2> factory;
@@ -487,21 +641,48 @@ bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
         return false;
     }
 
+    const bool wantHdr = m_monitorIsHdr && m_colorConfig.hdrOutputEnabled;
+    m_hdrSwapChain = false;
+
     DXGI_SWAP_CHAIN_DESC1 scd{};
-    scd.Width = w;
-    scd.Height = h;
-    scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    scd.Width = std::max<uint32_t>(w, 1);
+    scd.Height = std::max<uint32_t>(h, 1);
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.Scaling = DXGI_SCALING_STRETCH;
 
-    HRESULT hr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &m_swapChain);
-    if (FAILED(hr)) {
-        Logger::Instance().Error("RND-SC", L"CreateSwapChainForHwnd failed: " + FormatHr(hr));
-        return false;
+    if (wantHdr) {
+        scd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        HRESULT hrHdr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &m_swapChain);
+        if (SUCCEEDED(hrHdr) && m_swapChain) {
+            ComPtr<IDXGISwapChain3> sc3;
+            UINT support = 0;
+            if (SUCCEEDED(m_swapChain.As(&sc3)) &&
+                SUCCEEDED(sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support)) &&
+                (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
+                SUCCEEDED(sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709))) {
+                m_hdrSwapChain = true;
+            } else {
+                m_swapChain.Reset();
+            }
+        }
     }
+
+    if (!m_swapChain) {
+        scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        HRESULT hr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &m_swapChain);
+        if (FAILED(hr)) {
+            Logger::Instance().Error("RND-SC", L"CreateSwapChainForHwnd failed: " + FormatHr(hr));
+            return false;
+        }
+        ComPtr<IDXGISwapChain3> sc3;
+        if (SUCCEEDED(m_swapChain.As(&sc3))) {
+            sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        }
+    }
+
     factory->MakeWindowAssociation(m_hwnd, DXGI_MWA_NO_ALT_ENTER);
 
     ComPtr<ID3D11Texture2D> backBuf;
@@ -509,7 +690,37 @@ bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
         FAILED(m_device->CreateRenderTargetView(backBuf.Get(), nullptr, &m_rtv))) {
         return false;
     }
+
+    Logger::Instance().Info("RND-CLR",
+        L"Monitor #" + std::to_wstring(m_monitorIndex + 1) +
+        (m_hdrSwapChain
+            ? (L": scRGB 16-bit HDR active (whiteScale=" + std::to_wstring(m_osSdrWhiteScale) + L")")
+            : L": SDR 8-bit B8G8R8A8 active"));
     return true;
+}
+
+void D3D11Renderer::RebuildSwapChainIfNeeded() {
+    if (!m_hwnd) return;
+    HMONITOR curMon = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!m_needSwapChainRebuild && curMon == m_currentMonitor) {
+        return;
+    }
+
+    m_needSwapChainRebuild = false;
+    m_currentMonitor = curMon;
+
+    MonitorHdrInfo hdrInfo{};
+    QueryMonitorHdrInfo(curMon, hdrInfo);
+    bool wantHdr = hdrInfo.isHdr && m_colorConfig.hdrOutputEnabled;
+    bool monitorChangedHdr = (hdrInfo.isHdr != m_monitorIsHdr) || (wantHdr != m_hdrSwapChain);
+    m_monitorIsHdr = hdrInfo.isHdr;
+    m_osSdrWhiteScale = hdrInfo.sdrWhiteScale;
+
+    if (monitorChangedHdr) {
+        CreateSwapChain(m_winWidth, m_winHeight);
+        UpdateTitle();
+    }
+    m_needRepaint = true;
 }
 
 void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
@@ -709,10 +920,12 @@ void D3D11Renderer::PumpMessages() {
 }
 
 void D3D11Renderer::Present() {
+    RebuildSwapChainIfNeeded();
     if (!m_swapChain || !m_rtv || !m_frameSrv) return;
 
-    const float clear[4] = { 0.04f, 0.04f, 0.06f, 1.0f };
-    m_context->ClearRenderTargetView(m_rtv.Get(), clear);
+    const float clearHdr[4] = { 0.0004f, 0.0004f, 0.0008f, 1.0f };
+    const float clearSdr[4] = { 0.02f, 0.02f, 0.03f, 1.0f };
+    m_context->ClearRenderTargetView(m_rtv.Get(), m_hdrSwapChain ? clearHdr : clearSdr);
     m_context->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
 
     D3D11_VIEWPORT vp{};
@@ -739,8 +952,20 @@ void D3D11Renderer::Present() {
         offY = drawH * 0.5f;
     }
 
-    auto drawQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, bool blend) {
+    auto uploadColor = [&](bool isCursor) {
+        if (!m_colorCb) return;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(m_context->Map(m_colorCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            ColorShaderConstants cb = ComputeColorShaderConstants(m_colorConfig, m_hdrSwapChain, m_osSdrWhiteScale, isCursor);
+            std::memcpy(mapped.pData, &cb, sizeof(cb));
+            m_context->Unmap(m_colorCb.Get(), 0);
+            m_context->PSSetConstantBuffers(1, 1, m_colorCb.GetAddressOf());
+        }
+    };
+
+    auto drawQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, bool blend, bool isCursor) {
         if (!m_quadCb) return;
+        uploadColor(isCursor);
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (SUCCEEDED(m_context->Map(m_quadCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
             QuadCB cb{ x, y, w, h };
@@ -753,14 +978,14 @@ void D3D11Renderer::Present() {
         }
     };
 
-    drawQuad(offX, offY, drawW, drawH, m_frameSrv.Get(), false);
+    drawQuad(offX, offY, drawW, drawH, m_frameSrv.Get(), false, false);
 
     if (m_cursorVisible && m_cursorSrv && m_cursorW > 0 && m_cursorH > 0) {
         float cx = static_cast<float>(m_cursorX - static_cast<int32_t>(m_cursorHotX)) / static_cast<float>(m_srcWidth);
         float cy = static_cast<float>(m_cursorY - static_cast<int32_t>(m_cursorHotY)) / static_cast<float>(m_srcHeight);
         float cw = static_cast<float>(m_cursorW) / static_cast<float>(m_srcWidth);
         float ch = static_cast<float>(m_cursorH) / static_cast<float>(m_srcHeight);
-        drawQuad(offX + cx * drawW, offY - cy * drawH, cw * drawW, ch * drawH, m_cursorSrv.Get(), true);
+        drawQuad(offX + cx * drawW, offY - cy * drawH, cw * drawW, ch * drawH, m_cursorSrv.Get(), true, true);
     }
 
     // Immediate present (syncInterval = 0) for minimum display latency on LAN
@@ -782,11 +1007,21 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             return TRUE;
         }
         break;
-    case WM_MOVE:
+    case WM_DISPLAYCHANGE:
+        m_needSwapChainRebuild = true;
+        m_needRepaint = true;
+        return 0;
+    case WM_MOVE: {
+        HMONITOR curMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if (curMon != m_currentMonitor) {
+            m_needSwapChainRebuild = true;
+            m_needRepaint = true;
+        }
         if (m_kvmCaptured) {
             UpdateCursorClip();
         }
         return 0;
+    }
     case WM_SIZE: {
         UINT w = LOWORD(lp);
         UINT h = HIWORD(lp);

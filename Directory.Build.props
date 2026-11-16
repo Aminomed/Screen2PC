@@ -1,7 +1,17 @@
 <Project>
   <PropertyGroup>
     <SolutionRoot>$(MSBuildThisFileDirectory)</SolutionRoot>
+    <Screen2PCBuildNumber Condition="'$(Screen2PCBuildNumber)' == '' and '$(GITHUB_RUN_NUMBER)' != ''">$(GITHUB_RUN_NUMBER)</Screen2PCBuildNumber>
+    <Screen2PCBuildNumber Condition="'$(Screen2PCBuildNumber)' == ''">0</Screen2PCBuildNumber>
   </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(MSBuildProjectName)' != 'Screen2PC.Driver'">
+    <ClCompile>
+      <PreprocessorDefinitions>SCREEN2PC_BUILD_NUMBER=$(Screen2PCBuildNumber);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>SCREEN2PC_BUILD_NUMBER=$(Screen2PCBuildNumber);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
   <!-- Import WDK + matching SDK NuGet props for the UMDF v2 IddCx driver project -->
   <Import Project="$(MSBuildThisFileDirectory)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\build\native\Microsoft.Windows.WDK.x64.props"
           Condition="'$(MSBuildProjectName)' == 'Screen2PC.Driver' and '$(Platform)' == 'x64' and Exists('$(MSBuildThisFileDirectory)packages\Microsoft.Windows.WDK.x64.10.0.26100.2454\build\native\Microsoft.Windows.WDK.x64.props')" />

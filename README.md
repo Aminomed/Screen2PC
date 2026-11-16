@@ -9,10 +9,12 @@
 ### 1. Auf dem Gaming-PC (Empfaenger — 100 % treiberfrei!)
 > **Wichtig:** Auf dem PC wird **kein Treiber** installiert und **kein Test-Signing** aktiviert. Kernel-Anti-Cheat-Spiele bleiben vollstaendig unberuehrt.
 
-1. Entpacke `Screen2PC-Windows-x64.zip` (aus GitHub Actions -> Artifacts).
+1. Lade `Screen2PC-Windows-x64.zip` unter **GitHub Releases** herunter und entpacke das Archiv.
 2. Starte **`Screen2PC.Receiver.exe`**.
 3. Klicke einmal auf **"Windows Firewall Ports freigeben (Admin)"** (oeffnet UDP `48210` + TCP `48211–48215` im lokalen Netz).
-4. Der Empfaenger erkennt automatisch beide PC-Monitore (z. B. `#1 2560x1440` und `#2 1920x1080`) und wartet im System-Tray.
+4. Der Empfaenger erkennt automatisch beide PC-Monitore (inkl. `[HDR]` / `[SDR]`-Status) und wartet im System-Tray.
+5. **Autostart im System-Tray (Task-Manager kompatibel):** Setze den Haken **"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"**. `Screen2PC Receiver (PC)` startet beim Login unsichtbar (`--tray`) ins System-Tray und ist auch direkt unter **Windows Task-Manager -> Autostart-Apps** sichtbar und steuerbar.
+6. **HDR & Farbangleichung pro Monitor:** Falls ein Monitor mit **Windows HDR** laeuft und Farben verwaschen/anders aussehen, rendert der Receiver auf diesem Bildschirm automatisch in **16-Bit scRGB (`R16G16B16A16_FLOAT`)** mit reiner **Gamma-2.2-EOTF** und Uebernahme des Windows **SDR-Weisslevels**. Feintuning (Helligkeit, Gamma, Kontrast, Saettigung, RGB-Anteile pro Monitor) ist live im Fenster **"Farbe & HDR pro Monitor anpassen..."** moeglich (`receiver.ini`).
 
 ### 2. Auf dem Surface (Sender)
 1. Entpacke `Screen2PC-Windows-x64.zip` (bei Browser-Downloads ggf. ZIP vorher per *Rechtsklick -> Eigenschaften -> Zulassen* entsperren; bei SmartScreen *"Unbekannter Herausgeber"* auf *"Weitere Informationen -> Trotzdem ausfuehren"* klicken — `install_driver.ps1` fuehrt zusaetzlich automatisch `Unblock-File` aus).
@@ -23,7 +25,7 @@
    *(Das Skript installiert das lokale Test-Zertifikat in `Root` + `TrustedPublisher`. Falls Windows Code Integrity trotz Zertifikat Problem 52 meldet, waere `bcdedit /set testsigning on` auf dem Surface noetig, was bei aktivem Secure Boot blockiert ist — alternativ jederzeit treiberfrei mit **Spiegeln** arbeiten.)*
 3. Starte **`Screen2PC.Sender.exe`**.
 4. Waehle den automatisch gefundenen PC (oder gib die PC-IP ein), waehle Modus (**Erweitern Alle Monitore**, **Erweitern Monitor 1**, **Erweitern Monitor 2** oder **Spiegeln**) sowie Codec:
-   - **H.264 Low-Latency:** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC (inkl. CPU-MFT-Fallback).
+   - **H.264 Low-Latency:** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC (inkl. CPU-MFT-Fallback & BT.709 Colorimetry).
    - **Delta Lossless (4:4:4):** Nutzt DXGI-Dirty-Rects + verlustfreien Tile-RLE-Codec fuer gestochen scharfen Text/Code.
 5. Klicke **Verbinden** (oder jederzeit global via **`Ctrl + Shift + K`**).
    - Im Vollbild auf dem PC schaltet **`F11`** / **`ESC`** zwischen randlosem Vollbild und Fenster um (**`ESC`** gibt zusaetzlich sofort den KVM-Mausfokus frei).
@@ -31,6 +33,7 @@
    - **Quick File Transfer:** Dateien einfach per **Drag & Drop** ins Hauptfenster oder direkt in ein gestreamtes Monitorfenster ziehen (oder *"Datei(en) senden..."* nutzen); empfangene Dateien landen in `%USERPROFILE%\Downloads\Screen2PC`.
    - **KVM (Maus & Tastatur PC -> Surface):** Klick ins Streamfenster (oder Vollbild-Fokus) bindet die PC-Maus nahtlos auf das gesamte Surface-Desktop-Setup (Du kannst frei ueber alle PC-Monitore **und** direkt auf den physischen Surface-Bildschirm hinueberfahren, um Fenster herueberzuziehen; **`ESC`** oder **`Strg + Alt + K`** gibt die PC-Maus jederzeit wieder frei — komplett ohne Treiber oder Global Hooks auf dem PC).
    - **Bitrate & Flussigkeit:** Einstellbar zwischen **`25 / 50 / 80 (Standard) / 120 / 200 Mbit/s`** bei voller Monitor-Refreshrate (bis 120 Hz).
+   - **GitHub Auto-Update (Sender & Empfaenger):** Beide Apps pruefen auf Wunsch beim Start (oder manuell per *"Nach Updates suchen"* Button / Tray-Menue) die neueste Version auf GitHub Releases, laden `Screen2PC-Windows-x64.zip` direkt herunter und aktualisieren sich atomar im Ordner ohne manuelles Entpacken (auf dem Surface wird der Display-Treiber nur bei echten Treiber-Aenderungen neu installiert).
 
 ---
 
@@ -40,8 +43,8 @@
 |---|---|---|---|
 | `Screen2PC.Driver` (`IddCx 1.2`) | Nur Surface | UMDF v2 User-Mode Display Driver | Erzeugt 0..2 virtuelle Monitore dynamisch in der exakten Aufloesung der PC-Monitore ohne Kernel-`.sys`. Kommunikation via Named Pipe `\\.\pipe\Screen2PC_VDD` (mit `AU`-ACL) + `%ProgramData%\Screen2PC\monitors.cfg` umgeht das bekannte `IndirectKmd` `CreateFile` Access-Denied-Problem. |
 | `Screen2PC.DriverSetup` | Nur Surface | SetupAPI / NewDev / CfgMgr32 | Eigenstaendiges CLI zur Treiber-Installation ohne externes `devcon.exe`. |
-| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + Winsock2 | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus; `SendInput` im User-Mode fuer KVM. |
-| `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 + Media Foundation (DXVA/NVDEC) + Winsock2 | Reiner User-Mode-Prozess. Kein Treiber, kein Kernel-Hook (`SetWindowsHookEx`), Anti-Cheat-sicher. |
+| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + WinHTTP | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus; `SendInput` im User-Mode fuer KVM; GitHub Release Auto-Updater. |
+| `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 (`scRGB` HDR/SDR) + Media Foundation + WinHTTP | Reiner User-Mode-Prozess. Kein Treiber, kein Kernel-Hook (`SetWindowsHookEx`), Anti-Cheat-sicher. Task-Manager-Autostart (`HKCU\...\Run` + `VERSIONINFO`), pro-Monitor HDR/Gamma-2.2-Kalibrierung & Auto-Updater. |
 
 ### Warum reines C++20 statt ".NET 8 + C++ Core"?
 - **Vorteile von .NET 8 + C++ Core:** Schnellere GUI-Entwicklung (WPF/WinUI 3, XAML Data-Binding), komfortables Settings-/JSON-Handling.

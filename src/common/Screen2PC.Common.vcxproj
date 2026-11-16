@@ -60,6 +60,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Protocol.h" />
+    <ClInclude Include="Version.h" />
     <ClInclude Include="Logger.h" />
     <ClInclude Include="NetSocket.h" />
     <ClInclude Include="CodecDelta.h" />
@@ -67,6 +68,9 @@
     <ClInclude Include="ClipboardSync.h" />
     <ClInclude Include="FileTransfer.h" />
     <ClInclude Include="KvmInput.h" />
+    <ClInclude Include="Autostart.h" />
+    <ClInclude Include="ColorProfile.h" />
+    <ClInclude Include="Updater.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Logger.cpp" />
@@ -76,6 +80,9 @@
     <ClCompile Include="ClipboardSync.cpp" />
     <ClCompile Include="FileTransfer.cpp" />
     <ClCompile Include="KvmInput.cpp" />
+    <ClCompile Include="Autostart.cpp" />
+    <ClCompile Include="ColorProfile.cpp" />
+    <ClCompile Include="Updater.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "**" ]
 
+permissions:
+  contents: write
+
 jobs:
   build-and-test:
     runs-on: windows-2022
@@ -101,3 +104,41 @@ jobs:
           name: Screen2PC-Windows-x64
           path: dist/Screen2PC-Windows-x64.zip
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $verHeader = Get-Content -Path "src\common\Version.h" -Raw
+          $maj = [regex]::Match($verHeader, '#define\s+SCREEN2PC_VERSION_MAJOR\s+(\d+)').Groups[1].Value
+          $min = [regex]::Match($verHeader, '#define\s+SCREEN2PC_VERSION_MINOR\s+(\d+)').Groups[1].Value
+          $pat = [regex]::Match($verHeader, '#define\s+SCREEN2PC_VERSION_PATCH\s+(\d+)').Groups[1].Value
+          if (-not $maj -or -not $min -or -not $pat) {
+            throw "Failed to parse version macros from src\common\Version.h"
+          }
+          $ver = "$maj.$min.$pat.$env:GITHUB_RUN_NUMBER"
+          $tag = "v$ver"
+          $zip = "dist\Screen2PC-Windows-x64.zip"
+          Write-Host "Publishing GitHub Release $tag ($zip) for $env:GITHUB_REPOSITORY..."
+
+          $notes = @(
+            "Automatischer Screen2PC Windows x64 Release-Build (**v$ver**).",
+            "",
+            "- Alle C++ Unit- & Integrations-Tests bestanden",
+            "- UMDF v2 IddCx Treiberpaket via ``infverif.exe`` und ``Inf2Cat.exe`` geprueft",
+            "- Entpacken & Ausfuehren auf Surface (Sender) und PC (Empfaenger — 100 % treiberfrei)",
+            "- Integrierter GitHub Auto-Updater aktualisiert kuenftige Releases direkt per Klick in der App"
+          ) -join "`n"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
+            gh release edit $tag --repo $env:GITHUB_REPOSITORY --title "Screen2PC $tag" --notes $notes --latest
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed with exit code $LASTEXITCODE" }
+          } else {
+            gh release create $tag $zip --repo $env:GITHUB_REPOSITORY --title "Screen2PC $tag" --notes $notes --latest
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
+          }

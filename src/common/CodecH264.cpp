@@ -1,5 +1,6 @@
 #include "CodecH264.h"
 #include "Logger.h"
+#include <d3d11_1.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mferror.h>
@@ -20,6 +21,59 @@ namespace {
 
 inline uint8_t ClampByte(int v) {
     return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+void SetBt709MediaTypeAttributes(IMFMediaType* mt) {
+    if (!mt) return;
+    mt->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709);
+    mt->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709);
+    mt->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
+    mt->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+}
+
+void ClearColorMediaTypeAttributes(IMFMediaType* mt) {
+    if (!mt) return;
+    mt->DeleteItem(MF_MT_VIDEO_PRIMARIES);
+    mt->DeleteItem(MF_MT_TRANSFER_FUNCTION);
+    mt->DeleteItem(MF_MT_YUV_MATRIX);
+    mt->DeleteItem(MF_MT_VIDEO_NOMINAL_RANGE);
+}
+
+void ConfigureVideoProcessorBt709(ID3D11VideoContext* videoCtx, ID3D11VideoProcessor* vp, bool bgraToNv12) {
+    if (!videoCtx || !vp) return;
+    videoCtx->VideoProcessorSetStreamAutoProcessingMode(vp, 0, FALSE);
+
+    Microsoft::WRL::ComPtr<ID3D11VideoContext1> vc1;
+    if (SUCCEEDED(videoCtx->QueryInterface(IID_PPV_ARGS(&vc1))) && vc1) {
+        if (bgraToNv12) {
+            vc1->VideoProcessorSetStreamColorSpace1(vp, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            vc1->VideoProcessorSetOutputColorSpace1(vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+        } else {
+            vc1->VideoProcessorSetStreamColorSpace1(vp, 0, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+            vc1->VideoProcessorSetOutputColorSpace1(vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        }
+        return;
+    }
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE rgbFull{};
+    rgbFull.Usage = 0;
+    rgbFull.RGB_Range = 0;
+    rgbFull.YCbCr_Matrix = 1; // BT.709
+    rgbFull.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE yuvStudio{};
+    yuvStudio.Usage = 0;
+    yuvStudio.RGB_Range = 1;
+    yuvStudio.YCbCr_Matrix = 1; // BT.709
+    yuvStudio.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+
+    if (bgraToNv12) {
+        videoCtx->VideoProcessorSetStreamColorSpace(vp, 0, &rgbFull);
+        videoCtx->VideoProcessorSetOutputColorSpace(vp, &yuvStudio);
+    } else {
+        videoCtx->VideoProcessorSetStreamColorSpace(vp, 0, &yuvStudio);
+        videoCtx->VideoProcessorSetOutputColorSpace(vp, &rgbFull);
+    }
 }
 
 bool ContainsIdrNalu(const uint8_t* data, size_t size) {
@@ -60,6 +114,7 @@ HRESULT SetOutputSampleBuffer(IMFTransform* mft, DWORD streamId, DWORD bufSize, 
 } // namespace
 
 void CpuBgraToNv12(const uint8_t* bgra, uint32_t bgraStride, uint32_t width, uint32_t height, uint8_t* nv12Out) {
+    // BT.709 Studio Range (Y: 16..235, UV: 16..240) matching D3D11 VideoProcessor & H.264 VUI
     uint8_t* yPlane = nv12Out;
     uint8_t* uvPlane = nv12Out + static_cast<size_t>(width) * height;
 
@@ -70,7 +125,7 @@ void CpuBgraToNv12(const uint8_t* bgra, uint32_t bgraStride, uint32_t width, uin
             int b = row[x * 4 + 0];
             int g = row[x * 4 + 1];
             int r = row[x * 4 + 2];
-            int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            int yVal = ((748 * r + 2516 * g + 254 * b + 2048) >> 12) + 16;
             yRow[x] = ClampByte(yVal);
         }
     }
@@ -83,8 +138,8 @@ void CpuBgraToNv12(const uint8_t* bgra, uint32_t bgraStride, uint32_t width, uin
             int b = (r0[x * 4 + 0] + r0[(x + 1) * 4 + 0] + r1[x * 4 + 0] + r1[(x + 1) * 4 + 0]) >> 2;
             int g = (r0[x * 4 + 1] + r0[(x + 1) * 4 + 1] + r1[x * 4 + 1] + r1[(x + 1) * 4 + 1]) >> 2;
             int r = (r0[x * 4 + 2] + r0[(x + 1) * 4 + 2] + r1[x * 4 + 2] + r1[(x + 1) * 4 + 2]) >> 2;
-            int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-            int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            int uVal = ((-412 * r - 1387 * g + 1799 * b + 2048) >> 12) + 128;
+            int vVal = ((1799 * r - 1634 * g - 165 * b + 2048) >> 12) + 128;
             uvRow[x + 0] = ClampByte(uVal);
             uvRow[x + 1] = ClampByte(vVal);
         }
@@ -92,6 +147,7 @@ void CpuBgraToNv12(const uint8_t* bgra, uint32_t bgraStride, uint32_t width, uin
 }
 
 void CpuNv12ToBgra(const uint8_t* yPlane, uint32_t yStride, const uint8_t* uvPlane, uint32_t uvStride, uint32_t width, uint32_t height, uint8_t* bgraOut) {
+    // BT.709 Studio Range -> Full RGB
     for (uint32_t y = 0; y < height; ++y) {
         const uint8_t* yRow = yPlane + static_cast<size_t>(y) * yStride;
         const uint8_t* uvRow = uvPlane + static_cast<size_t>(y / 2) * uvStride;
@@ -101,9 +157,9 @@ void CpuNv12ToBgra(const uint8_t* yPlane, uint32_t yStride, const uint8_t* uvPla
             uint32_t uvX = (x & ~1u);
             int d = static_cast<int>(uvRow[uvX + 0]) - 128;
             int e = static_cast<int>(uvRow[uvX + 1]) - 128;
-            int r = (298 * c + 409 * e + 128) >> 8;
-            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-            int b = (298 * c + 516 * d + 128) >> 8;
+            int r = (4769 * c + 7343 * e + 2048) >> 12;
+            int g = (4769 * c - 873 * d - 2183 * e + 2048) >> 12;
+            int b = (4769 * c + 8652 * d + 2048) >> 12;
             dstRow[x * 4 + 0] = ClampByte(b);
             dstRow[x * 4 + 1] = ClampByte(g);
             dstRow[x * 4 + 2] = ClampByte(r);
@@ -312,8 +368,13 @@ bool H264Encoder::InitMft(bool tryHardware) {
         MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
+        SetBt709MediaTypeAttributes(outType.Get());
 
         hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
+        if (FAILED(hr)) {
+            ClearColorMediaTypeAttributes(outType.Get());
+            hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
+        }
         if (FAILED(hr)) continue;
 
         // Configure input type (NV12)
@@ -330,7 +391,13 @@ bool H264Encoder::InitMft(bool tryHardware) {
                 MFSetAttributeRatio(availIn.Get(), MF_MT_FRAME_RATE, m_fps, 1);
                 MFSetAttributeRatio(availIn.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
                 availIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-                if (SUCCEEDED(candidate->SetInputType(m_inputStreamId, availIn.Get(), 0))) {
+                SetBt709MediaTypeAttributes(availIn.Get());
+                hr = candidate->SetInputType(m_inputStreamId, availIn.Get(), 0);
+                if (FAILED(hr)) {
+                    ClearColorMediaTypeAttributes(availIn.Get());
+                    hr = candidate->SetInputType(m_inputStreamId, availIn.Get(), 0);
+                }
+                if (SUCCEEDED(hr)) {
                     inputOk = true;
                     break;
                 }
@@ -345,7 +412,13 @@ bool H264Encoder::InitMft(bool tryHardware) {
                 MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, m_fps, 1);
                 MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
                 inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-                inputOk = SUCCEEDED(candidate->SetInputType(m_inputStreamId, inType.Get(), 0));
+                SetBt709MediaTypeAttributes(inType.Get());
+                hr = candidate->SetInputType(m_inputStreamId, inType.Get(), 0);
+                if (FAILED(hr)) {
+                    ClearColorMediaTypeAttributes(inType.Get());
+                    hr = candidate->SetInputType(m_inputStreamId, inType.Get(), 0);
+                }
+                inputOk = SUCCEEDED(hr);
             }
         }
         if (!inputOk) continue;
@@ -407,6 +480,7 @@ bool H264Encoder::EnsureVideoProcessor() {
 
     if (FAILED(m_videoDev->CreateVideoProcessorEnumerator(&cdesc, &m_vpEnum))) return false;
     if (FAILED(m_videoDev->CreateVideoProcessor(m_vpEnum.Get(), 0, &m_vp))) return false;
+    ConfigureVideoProcessorBt709(m_videoCtx.Get(), m_vp.Get(), true);
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = m_width;
@@ -801,8 +875,13 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uin
     MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, m_width, m_height);
     MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, 60, 1);
     inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    SetBt709MediaTypeAttributes(inType.Get());
 
     hr = m_mft->SetInputType(0, inType.Get(), 0);
+    if (FAILED(hr)) {
+        ClearColorMediaTypeAttributes(inType.Get());
+        hr = m_mft->SetInputType(0, inType.Get(), 0);
+    }
     if (FAILED(hr)) {
         Logger::Instance().Error("H264_DEC_INTYPE", L"SetInputType failed: " + FormatHr(hr));
         Shutdown();
@@ -888,6 +967,7 @@ bool H264Decoder::EnsureVideoProcessor(uint32_t width, uint32_t height) {
 
     if (FAILED(m_videoDev->CreateVideoProcessorEnumerator(&cdesc, &m_vpEnum))) return false;
     if (FAILED(m_videoDev->CreateVideoProcessor(m_vpEnum.Get(), 0, &m_vp))) return false;
+    ConfigureVideoProcessorBt709(m_videoCtx.Get(), m_vp.Get(), false);
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = width;

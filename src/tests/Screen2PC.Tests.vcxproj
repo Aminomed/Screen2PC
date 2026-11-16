@@ -47,7 +47,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;winhttp.lib;advapi32.lib;shell32.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -63,7 +63,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;winhttp.lib;advapi32.lib;shell32.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

@@ -4,7 +4,7 @@
 #endif
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdint>
 #include <functional>
@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include "../common/Protocol.h"
+#include "../common/ColorProfile.h"
 
 namespace s2p {
 
@@ -68,6 +69,14 @@ public:
                       const uint8_t* shapeData,
                       size_t shapeDataSize);
 
+    static bool QueryMonitorHdrInfo(HMONITOR hMon, MonitorHdrInfo& out);
+
+    void SetColorConfig(const MonitorColorConfig& cfg);
+    MonitorColorConfig GetColorConfig() const { return m_colorConfig; }
+    bool IsHdrSwapChain() const { return m_hdrSwapChain; }
+    bool IsMonitorHdr() const { return m_monitorIsHdr; }
+    float OsSdrWhiteScale() const { return m_osSdrWhiteScale; }
+
     void ToggleFullscreen();
     void SetFullscreen(bool fullscreen);
     void PumpMessages();
@@ -89,6 +98,7 @@ private:
     bool CreateDeviceAndShaders();
     void CreateDefaultCursorTexture();
     bool CreateSwapChain(uint32_t w, uint32_t h);
+    void RebuildSwapChainIfNeeded();
     void ResizeSwapChain(uint32_t w, uint32_t h);
     void UpdateTitle();
     void SetKvmCapture(bool captured);
@@ -123,6 +133,13 @@ private:
     LONG m_lastAbsRawX = 0;
     LONG m_lastAbsRawY = 0;
 
+    HMONITOR m_currentMonitor = nullptr;
+    bool m_monitorIsHdr = false;
+    float m_osSdrWhiteScale = 1.0f;
+    bool m_hdrSwapChain = false;
+    bool m_needSwapChainRebuild = false;
+    MonitorColorConfig m_colorConfig{};
+
     HWND m_hwnd = nullptr;
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
@@ -135,6 +152,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_sampler;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_alphaBlend;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_quadCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> m_colorCb;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_frameTex;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_frameSrv;

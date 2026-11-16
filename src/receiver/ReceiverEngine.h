@@ -15,6 +15,7 @@
 #include "../common/NetSocket.h"
 #include "../common/ClipboardSync.h"
 #include "../common/FileTransfer.h"
+#include "../common/ColorProfile.h"
 
 namespace s2p {
 
@@ -36,6 +37,7 @@ struct ReceiverStatus {
     std::string senderIp;
     std::wstring stateText;
     std::vector<MonitorDesc> localMonitors;
+    std::vector<MonitorHdrInfo> localMonitorHdr;
     std::vector<std::string> localIps;
     std::vector<ReceiverStreamStats> streams;
     FileTransferStats fileStats;
@@ -50,14 +52,18 @@ public:
     ReceiverEngine& operator=(const ReceiverEngine&) = delete;
 
     static std::vector<MonitorDesc> EnumerateLocalMonitors();
+    static std::vector<MonitorDesc> EnumerateLocalMonitorsWithHdr(std::vector<MonitorHdrInfo>& outHdr);
 
     bool Start(bool startFullscreen = true);
     void Stop();
     void DisconnectSession();
+    void RefreshLocalMonitorInfo();
     void SetStartFullscreen(bool fs) { m_startFullscreen = fs; }
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
     void SetKvmEnabled(bool enabled) { m_kvmEnabled = enabled; }
     bool IsKvmEnabled() const { return m_kvmEnabled.load(); }
+    void SetMonitorColorConfig(uint32_t monitorIndex, const MonitorColorConfig& cfg);
+    MonitorColorConfig GetMonitorColorConfig(uint32_t monitorIndex) const;
     size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
 
     ReceiverStatus GetStatus() const;
@@ -68,6 +74,7 @@ private:
     void SendKvmKey(const KvmKeyEvent& ev);
     struct StreamReceiverWorker {
         uint32_t monitorIndex = 0;
+        uint32_t targetMonitorIndex = 0;
         uint16_t port = kPortStreamBase;
         RECT targetMonitorRect{};
         uint32_t expectedWidth = 1920;
@@ -95,6 +102,10 @@ private:
     std::atomic<bool> m_startFullscreen{true};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
+
+    mutable std::mutex m_colorMutex;
+    MonitorColorConfig m_colorConfigs[kMaxMonitors]{};
+    std::atomic<uint64_t> m_colorGeneration[kMaxMonitors]{};
 
     UdpSocket m_discoverySock;
     TcpSocket m_controlListenSock;
