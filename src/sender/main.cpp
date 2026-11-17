@@ -19,6 +19,7 @@
 
 #include "../common/AppIcon.h"
 #include "../common/Autostart.h"
+#include "../common/BitratePresets.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
 #include "../common/Updater.h"
@@ -320,12 +321,12 @@ void OnToggleConnect() {
     cfg.codec = (codecIdx == 1) ? s2p::CodecType::DeltaLossless : s2p::CodecType::H264;
 
     LRESULT brIdx = SendDlgItemMessageW(g_hwnd, IDC_BITRATE_COMBO, CB_GETCURSEL, 0, 0);
-    const uint32_t bitrates[] = { 25, 50, 80, 120, 200 };
-    cfg.bitrateMbps = (brIdx >= 0 && brIdx < 5) ? bitrates[brIdx] : 80;
+    cfg.bitrateMbps = s2p::BitrateFromPresetIndex(static_cast<int>(brIdx));
     cfg.targetFps = 60;
 
     SaveSetting(L"ModeIdx", static_cast<int>(modeIdx));
     SaveSetting(L"CodecIdx", static_cast<int>(codecIdx));
+    SaveSetting(L"BitrateMbps", static_cast<int>(cfg.bitrateMbps));
     SaveSetting(L"BitrateIdx", static_cast<int>(brIdx));
 
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_CONNECT), FALSE);
@@ -384,13 +385,14 @@ void CreateUiControls(HWND hwnd) {
     int savedCodec = std::clamp(LoadSetting(L"CodecIdx", 0), 0, 1);
     SendMessageW(codecCb, CB_SETCURSEL, savedCodec, 0);
 
-    HWND brCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 386, 138, 110, 160, IDC_BITRATE_COMBO);
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"25 Mbit/s"));
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"50 Mbit/s"));
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"80 Mbit/s"));
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"120 Mbit/s"));
-    SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"200 Mbit/s"));
-    int savedBr = std::clamp(LoadSetting(L"BitrateIdx", 2), 0, 4);
+    HWND brCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 386, 138, 110, 260, IDC_BITRATE_COMBO);
+    for (uint32_t mbps : s2p::kBitratePresetsMbps) {
+        std::wstring label = s2p::FormatBitrateLabel(mbps);
+        SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    }
+    int savedBr = s2p::ResolveSavedBitratePresetIndex(
+        LoadSetting(L"BitrateMbps", 0),
+        LoadSetting(L"BitrateIdx", -1));
     SendMessageW(brCb, CB_SETCURSEL, savedBr, 0);
 
     addCtrl(L"BUTTON", L"Verbinden (Ctrl+Shift+K)", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 178, 480, 34, IDC_BTN_CONNECT);

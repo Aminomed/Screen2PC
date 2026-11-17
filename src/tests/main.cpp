@@ -17,6 +17,7 @@
 #include "../common/Version.h"
 #include "../common/AppIcon.h"
 #include "../common/Autostart.h"
+#include "../common/BitratePresets.h"
 #include "../common/ColorProfile.h"
 #include "../common/Updater.h"
 #include "../common/Protocol.h"
@@ -945,6 +946,41 @@ void TestAppIcons() {
     std::cout << "[PASS] TestAppIcons\n";
 }
 
+void TestBitratePresets() {
+    CHECK(s2p::kBitratePresetCount == 10, "Expected 10 bitrate presets");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::kDefaultBitratePresetIdx) == 80, "Default bitrate must be 80 Mbit/s");
+    CHECK(s2p::BitrateFromPresetIndex(-1) == 80 && s2p::BitrateFromPresetIndex(999) == 80,
+          "Out-of-bounds preset index must safely fall back to 80 Mbit/s");
+
+    for (size_t i = 1; i < s2p::kBitratePresetCount; ++i) {
+        CHECK(s2p::kBitratePresetsMbps[i] > s2p::kBitratePresetsMbps[i - 1],
+              "Bitrate presets must be strictly ascending");
+    }
+
+    // Requested 60 and 100 Mbit/s presets must exist with clean labels
+    int idx60 = s2p::FindBitratePresetIndex(60);
+    int idx100 = s2p::FindBitratePresetIndex(100);
+    CHECK(s2p::BitrateFromPresetIndex(idx60) == 60, "60 Mbit/s preset missing");
+    CHECK(s2p::BitrateFromPresetIndex(idx100) == 100, "100 Mbit/s preset missing");
+    CHECK(s2p::FormatBitrateLabel(60) == L"60 Mbit/s", "60 Mbit/s label mismatch");
+    CHECK(s2p::FormatBitrateLabel(100) == L"100 Mbit/s", "100 Mbit/s label mismatch");
+
+    // Legacy 5-step INI migration (v1.5.0.28 and earlier: 25, 50, 80, 120, 200)
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 0)) == 25, "Legacy idx 0 -> 25 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 1)) == 50, "Legacy idx 1 -> 50 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 2)) == 80, "Legacy idx 2 -> 80 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 3)) == 120, "Legacy idx 3 -> 120 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 4)) == 200, "Legacy idx 4 -> 200 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, -1)) == 80, "Fresh INI default -> 80 failed");
+
+    // Explicit BitrateMbps always wins over legacy index and snaps nearest
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(60, 4)) == 60, "Explicit 60 Mbit/s ignored");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(100, 0)) == 100, "Explicit 100 Mbit/s ignored");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(95, 0)) == 100, "Nearest snap 95 -> 100 failed");
+
+    std::cout << "[PASS] TestBitratePresets\n";
+}
+
 } // namespace
 
 int main() {
@@ -964,6 +1000,7 @@ int main() {
     TestHdrColorPipeline();
     TestUpdaterParsing();
     TestAppIcons();
+    TestBitratePresets();
 
     CoUninitialize();
 

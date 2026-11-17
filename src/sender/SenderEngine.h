@@ -33,7 +33,7 @@ struct SenderConfig {
     uint16_t controlPort = kPortControl;
     DisplayMode mode = DisplayMode::ExtendAll;
     CodecType codec = CodecType::H264;
-    uint32_t bitrateMbps = 25;
+    uint32_t bitrateMbps = 80;
     uint32_t targetFps = 60;
 };
 
@@ -94,7 +94,7 @@ private:
         uint32_t height = 0;
         uint32_t refreshHz = 60;
         CodecType codec = CodecType::H264;
-        uint32_t bitrateMbps = 25;
+        uint32_t bitrateMbps = 80;
         uint32_t targetFps = 60;
         std::string peerIp;
         uint16_t streamPort = kPortStreamBase;

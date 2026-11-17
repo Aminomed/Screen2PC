@@ -63,6 +63,7 @@
     <ClInclude Include="Version.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="AppIcon.h" />
+    <ClInclude Include="BitratePresets.h" />
     <ClInclude Include="Logger.h" />
     <ClInclude Include="NetSocket.h" />
     <ClInclude Include="CodecDelta.h" />
