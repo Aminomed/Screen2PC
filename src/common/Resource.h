@@ -1,0 +1,7 @@
+#pragma once
+#ifndef SCREEN2PC_RESOURCE_H
+#define SCREEN2PC_RESOURCE_H
+
+#define IDI_SCREEN2PC_APP 101
+
+#endif // SCREEN2PC_RESOURCE_H

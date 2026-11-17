@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "../common/AppIcon.h"
 #include "../common/Autostart.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
@@ -465,7 +466,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_nid.uID = 1;
         g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         g_nid.uCallbackMessage = WM_TRAYICON;
-        g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        g_nid.hIcon = s2p::LoadAppSmallIcon(GetModuleHandleW(nullptr));
         wcscpy_s(g_nid.szTip, L"Screen2PC Sender (Surface)");
         Shell_NotifyIconW(NIM_ADD, &g_nid);
 
@@ -772,6 +773,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
+    wc.hIcon = s2p::LoadAppLargeIcon(hInst);
+    wc.hIconSm = s2p::LoadAppSmallIcon(hInst);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = L"Screen2PCSenderWnd";

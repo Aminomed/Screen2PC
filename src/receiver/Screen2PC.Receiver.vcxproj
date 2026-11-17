@@ -77,6 +77,7 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Screen2PC.Receiver.rc" />
+    <Image Include="..\common\assets\Screen2PC.ico" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\common\Screen2PC.Common.vcxproj">

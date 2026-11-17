@@ -1,4 +1,5 @@
 #include "D3D11Renderer.h"
+#include "../common/AppIcon.h"
 #include "../common/KvmInput.h"
 #include "../common/Logger.h"
 
@@ -127,6 +128,8 @@ void RegisterRenderClassOnce() {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = StaticRenderWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hIcon = s2p::LoadAppLargeIcon();
+    wc.hIconSm = s2p::LoadAppSmallIcon();
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     wc.lpszClassName = kRendererClass;

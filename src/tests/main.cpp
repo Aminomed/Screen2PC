@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../common/Version.h"
+#include "../common/AppIcon.h"
 #include "../common/Autostart.h"
 #include "../common/ColorProfile.h"
 #include "../common/Updater.h"
@@ -881,6 +882,69 @@ void TestUpdaterParsing() {
     std::cout << "[PASS] TestUpdaterParsing\n";
 }
 
+void TestAppIcons() {
+    // Fallback helpers must always return a non-null icon handle even without EXE resources.
+    CHECK(s2p::LoadAppLargeIcon() != nullptr, "LoadAppLargeIcon fallback returned null");
+    CHECK(s2p::LoadAppSmallIcon() != nullptr, "LoadAppSmallIcon fallback returned null");
+
+    wchar_t modulePath[MAX_PATH]{};
+    DWORD n = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    CHECK(n > 0 && n < MAX_PATH, "GetModuleFileNameW failed");
+    std::wstring exeDir(modulePath);
+    size_t slash = exeDir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        exeDir.resize(slash + 1);
+    } else {
+        exeDir.clear();
+    }
+
+    const wchar_t* kTargets[] = { L"Screen2PC.Sender.exe", L"Screen2PC.Receiver.exe" };
+    const int kExpectedSizes[] = { 16, 20, 24, 32, 48, 64, 256 };
+
+    int verifiedTargets = 0;
+    for (const wchar_t* exeName : kTargets) {
+        std::wstring targetPath = exeDir + exeName;
+        if (GetFileAttributesW(targetPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
+        ++verifiedTargets;
+
+        HMODULE hMod = LoadLibraryExW(
+            targetPath.c_str(), nullptr,
+            LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+        CHECK(hMod != nullptr, "LoadLibraryExW failed on target EXE for icon check");
+        if (!hMod) continue;
+
+        CHECK(FindResourceW(hMod, MAKEINTRESOURCEW(IDI_SCREEN2PC_APP), RT_GROUP_ICON) != nullptr,
+              "IDI_SCREEN2PC_APP RT_GROUP_ICON missing from EXE resource table");
+
+        for (int sz : kExpectedSizes) {
+            HICON hIcon = static_cast<HICON>(LoadImageW(
+                hMod, MAKEINTRESOURCEW(IDI_SCREEN2PC_APP), IMAGE_ICON, sz, sz, LR_DEFAULTCOLOR));
+            CHECK(hIcon != nullptr, "LoadImageW failed to decode icon size from EXE");
+            if (hIcon) {
+                ICONINFO ii{};
+                BOOL okInfo = GetIconInfo(hIcon, &ii);
+                CHECK(okInfo != FALSE, "GetIconInfo failed on decoded EXE icon");
+                if (okInfo) {
+                    BITMAP bmp{};
+                    CHECK(ii.hbmColor != nullptr && GetObjectW(ii.hbmColor, sizeof(bmp), &bmp) == sizeof(bmp),
+                          "GetObjectW failed on icon color bitmap");
+                    CHECK(bmp.bmWidth == sz && bmp.bmHeight == sz,
+                          "Decoded icon bitmap dimensions do not match requested size");
+                    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+                    if (ii.hbmMask) DeleteObject(ii.hbmMask);
+                }
+                DestroyIcon(hIcon);
+            }
+        }
+        FreeLibrary(hMod);
+    }
+
+    CHECK(verifiedTargets == 2, "Expected both Screen2PC.Sender.exe and Screen2PC.Receiver.exe beside Tests.exe");
+    std::cout << "[PASS] TestAppIcons\n";
+}
+
 } // namespace
 
 int main() {
@@ -899,6 +963,7 @@ int main() {
     TestAutostartAndCli();
     TestHdrColorPipeline();
     TestUpdaterParsing();
+    TestAppIcons();
 
     CoUninitialize();
 
