@@ -6,15 +6,15 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `App- & System-Tray-Icon (Dual-Glass Projection, Release v1.5.0.28)`
-- **Status:** Einheitliches transparentes Multi-Resolution-Monitor-Icon (**Konzept 2: Dual-Glass Projection**, [`Screen2PC.ico`](src/common/assets/Screen2PC.ico)) ist im grünen CI-Build **Run `44076960795`** (Commit `a45c016`, Artifact `14324348800`, **GitHub Release `v1.5.0.28`**, 11/11 Unit-Tests PASS, INF/CAT OK, 0 neue Warnungen/Fehler) für PC & Surface veröffentlicht:
-  1. **Multi-Resolution-Icon (`16×16` bis `256×256` px):** Deterministischer Generator [`scripts/generate_icons.py`](scripts/generate_icons.py) erzeugt `16/20/24/32/48/64`-px 32-Bit-ARGB-BMPs + `256×256`-PNG mit transparentem Hintergrund (dunkle Display-Füllung & Slate-Rahmen für Windows 11 Dark & Light Mode, optimierte Pixel-Schärfe bei `16×16` / `20×20` im Tray).
-  2. **Einbindung in beiden Apps:** Über [`Resource.h`](src/common/Resource.h) (`IDI_SCREEN2PC_APP = 101`) und [`AppIcon.h`](src/common/AppIcon.h) (`LoadAppLargeIcon` / `LoadAppSmallIcon`) in [`Screen2PC.Sender.rc`](src/sender/Screen2PC.Sender.rc), [`Screen2PC.Receiver.rc`](src/receiver/Screen2PC.Receiver.rc), Hauptfenster, Farb-Einstellungsfenster, [`D3D11Renderer`](src/receiver/D3D11Renderer.cpp) (`Screen2PCStreamWnd`) sowie beide System-Trays (`NOTIFYICONDATAW`).
-  3. **Hardening & Vorgänger-Fixes (behalten):** Alle Stabilitäts-, Concurrency-, Bounds- & GPU-Recovery-Fixes aus `v1.5.0.27` (`b0a55ed`) sind unverändert aktiv.
+- **Phase:** `Erweiterte Bandbreiten-Abstufungen (15..200 Mbit/s, Release v1.5.0.29)`
+- **Status:** Feiner abgestufte Bandbreiten-Optionen (`15 / 25 / 40 / 50 / 60 / 80 / 100 / 120 / 150 / 200 Mbit/s`) inkl. Abwärtskompatibilität für gespeicherte `sender.ini`-Profile und transparentem App-/Tray-Icon sind im grünen CI-Build **Run `44099639218`** (Commit `8b5a08d`, Artifact `14335706815`, **GitHub Release `v1.5.0.29`**, 12/12 Unit-Tests PASS, INF/CAT OK, 0 neue Warnungen/Fehler) veröffentlicht:
+  1. **Bandbreiten-Presets (`BitratePresets.h` & `sender/main.cpp`):** 10 Stufen (`15, 25, 40, 50, 60, 80 (Standard), 100, 120, 150, 200 Mbit/s`) im ComboBox-Dropdown (`CBS_DROPDOWNLIST | WS_VSCROLL`), Speicherung als explizites `BitrateMbps` in `sender.ini` plus automatische Migration bestehender `BitrateIdx`-Einträge (`0..4 -> 25/50/80/120/200`).
+  2. **App- & System-Tray-Icon (behalten):** Einheitliches transparentes Multi-Size-Icon (**Dual-Glass Projection**, `16..256 px`) in Explorer, Taskleiste, Fenstern & Trays (`v1.5.0.28`).
+  3. **Hardening & Vorgänger-Fixes (behalten):** Alle Stabilitäts-, Concurrency-, Bounds- & GPU-Recovery-Fixes aus `v1.5.0.27` (`b0a55ed`) bleiben unverändert aktiv.
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build (0 Fehler, 0 neue Warnungen), `infverif.exe /v` (`INF is VALID`), `Inf2Cat.exe` (`Errors: None`), GitHub Release **`v1.5.0.28`** (`Screen2PC-Windows-x64.zip`, `1017262` Bytes) & `Screen2PC.Tests.exe` (11/11 PASS) via `.github/workflows/ci.yml`.
-  - *Test-Scope:* `Screen2PC.Tests.exe` prüft 11/11 Suiten inkl. neuem [`TestAppIcons`](src/tests/main.cpp) (verifiziert `RT_GROUP_ICON` `IDI_SCREEN2PC_APP` + Dekodierung aller 7 Größen `16..256` direkt aus den gebauten `Screen2PC.Sender.exe` & `Screen2PC.Receiver.exe`); visuelle Prüfung auf Windows-Desktop/Tray erfolgt beim Update-Test auf PC & Surface.
-- **Next Step:** Auf **PC** und **Surface** per Auto-Updater auf **`v1.5.0.28`** aktualisieren und das neue Icon in Explorer, Taskleiste, Task-Manager-Autostart und System-Tray prüfen.
+  - *Build & INF:* Windows-x64 Release-Build (0 Fehler, 0 neue Warnungen), `infverif.exe /v` (`INF is VALID`), `Inf2Cat.exe` (`Errors: None`), GitHub Release **`v1.5.0.29`** (`Screen2PC-Windows-x64.zip`, `1018991` Bytes) & `Screen2PC.Tests.exe` (12/12 PASS) via `.github/workflows/ci.yml`.
+  - *Test-Scope:* `Screen2PC.Tests.exe` prüft 12/12 Suiten inkl. [`TestBitratePresets`](src/tests/main.cpp) (`15..200 Mbit/s`, `60`/`100`-Presets, Legacy-`BitrateIdx`-Migration & Nearest-Snap) und [`TestAppIcons`](src/tests/main.cpp).
+- **Next Step:** Auf **PC** und **Surface** per Auto-Updater auf **`v1.5.0.29`** aktualisieren und im Sender-Fenster die neuen Bandbreitenstufen (`60 / 100 Mbit/s` usw.) sowie das neue Icon prüfen.
 
 ---
 
@@ -52,7 +52,7 @@
    - Minimaler User-Mode-Display-Treiber ohne eigenes Kernel-`.sys` (`Screen2PCDriver.inf` mit `ClassVer = 2.0`, `HardwareID = Root\Screen2PCVDD`, `PnpLockdown = 1`, `MaxMonitorsSupported = 2`, `UmdfExtensions = IddCx0102` in `[Screen2PCDriver_Install_UMDF]`, ohne `ProcessSharingDisabled`-Konflikt; Win10 `17763` über `AddService = WUDFRd` und Win11 `22000+` über `Include/Needs = WUDFRD.inf`).
    - *IPC & Persistenz:* Named Pipe `\\.\pipe\Screen2PC_VDD`, Persistenz unter `C:\ProgramData\Screen2PC\monitors.cfg`.
 6. **Dual-Codec & Low-Latency Pipeline + Transport (`Protocol.h`, `NetSocket`):**
-   - H.264 Low-Latency (`25 / 50 / 80 / 120 / 200 Mbit/s`, `timeBeginPeriod(1)`, Async-MFT-Wait-Fix, kein Post-Frame-`Sleep`) oder `DeltaLossless` (`DLT1`).
+   - H.264 Low-Latency (`15 / 25 / 40 / 50 / 60 / 80 / 100 / 120 / 150 / 200 Mbit/s`, `timeBeginPeriod(1)`, Async-MFT-Wait-Fix, kein Post-Frame-`Sleep`) oder `DeltaLossless` (`DLT1`).
    - IPv4-only (`AF_INET`), `S2P1` Magic, Version `1`, **ohne TLS/Auth**, `Protocol.h`-Binärstructs unverändert. `ClipboardSync` / `FileTransfer` mit `m_lifecycleMutex` (Move-before-Join).
 
 ---
@@ -62,12 +62,12 @@
 |---|---|
 | `MEMORY.md`, `README.md` | Zentrale Projekt-Memory (`MEMORY.md`) & Enduser-Schnellstart (`README.md`) |
 | `Screen2PC.sln`, `packages.config`, `Directory.Build.props`, `.gitignore` | VS 2022 Solution (`x64`, `SCREEN2PC_BUILD_NUMBER`), NuGet-WDK/-SDK `10.0.26100.2454` für Driver |
-| `src/common/` (`Screen2PC.Common.vcxproj`) | `Protocol.h`, `Version.h`, `Resource.h`, `AppIcon.h`, `assets/Screen2PC.ico`, `Autostart.h/.cpp`, `ColorProfile.h/.cpp`, `Updater.h/.cpp`, `Logger.h/.cpp`, `NetSocket.h/.cpp`, `CodecH264.h/.cpp` (`BT.709`), `CodecDelta.h/.cpp`, `ClipboardSync.h/.cpp`, `FileTransfer.h/.cpp`, `KvmInput.h/.cpp` |
+| `src/common/` (`Screen2PC.Common.vcxproj`) | `Protocol.h`, `Version.h`, `Resource.h`, `AppIcon.h`, `BitratePresets.h`, `assets/Screen2PC.ico`, `Autostart.h/.cpp`, `ColorProfile.h/.cpp`, `Updater.h/.cpp`, `Logger.h/.cpp`, `NetSocket.h/.cpp`, `CodecH264.h/.cpp` (`BT.709`), `CodecDelta.h/.cpp`, `ClipboardSync.h/.cpp`, `FileTransfer.h/.cpp`, `KvmInput.h/.cpp` |
 | `src/driver/` (`Screen2PC.Driver.vcxproj`) | `DriverProtocol.h`, `Driver.h/.cpp` (UMDF v2 `IddCx 1.2`), `Screen2PCDriver.inf` |
 | `src/driversetup/` (`Screen2PC.DriverSetup.vcxproj`) | `main.cpp` -> `Screen2PC.DriverSetup.exe` |
-| `src/sender/` (`Screen2PC.Sender.vcxproj`) | Surface-App: `SenderEngine.h/.cpp`, `DxgiCapture.h/.cpp`, `VirtualDisplayCtl.h/.cpp`, `Screen2PC.Sender.rc` (`IDI_SCREEN2PC_APP`), `main.cpp` (`winmm`, `25..200 Mbit/s`, Task-Manager Autostart `--tray`, Single-Instance, GitHub Auto-Updater + SHA256-Treibercheck, App-/Tray-Icon) |
+| `src/sender/` (`Screen2PC.Sender.vcxproj`) | Surface-App: `SenderEngine.h/.cpp`, `DxgiCapture.h/.cpp`, `VirtualDisplayCtl.h/.cpp`, `Screen2PC.Sender.rc` (`IDI_SCREEN2PC_APP`), `main.cpp` (`winmm`, `15..200 Mbit/s` inkl. `60`/`100`, Task-Manager Autostart `--tray`, Single-Instance, GitHub Auto-Updater + SHA256-Treibercheck, App-/Tray-Icon) |
 | `src/receiver/` (`Screen2PC.Receiver.vcxproj`) | PC-App (treiberfrei): `ReceiverEngine.h/.cpp`, `D3D11Renderer.h/.cpp` (`IDXGIOutput6`/`scRGB`/Gamma `2.2`/`ColorCB`, `WM_INPUT`, `ClipCursor`, Stream-Icon), `Screen2PC.Receiver.rc` (`IDI_SCREEN2PC_APP`), `main.cpp` (Task-Manager Autostart, `--tray`, Single-Instance, Farbkalibrierungs-Dialog, GitHub Auto-Updater, App-/Tray-Icon) |
-| `src/tests/` (`Screen2PC.Tests.vcxproj`) | `main.cpp` -> `Screen2PC.Tests.exe`: 11 Suiten (Protocol, Delta, Color/H264/BT.709/Version, Loopback, Clipboard, FileTransfer, KVM-Roaming, Autostart/CLI, HDR-Color-Pipeline/INI, Updater-JSON/Version, App-Icons) |
+| `src/tests/` (`Screen2PC.Tests.vcxproj`) | `main.cpp` -> `Screen2PC.Tests.exe`: 12 Suiten (Protocol, Delta, Color/H264/BT.709/Version, Loopback, Clipboard, FileTransfer, KVM-Roaming, Autostart/CLI, HDR-Color-Pipeline/INI, Updater-JSON/Version, App-Icons, Bitrate-Presets) |
 | `scripts/` | `install_driver.ps1`, `uninstall_driver.ps1`, `generate_icons.py` |
 | `.github/workflows/ci.yml` | Windows-2022 CI: MSBuild `Release\|x64`, Tests, `infverif`, `Inf2Cat`, Artifact & GitHub Release `Screen2PC-Windows-x64.zip` |
 
@@ -80,7 +80,7 @@
   - *Receiver (`580x550`):* `X` versteckt ins Tray; Button *"Windows Firewall Ports freigeben (Admin)"*; Checkbox *"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"*; Button *"Farben & HDR pro Monitor anpassen..."*; Auto-Update-Checkbox + *"Nach Updates suchen"* + Tray-Menüpunkt.
   - *Streamfenster (`D3D11Renderer`):* `F11` Vollbild-Toggle; `ESC` verlässt Vollbild **und** gibt KVM-Mausfokus frei; Klick ins Bild aktiviert Full-Desktop-KVM-Capture (`WM_INPUT` + `ClipCursor`); `Ctrl+Alt+K` schaltet KVM global um; `Alt+F4` beendet Session (`StopSession`); `WM_DISPLAYCHANGE`/`WM_MOVE` aktualisieren HDR/SDR-SwapChain automatisch.
 - **INI-Konfiguration, Registry & Pfade:**
-  - `%APPDATA%\Screen2PC\sender.ini` (`[Sender]`): `LastIp=""`, `ModeIdx=0`, `CodecIdx=0`, `BitrateIdx=2`, `ClipboardSync=1`, `KvmEnabled=1`, `AutoUpdateCheck=1`.
+  - `%APPDATA%\Screen2PC\sender.ini` (`[Sender]`): `LastIp=""`, `ModeIdx=0`, `CodecIdx=0`, `BitrateMbps=80` (`BitrateIdx=5`, kompatible Migration aus Alt-`0..4`), `ClipboardSync=1`, `KvmEnabled=1`, `AutoUpdateCheck=1`.
   - `%APPDATA%\Screen2PC\receiver.ini` (`[Receiver]`): `StartFullscreen=1`, `ClipboardSync=1`, `KvmEnabled=1`, `AutoUpdateCheck=1`; `[ColorMonitor0]`, `[ColorMonitor1]`: `HdrOutput=1`, `BrightnessPct=100`, `GammaX100=220`, `ContrastPct=100`, `SaturationPct=100`, `RedGainPct=100`, `GreenGainPct=100`, `BlueGainPct=100`.
   - Registry (je optional per Checkbox): `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Screen2PC Receiver` / `Screen2PC Sender` & `StartupApproved\Run`.
   - `C:\ProgramData\Screen2PC\monitors.cfg`, `%USERPROFILE%\Downloads\Screen2PC`, `%TEMP%\Screen2PC_*.log`, `%TEMP%\Screen2PC_Update_<pid>\`.
@@ -108,3 +108,4 @@
 | 2026-11-16 | Surface Sender Autostart (Variante A) | Gleicher Task-Manager-Autostart (`Screen2PC Sender`, `--tray`, `Local\Screen2PC_Sender_SingleInstance`, `WM_ACTIVATE`-Sync) auch in `src/sender/main.cpp` ergänzt (`b0adff2`, Run `43844648845`, Artifact `14215250697`, Release `v1.5.0.26`, 10/10 Tests PASS) |
 | 2026-11-16 | Umfassendes Stability-, Deadlock- & Bounds-Debugging | Voll-Audit über `Driver` (Overlapped-Pipe + Monitor-Rollback), `Common` (`ClipboardSync`, `CodecDelta`, `CodecH264` Async-MFT/Multi-MFT, `ColorProfile`, `KvmInput`, `NetSocket` Cancel-Connect/Atomic-UDP, `Protocol` Cursor-Check, `Updater`), `Sender` (`DxgiCapture` Reset/Resize, `SenderEngine` Device-Reset & Interrupt-Handshake, `MOD_NOREPEAT`), `Receiver` (`D3D11Renderer` Device-Lost-Recovery/Modifiers, `ReceiverEngine` Interrupt-Accept, `g_disconnBusy`) & erweiterte Regressionstests (`b0a55ed`, Run `43858802633`, Artifact `14222816676`, Release `v1.5.0.27`, 10/10 Tests PASS) |
 | 2026-11-17 | App- & Tray-Icon (Dual-Glass Projection) | Transparentes Multi-Size-Monitor-Icon (`16/20/24/32/48/64`-px ARGB-BMP + `256×256`-PNG via `scripts/generate_icons.py` -> `src/common/assets/Screen2PC.ico`), `Resource.h` (`IDI_SCREEN2PC_APP`), `AppIcon.h` (`LoadAppLargeIcon`/`LoadAppSmallIcon`), Einbindung in `Sender`/`Receiver` `.rc`, Hauptfenster, `ColorWnd`, `D3D11Renderer` & System-Trays + `TestAppIcons`-Suite (`a45c016`, Run `44076960795`, Artifact `14324348800`, Release `v1.5.0.28`, 11/11 Tests PASS) |
+| 2026-11-17 | Erweiterte Bandbreiten-Abstufungen | `BitratePresets.h` (`15/25/40/50/60/80/100/120/150/200 Mbit/s`), ComboBox + `WS_VSCROLL` & `BitrateMbps`-INI-Speicherung mit Legacy-`BitrateIdx`-Migration in `sender/main.cpp` + `TestBitratePresets`-Suite (`8b5a08d`, Run `44099639218`, Artifact `14335706815`, Release `v1.5.0.29`, 12/12 Tests PASS) |
