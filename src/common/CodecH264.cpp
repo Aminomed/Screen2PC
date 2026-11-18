@@ -152,11 +152,6 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
         vCabac.boolVal = VARIANT_FALSE;
         api->SetValue(&CODECAPI_AVEncH264CABACEnable, &vCabac);
 
-        VARIANT vNumRef{};
-        vNumRef.vt = VT_UI4;
-        vNumRef.ulVal = 1;
-        api->SetValue(&CODECAPI_AVEncVideoNumGQPs, &vNumRef);
-
         constexpr UINT32 kRateControlLowDelayVbr = 4; // eAVEncCommonRateControlMode_LowDelayVBR
         VARIANT vRc{};
         vRc.vt = VT_UI4;
@@ -1173,11 +1168,6 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
             vLow.boolVal = VARIANT_TRUE;
             decCodecApi->SetValue(&CODECAPI_AVLowLatencyMode, &vLow);
 
-            VARIANT vMaxDisp{};
-            vMaxDisp.vt = VT_UI4;
-            vMaxDisp.ulVal = 0; // 0 displayable frame delay in DPB
-            decCodecApi->SetValue(&CODECAPI_AVDecVideoMaxNumOfDisplayableFrames, &vMaxDisp);
-
             VARIANT vFastDec{};
             vFastDec.vt = VT_UI4;
             vFastDec.ulVal = 32;
@@ -1218,11 +1208,6 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
             vLow.vt = VT_BOOL;
             vLow.boolVal = VARIANT_TRUE;
             decCodecApi->SetValue(&CODECAPI_AVLowLatencyMode, &vLow);
-
-            VARIANT vMaxDisp{};
-            vMaxDisp.vt = VT_UI4;
-            vMaxDisp.ulVal = 0;
-            decCodecApi->SetValue(&CODECAPI_AVDecVideoMaxNumOfDisplayableFrames, &vMaxDisp);
         }
 
         m_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
