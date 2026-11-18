@@ -3,11 +3,12 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include "Version.h"
 
 namespace s2p {
 
 constexpr uint32_t kProtocolMagic   = 0x53325031; // "S2P1"
-constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kProtocolVersion = 2;
 
 constexpr uint16_t kPortDiscovery    = 48210; // UDP Broadcast discovery
 constexpr uint16_t kPortControl      = 48211; // TCP Control & Handshake
@@ -18,8 +19,8 @@ constexpr size_t   kMaxMonitors     = 2;
 constexpr size_t   kMaxFrameBytes   = 64 * 1024 * 1024; // 64 MB safety cap
 
 enum class CodecType : uint8_t {
-    Auto       = 0,
-    H264       = 1,
+    Auto          = 0,
+    H264          = 1,
     DeltaLossless = 2
 };
 
@@ -29,30 +30,38 @@ enum class MsgType : uint16_t {
     DiscoverResp     = 2,
 
     // TCP Control
-    HelloSender      = 10,
-    HelloReceiver    = 11,
-    StartSession     = 12,
-    StopSession      = 13,
-    RequestKeyframe  = 14,
-    Heartbeat        = 15,
-    SessionAck       = 16,
+    HelloSender       = 10,
+    HelloReceiver     = 11,
+    StartSession      = 12,
+    StopSession       = 13,
+    RequestKeyframe   = 14,
+    Heartbeat         = 15,
+    SessionAck        = 16,
+    VersionMismatch   = 17,
+    PairChallenge     = 18,
+    PairVerify        = 19,
 
     // TCP Video Stream (on stream socket)
-    VideoFrame       = 20,
-    CursorUpdate     = 21,
-    StreamEnd        = 22,
+    VideoFrame        = 20,
+    CursorUpdate      = 21,
+    StreamEnd         = 22,
 
-    // TCP Control - Shared Clipboard & KVM (Phase 2/3)
-    ClipboardSync    = 30,
+    // TCP Control - Pairing & Live Reconfiguration
+    PairResult        = 23,
+    ReconfigureStream = 24,
+
+    // TCP Control - Shared Clipboard
+    ClipboardSync     = 30,
 
     // Dedicated TCP File Transfer (port 48214)
-    FileMeta         = 31,
-    FileChunk        = 32,
-    FileDone         = 33,
+    FileMeta          = 31,
+    FileChunk         = 32,
+    FileDone          = 33,
+    FileCancel        = 34,
 
     // TCP Control - Pure User-Mode KVM Input (PC -> Surface)
-    KvmMouse         = 40,
-    KvmKey           = 41
+    KvmMouse          = 40,
+    KvmKey            = 41
 };
 
 enum KvmMouseAction : uint8_t {
@@ -78,6 +87,13 @@ enum FrameFlags : uint32_t {
 };
 
 #pragma pack(push, 1)
+
+struct AppVersionTuple {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t patch;
+    uint16_t build;
+};
 
 struct PacketHeader {
     uint32_t magic;
@@ -107,26 +123,61 @@ struct DiscoverReqPayload {
 };
 
 struct DiscoverRespPayload {
-    uint32_t senderNonce;
-    uint16_t controlPort;
-    uint16_t streamBasePort;
-    uint32_t monitorCount;
-    wchar_t  pcName[32];
-    MonitorDesc monitors[kMaxMonitors];
+    uint32_t        senderNonce;
+    uint16_t        controlPort;
+    uint16_t        streamBasePort;
+    uint32_t        monitorCount;
+    wchar_t         pcName[32];
+    MonitorDesc     monitors[kMaxMonitors];
+    AppVersionTuple receiverVersion;
 };
 
 struct HelloSenderPayload {
-    wchar_t  senderName[32];
-    uint8_t  preferredCodec; // CodecType
-    uint8_t  pad[3];
-    uint32_t targetBitrateMbps;
-    uint32_t targetFps;
+    wchar_t         senderName[32];
+    uint8_t         preferredCodec; // CodecType
+    uint8_t         pad[3];
+    uint32_t        targetBitrateMbps;
+    uint32_t        targetFps;
+    uint8_t         senderMac[6];
+    uint8_t         senderDeviceId[16];
+    uint8_t         pad2[2];
+    AppVersionTuple senderVersion;
 };
 
 struct HelloReceiverPayload {
-    wchar_t  pcName[32];
-    uint32_t monitorCount;
-    MonitorDesc monitors[kMaxMonitors];
+    wchar_t         pcName[32];
+    uint32_t        monitorCount;
+    MonitorDesc     monitors[kMaxMonitors];
+    AppVersionTuple receiverVersion;
+};
+
+struct VersionMismatchPayload {
+    uint16_t        protocolVersion;
+    uint16_t        pad;
+    AppVersionTuple appVersion;
+    wchar_t         message[64];
+};
+
+struct PairChallengePayload {
+    uint8_t         nonce[16];
+    wchar_t         pcName[32];
+    AppVersionTuple pcVersion;
+};
+
+struct PairVerifyPayload {
+    char            pinCode[8];
+    wchar_t         senderName[32];
+    uint8_t         senderMac[6];
+    uint8_t         senderDeviceId[16];
+    uint8_t         pad[2];
+};
+
+struct PairResultPayload {
+    uint8_t         accepted;
+    uint8_t         remembered;
+    uint8_t         remainingAttempts;
+    uint8_t         pad;
+    wchar_t         message[64];
 };
 
 struct StartStreamSpec {
@@ -137,11 +188,20 @@ struct StartStreamSpec {
     uint8_t  codec;            // CodecType
     uint8_t  pad[3];
     uint32_t bitrateMbps;
+    uint32_t targetFps;        // Effective encode/decode FPS
 };
 
 struct StartSessionPayload {
     uint32_t streamCount;
     StartStreamSpec streams[kMaxMonitors];
+};
+
+struct ReconfigureStreamPayload {
+    uint32_t streamIndex;
+    uint8_t  codec;            // CodecType
+    uint8_t  pad[3];
+    uint32_t bitrateMbps;
+    uint32_t targetFps;
 };
 
 struct SessionAckPayload {
@@ -191,7 +251,9 @@ struct ClipboardHeader {
 struct FileMetaHeader {
     uint32_t transferId;
     uint64_t fileSize;
-    uint32_t nameUtf8Bytes; // followed by UTF-8 sanitized filename
+    uint32_t flags;
+    uint32_t nameUtf8Bytes;    // followed by UTF-8 sanitized filename
+    uint32_t relPathUtf8Bytes; // followed by UTF-8 sanitized relative subdir path
 };
 
 struct FileChunkHeader {
@@ -207,6 +269,11 @@ struct FileDonePayload {
     uint32_t totalCrc32;
     uint8_t  ok;
     uint8_t  pad[3];
+};
+
+struct FileCancelPayload {
+    uint32_t transferId;
+    uint32_t reason; // 1 = sender canceled, 2 = receiver canceled
 };
 
 struct KvmMouseEvent {
@@ -229,6 +296,22 @@ struct KvmKeyEvent {
 
 #pragma pack(pop)
 
+inline AppVersionTuple CurrentAppVersionTuple() {
+    AppVersionTuple t{};
+    t.major = static_cast<uint16_t>(SCREEN2PC_VERSION_MAJOR);
+    t.minor = static_cast<uint16_t>(SCREEN2PC_VERSION_MINOR);
+    t.patch = static_cast<uint16_t>(SCREEN2PC_VERSION_PATCH);
+    t.build = static_cast<uint16_t>(SCREEN2PC_BUILD_NUMBER);
+    return t;
+}
+
+inline std::wstring FormatVersionTuple(const AppVersionTuple& t) {
+    return std::to_wstring(t.major) + L"." +
+           std::to_wstring(t.minor) + L"." +
+           std::to_wstring(t.patch) + L"." +
+           std::to_wstring(t.build);
+}
+
 inline PacketHeader MakeHeader(MsgType type, uint32_t payloadSize, uint32_t reserved = 0) {
     PacketHeader h{};
     h.magic = kProtocolMagic;
@@ -243,6 +326,15 @@ inline bool ValidateHeader(const PacketHeader& h) {
     return h.magic == kProtocolMagic &&
            h.version == kProtocolVersion &&
            h.payloadSize <= kMaxFrameBytes;
+}
+
+inline bool CheckHeaderVersion(const PacketHeader& h, uint16_t& outRemoteVersion) {
+    outRemoteVersion = 0;
+    if (h.magic != kProtocolMagic || h.payloadSize > kMaxFrameBytes) {
+        return false;
+    }
+    outRemoteVersion = h.version;
+    return h.version == kProtocolVersion;
 }
 
 constexpr uint32_t kMaxCursorDimension = 1024;

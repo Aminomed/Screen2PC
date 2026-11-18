@@ -2,6 +2,7 @@
 #ifndef SCREEN2PC_BITRATE_PRESETS_H
 #define SCREEN2PC_BITRATE_PRESETS_H
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -55,6 +56,53 @@ inline int ResolveSavedBitratePresetIndex(int savedBitrateMbps, int legacyBitrat
 
 inline std::wstring FormatBitrateLabel(uint32_t mbps) {
     return std::to_wstring(mbps) + L" Mbit/s";
+}
+
+// Target FPS presets: 0 = Auto (follows monitor Hz clamped 60..120), 60, 90, 120
+inline constexpr uint32_t kFpsPresets[] = { 0, 60, 90, 120 };
+inline constexpr size_t kFpsPresetCount = sizeof(kFpsPresets) / sizeof(kFpsPresets[0]);
+inline constexpr int kDefaultFpsPresetIdx = 0;
+
+inline uint32_t FpsFromPresetIndex(int idx) {
+    if (idx < 0 || static_cast<size_t>(idx) >= kFpsPresetCount) {
+        return 0;
+    }
+    return kFpsPresets[idx];
+}
+
+inline int FindFpsPresetIndex(uint32_t fpsSetting) {
+    if (fpsSetting == 0) {
+        return 0;
+    }
+    int bestIdx = 1; // 60 FPS
+    int64_t bestDiff = INT64_MAX;
+    for (size_t i = 1; i < kFpsPresetCount; ++i) {
+        if (kFpsPresets[i] == fpsSetting) {
+            return static_cast<int>(i);
+        }
+        int64_t diff = std::llabs(static_cast<int64_t>(kFpsPresets[i]) -
+                                   static_cast<int64_t>(fpsSetting));
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            bestIdx = static_cast<int>(i);
+        }
+    }
+    return bestIdx;
+}
+
+inline uint32_t ResolveEffectiveFps(uint32_t fpsSetting, uint32_t monitorRefreshHz) {
+    if (fpsSetting == 0) {
+        uint32_t hz = (monitorRefreshHz >= 30 && monitorRefreshHz <= 240) ? monitorRefreshHz : 60u;
+        return std::clamp<uint32_t>(hz, 60u, 120u);
+    }
+    return std::clamp<uint32_t>(fpsSetting, 30u, 120u);
+}
+
+inline std::wstring FormatFpsLabel(uint32_t fpsSetting) {
+    if (fpsSetting == 0) {
+        return L"Auto (Monitor-Hz)";
+    }
+    return std::to_wstring(fpsSetting) + L" FPS";
 }
 
 } // namespace s2p

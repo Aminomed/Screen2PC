@@ -12,9 +12,11 @@
 1. Lade `Screen2PC-Windows-x64.zip` unter **GitHub Releases** herunter und entpacke das Archiv.
 2. Starte **`Screen2PC.Receiver.exe`**.
 3. Klicke einmal auf **"Windows Firewall Ports freigeben (Admin)"** (oeffnet UDP `48210` + TCP `48211–48215` im lokalen Netz).
-4. Der Empfaenger erkennt automatisch beide PC-Monitore (inkl. `[HDR]` / `[SDR]`-Status) und wartet im System-Tray.
+4. Der Empfaenger erkennt automatisch beide PC-Monitore (inkl. `[HDR]` / `[SDR]`-Status) und wartet im System-Tray (inkl. automatischer Tray-Wiederherstellung nach Explorer-Neustart).
 5. **Autostart im System-Tray (Task-Manager kompatibel):** Setze den Haken **"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"**. `Screen2PC Receiver (PC)` startet beim Login unsichtbar (`--tray`) ins System-Tray und ist auch direkt unter **Windows Task-Manager -> Autostart-Apps** sichtbar und steuerbar.
-6. **HDR & Farbangleichung pro Monitor:** Falls ein Monitor mit **Windows HDR** laeuft und Farben verwaschen/anders aussehen, rendert der Receiver auf diesem Bildschirm automatisch in **16-Bit scRGB (`R16G16B16A16_FLOAT`)** mit reiner **Gamma-2.2-EOTF** und Uebernahme des Windows **SDR-Weisslevels**. Feintuning (Helligkeit, Gamma, Kontrast, Saettigung, RGB-Anteile pro Monitor) ist live im Fenster **"Farbe & HDR pro Monitor anpassen..."** moeglich (`receiver.ini`).
+6. **HDR & Farbangleichung pro Monitor:** Falls ein Monitor mit **Windows HDR** laeuft und Farben verwaschen/anders aussehen, rendert der Receiver auf diesem Bildschirm automatisch in **16-Bit scRGB (`R16G16B16A16_FLOAT`)** mit reiner **Gamma-2.2-EOTF** und Uebernahme des Windows **SDR-Weisslevels**. Feintuning (Helligkeit, Gamma, Kontrast, Saettigung, RGB-Anteile pro Monitor) ist live im Fenster **"Farbe & HDR..."** moeglich (`receiver.ini`).
+7. **Sicherheit per 6-stelliger PIN & Vertraute Geraete:** Beim ersten Verbinden eines unbekannten Surface blendet der PC ein nicht-blockierendes Popup mit einer **einmaligen 6-stelligen PIN** ein (auch wenn der Receiver im Tray liegt). Optional merkt sich der PC die **MAC-Adresse** in `receiver.ini`, sodass spaetere Verbindungen ohne erneute PIN direkt starten. Gespeicherte Geraete lassen sich jederzeit ueber **"Vertraute Geraete..."** einsehen oder entfernen.
+8. **Ausgeblendete Streamfenster:** Wird ein Streamfenster ueber `X` geschlossen, bleibt die Session aktiv und der Stream laesst sich jederzeit per **"Streamfenster wieder einblenden"** (im Hauptfenster oder System-Tray) wieder hervorholen.
 
 ### 2. Auf dem Surface (Sender)
 1. Entpacke `Screen2PC-Windows-x64.zip` (bei Browser-Downloads ggf. ZIP vorher per *Rechtsklick -> Eigenschaften -> Zulassen* entsperren; bei SmartScreen *"Unbekannter Herausgeber"* auf *"Weitere Informationen -> Trotzdem ausfuehren"* klicken — `install_driver.ps1` fuehrt zusaetzlich automatisch `Unblock-File` aus).
@@ -24,17 +26,19 @@
    ```
    *(Das Skript installiert das lokale Test-Zertifikat in `Root` + `TrustedPublisher`. Falls Windows Code Integrity trotz Zertifikat Problem 52 meldet, waere `bcdedit /set testsigning on` auf dem Surface noetig, was bei aktivem Secure Boot blockiert ist — alternativ jederzeit treiberfrei mit **Spiegeln** arbeiten.)*
 3. Starte **`Screen2PC.Sender.exe`**.
-4. Waehle den automatisch gefundenen PC (oder gib die PC-IP ein), waehle Modus (**Erweitern Alle Monitore**, **Erweitern Monitor 1**, **Erweitern Monitor 2** oder **Spiegeln**) sowie Codec:
-   - **H.264 Low-Latency:** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC (inkl. CPU-MFT-Fallback & BT.709 Colorimetry).
+4. Waehle den automatisch gefundenen PC (oder gib die PC-IP ein), waehle Modus (**Erweitern Alle Monitore**, **Erweitern Monitor 1**, **Erweitern Monitor 2** oder **Spiegeln**) sowie **Codec / Bitrate / FPS**:
+   - **H.264 Low-Latency (`LowDelayVBR`):** Nutzt AMD VCN auf dem Surface & Nvidia NVDEC (RTX 4070) auf dem PC mit minimaler Encoder-Latenz (`3`-Slot-NV12-Ring, dynamische Bitraten-Anpassung/ABR bei Netzlast, `DXGI ALLOW_TEARING` & entkoppeltem Receive-/Decode-Thread).
    - **Delta Lossless (4:4:4):** Nutzt DXGI-Dirty-Rects + verlustfreien Tile-RLE-Codec fuer gestochen scharfen Text/Code.
-5. Klicke **Verbinden** (oder jederzeit global via **`Ctrl + Shift + K`**).
+   - **Live-Wechsel im Betrieb:** Codec, Bitrate (**`15..200 Mbit/s`**) und Zielframerate (**`Auto / 60 / 90 / 120 FPS`**) koennen auch **waehrend der laufenden Session** live umgeschaltet werden.
+5. Klicke **Verbinden** (oder jederzeit global via **`Ctrl + Shift + K`**) — optional auch automatisch per **"Beim Start automatisch verbinden"** und **"Bei Abbruch automatisch wiederverbinden"** (`2s -> 5s -> 10s -> 20s` Backoff):
+   - Bei der ersten Kopplung die auf dem PC angezeigte **6-stellige PIN** eingeben. Bei Versionsunterschieden zwischen Sender und PC (`Protokoll v2`) erscheint ein direkter Hinweis inkl. direkter Update-Pruefung.
    - Im Vollbild auf dem PC schaltet **`F11`** / **`ESC`** zwischen randlosem Vollbild und Fenster um (**`ESC`** gibt zusaetzlich sofort den KVM-Mausfokus frei).
    - **Geteilte Zwischenablage:** Text & Bilder automatisch zwischen Surface und PC synchronisieren (optional per Checkbox abschaltbar).
-   - **Quick File Transfer:** Dateien einfach per **Drag & Drop** ins Hauptfenster oder direkt in ein gestreamtes Monitorfenster ziehen (oder *"Datei(en) senden..."* nutzen); empfangene Dateien landen in `%USERPROFILE%\Downloads\Screen2PC`.
-   - **KVM (Maus & Tastatur PC -> Surface):** Klick ins Streamfenster (oder Vollbild-Fokus) bindet die PC-Maus nahtlos auf das gesamte Surface-Desktop-Setup (Du kannst frei ueber alle PC-Monitore **und** direkt auf den physischen Surface-Bildschirm hinueberfahren, um Fenster herueberzuziehen; **`ESC`** oder **`Strg + Alt + K`** gibt die PC-Maus jederzeit wieder frei — komplett ohne Treiber oder Global Hooks auf dem PC).
-   - **Bitrate & Flussigkeit:** Einstellbar zwischen **`15 / 25 / 40 / 50 / 60 / 80 (Standard) / 100 / 120 / 150 / 200 Mbit/s`** bei voller Monitor-Refreshrate (bis 120 Hz).
-   - **GitHub Auto-Update (Sender & Empfaenger):** Beide Apps pruefen auf Wunsch beim Start (oder manuell per *"Nach Updates suchen"* Button / Tray-Menue) die neueste Version auf GitHub Releases, laden `Screen2PC-Windows-x64.zip` direkt herunter und aktualisieren sich atomar im Ordner ohne manuelles Entpacken (auf dem Surface wird der Display-Treiber nur bei echten Treiber-Aenderungen neu installiert).
-   - **Autostart im System-Tray auch am Surface (Task-Manager kompatibel):** Ueber die Checkbox **"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"** startet auch `Screen2PC Sender (Surface)` beim Windows-Login unsichtbar (`--tray`) ins Tray — ohne virtuelle Monitore vorab anzulegen — und wartet dort auf **`Strg + Shift + K`** oder Tray-Klick.
+   - **Erweiterter Dateitransfer (Dateien & ganze Ordner):** Einzelne Dateien oder ganze **Ordner rekursiv** per **Drag & Drop** (oder *"Datei(en) senden..."* / *"Ordner senden..."*) uebertragen — mit Live-Fortschrittsbalken (`%`), Geschwindigkeit (`MB/s`), Warteschlangen-Zaehler und **"Abbrechen"**-Button (`%USERPROFILE%\Downloads\Screen2PC`).
+   - **KVM (Maus & Tastatur PC -> Surface):** Klick ins Streamfenster (oder Vollbild-Fokus) bindet die PC-Maus nahtlos auf das gesamte Surface-Desktop-Setup (`ESC` oder `Strg + Alt + K` gibt die PC-Maus jederzeit wieder frei — komplett ohne Treiber oder Global Hooks auf dem PC).
+   - **Smart Surface Zuklappen-Schutz & Bildschirm-Abdunkelung:** Auf Wunsch bleibt das Surface trotz aktivierter Windows-Zuklapp-Ruhezustand-Einstellung **ausschliesslich dann** wach, wenn `Screen2PC` aktiv mit externen PC-Monitoren verbunden ist (beim Trennen/Beenden sowie per Crash-Recovery automatisch wiederhergestellt). Optional laesst sich der physische Surface-Bildschirm dabei schwarz abdunkeln (jederzeit per `ESC` oder Doppelklick reaktivierbar).
+   - **GitHub Auto-Update (Sender & Empfaenger):** Beide Apps pruefen auf Wunsch beim Start (oder manuell per *"Nach Updates suchen"* Button / Tray-Menue) die neueste Version auf GitHub Releases, laden `Screen2PC-Windows-x64.zip` direkt herunter und aktualisieren sich atomar im Ordner ohne manuelles Entpacken.
+   - **Autostart im System-Tray auch am Surface (Task-Manager kompatibel):** Ueber die Checkbox **"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)"** startet auch `Screen2PC Sender (Surface)` beim Windows-Login unsichtbar (`--tray`) ins Tray.
 
 ---
 
@@ -42,10 +46,10 @@
 
 | Komponente | Ort | Technologie | Grund |
 |---|---|---|---|
-| `Screen2PC.Driver` (`IddCx 1.2`) | Nur Surface | UMDF v2 User-Mode Display Driver | Erzeugt 0..2 virtuelle Monitore dynamisch in der exakten Aufloesung der PC-Monitore ohne Kernel-`.sys`. Kommunikation via Named Pipe `\\.\pipe\Screen2PC_VDD` (mit `AU`-ACL) + `%ProgramData%\Screen2PC\monitors.cfg` umgeht das bekannte `IndirectKmd` `CreateFile` Access-Denied-Problem. |
+| `Screen2PC.Driver` (`IddCx 1.2`) | Nur Surface | UMDF v2 User-Mode Display Driver | Erzeugt 0..2 virtuelle Monitore dynamisch mit stabilen deterministischen Container-GUIDs (`MakeDeterministicMonitorGuid`) ohne Kernel-`.sys`. Named Pipe `\\.\pipe\Screen2PC_VDD` + `%ProgramData%\Screen2PC\monitors.cfg`. |
 | `Screen2PC.DriverSetup` | Nur Surface | SetupAPI / NewDev / CfgMgr32 | Eigenstaendiges CLI zur Treiber-Installation ohne externes `devcon.exe`. |
-| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + WinHTTP | Direkter GPU-Texture-Abgriff mit Dirty-Rects & Hardware-Cursor-Trennung; sauberer Fallback auf Mirror-Modus; `SendInput` im User-Mode fuer KVM; Task-Manager-Autostart (`--tray`) & GitHub Release Auto-Updater. |
-| `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 (`scRGB` HDR/SDR) + Media Foundation + WinHTTP | Reiner User-Mode-Prozess. Kein Treiber, kein Kernel-Hook (`SetWindowsHookEx`), Anti-Cheat-sicher. Task-Manager-Autostart (`HKCU\...\Run` + `VERSIONINFO`), pro-Monitor HDR/Gamma-2.2-Kalibrierung & Auto-Updater. |
+| `Screen2PC.Sender` | Surface | Win32 + DXGI Desktop Duplication + Media Foundation + `PowrProf` + WinHTTP | `LowDelayVBR` H.264 / Delta Lossless, ABR, Live-Reconfig, Auto-Connect/-Reconnect, PIN-Kopplung, Smart-Lid-Close-Guard & Surface-Dim-Overlay, Folder-Transfer, Task-Manager-Autostart & Auto-Updater. |
+| `Screen2PC.Receiver` | Gaming-PC | Win32 + D3D11 (`scRGB` HDR/SDR, `ALLOW_TEARING`) + Media Foundation + `IPHelper` + WinHTTP | Reiner User-Mode-Prozess (kein Treiber, kein Hook). Entkoppelter Decode-/Render-Loop (`MsgWaitForMultipleObjectsEx`), PIN/MAC-Vertrauensliste (`BCrypt` + `GetIpNetTable`), HDR/Gamma-2.2-Kalibrierung & Auto-Updater. |
 
 ### Warum reines C++20 statt ".NET 8 + C++ Core"?
 - **Vorteile von .NET 8 + C++ Core:** Schnellere GUI-Entwicklung (WPF/WinUI 3, XAML Data-Binding), komfortables Settings-/JSON-Handling.
@@ -56,7 +60,7 @@
 ---
 
 ## Ports & Sicherheit
-- **UDP `48210`:** Lokale LAN-Broadcast-Erkennung (Auto-Discovery)
-- **TCP `48211`:** Control-, Clipboard- (`ClipboardSync`), KVM- (`KvmMouse`/`KvmKey`) & Heartbeat-Kanal
-- **TCP `48212` / `48213`:** Dedizierte `TCP_NODELAY`-Videostreams pro Monitor (Monitor 1 & Monitor 2)
-- **TCP `48214`:** Dedizierter bidirektionaler Dateitransfer-Kanal mit 64-KB-Chunks & CRC32-Pruefsumme
+- **UDP `48210`:** Lokale LAN-Broadcast-Erkennung inkl. Protokoll- & App-Versionsabgleich
+- **TCP `48211`:** Control- (`Protokoll v2`), einmalige 6-stellige **PIN-Kopplung** mit MAC-Merkliste (`HelloSender` / `PairChallenge` / `PairVerify` / `PairResult`), Live-Stream-Reconfig, Clipboard (`ClipboardSync`), KVM (`KvmMouse`/`KvmKey`) & Heartbeat
+- **TCP `48212` / `48213`:** Dedizierte `TCP_NODELAY`-Videostreams pro Monitor (`Monitor 1` & `Monitor 2`)
+- **TCP `48214`:** Dedizierter bidirektionaler Dateitransfer-Kanal mit 64-KB-Chunks, rekursiver Unterordner-Struktur (Traversal-gesichert), Live-Speed/% & Abbruch (`FileCancel`) plus CRC32-Pruefsumme

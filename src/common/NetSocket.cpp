@@ -197,13 +197,18 @@ TcpSocket TcpSocket::Accept(std::string* outPeerIp, int timeoutMs) {
     return sock;
 }
 
-void TcpSocket::TuneLowLatency(int bufBytes) {
+void TcpSocket::TuneLowLatency(int sndBufBytes, int rcvBufBytes) {
     SOCKET s = m_sock.load();
     if (s == INVALID_SOCKET) return;
     BOOL nodelay = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufBytes), sizeof(bufBytes));
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufBytes), sizeof(bufBytes));
+    int effectiveRcv = (rcvBufBytes >= 0) ? rcvBufBytes : sndBufBytes;
+    if (sndBufBytes > 0) {
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndBufBytes), sizeof(sndBufBytes));
+    }
+    if (effectiveRcv > 0) {
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&effectiveRcv), sizeof(effectiveRcv));
+    }
 }
 
 void TcpSocket::SetTimeouts(int sendTimeoutMs, int recvTimeoutMs) {
@@ -286,6 +291,38 @@ bool TcpSocket::SendPacket(MsgType type, const void* payload, uint32_t payloadSi
 bool TcpSocket::RecvPacket(PacketHeader& outHeader, std::vector<uint8_t>& outPayload) {
     if (!RecvAll(&outHeader, sizeof(outHeader))) return false;
     if (!ValidateHeader(outHeader)) return false;
+    outPayload.resize(outHeader.payloadSize);
+    if (outHeader.payloadSize > 0) {
+        if (!RecvAll(outPayload.data(), outHeader.payloadSize)) return false;
+    }
+    return true;
+}
+
+bool TcpSocket::RecvPacketRaw(PacketHeader& outHeader,
+                              std::vector<uint8_t>& outPayload,
+                              uint16_t& outRemoteVersion,
+                              bool& outVersionMismatch) {
+    outRemoteVersion = 0;
+    outVersionMismatch = false;
+    outPayload.clear();
+
+    if (!RecvAll(&outHeader, sizeof(outHeader))) return false;
+    if (outHeader.magic != kProtocolMagic || outHeader.payloadSize > kMaxFrameBytes) {
+        return false;
+    }
+    outRemoteVersion = outHeader.version;
+
+    const bool isExplicitMismatch = (outHeader.type == static_cast<uint16_t>(MsgType::VersionMismatch) &&
+                                     outHeader.payloadSize <= 4096);
+    if (outHeader.version != kProtocolVersion && !isExplicitMismatch) {
+        outVersionMismatch = true;
+        if (outHeader.payloadSize > 0 && outHeader.payloadSize <= 65536) {
+            std::vector<uint8_t> drain(outHeader.payloadSize);
+            RecvAll(drain.data(), drain.size());
+        }
+        return false;
+    }
+
     outPayload.resize(outHeader.payloadSize);
     if (outHeader.payloadSize > 0) {
         if (!RecvAll(outPayload.data(), outHeader.payloadSize)) return false;

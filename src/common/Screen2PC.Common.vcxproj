@@ -73,6 +73,7 @@
     <ClInclude Include="KvmInput.h" />
     <ClInclude Include="Autostart.h" />
     <ClInclude Include="ColorProfile.h" />
+    <ClInclude Include="Pairing.h" />
     <ClInclude Include="Updater.h" />
   </ItemGroup>
   <ItemGroup>
@@ -85,6 +86,7 @@
     <ClCompile Include="KvmInput.cpp" />
     <ClCompile Include="Autostart.cpp" />
     <ClCompile Include="ColorProfile.cpp" />
+    <ClCompile Include="Pairing.cpp" />
     <ClCompile Include="Updater.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

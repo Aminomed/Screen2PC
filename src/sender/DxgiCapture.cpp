@@ -159,7 +159,8 @@ bool DxgiCapture::RecreateDuplication() {
 bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
                                bool& outHasNewImage,
                                std::vector<DeltaRect>& outDirtyRects,
-                               CapturedCursor& outCursor) {
+                               CapturedCursor& outCursor,
+                               bool collectDirtyRects) {
     outHasNewImage = false;
     outDirtyRects.clear();
     outCursor = CapturedCursor{};
@@ -240,7 +241,7 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
             m_context->CopyResource(m_frameTex.Get(), srcTex.Get());
             outHasNewImage = true;
 
-            if (fi.TotalMetadataBufferSize > 0) {
+            if (collectDirtyRects && fi.TotalMetadataBufferSize > 0) {
                 if (m_metaBuf.size() < fi.TotalMetadataBufferSize) {
                     m_metaBuf.resize(fi.TotalMetadataBufferSize);
                 }

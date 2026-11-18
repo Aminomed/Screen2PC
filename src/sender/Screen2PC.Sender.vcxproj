@@ -47,7 +47,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;winhttp.lib;advapi32.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;comctl32.lib;comdlg32.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;winhttp.lib;advapi32.lib;bcrypt.lib;powrprof.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;comctl32.lib;comdlg32.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -63,16 +63,18 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;winhttp.lib;advapi32.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;comctl32.lib;comdlg32.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;ws2_32.lib;iphlpapi.lib;winhttp.lib;advapi32.lib;bcrypt.lib;powrprof.lib;mfplat.lib;mfuuid.lib;mfreadwrite.lib;wmcodecdspuuid.lib;comctl32.lib;comdlg32.lib;shell32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="DxgiCapture.h" />
+    <ClInclude Include="PowerPolicy.h" />
     <ClInclude Include="VirtualDisplayCtl.h" />
     <ClInclude Include="SenderEngine.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DxgiCapture.cpp" />
+    <ClCompile Include="PowerPolicy.cpp" />
     <ClCompile Include="VirtualDisplayCtl.cpp" />
     <ClCompile Include="SenderEngine.cpp" />
     <ClCompile Include="main.cpp" />

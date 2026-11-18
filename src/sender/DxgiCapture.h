@@ -56,7 +56,8 @@ public:
     bool AcquireFrame(uint32_t timeoutMs,
                       bool& outHasNewImage,
                       std::vector<DeltaRect>& outDirtyRects,
-                      CapturedCursor& outCursor);
+                      CapturedCursor& outCursor,
+                      bool collectDirtyRects = true);
 
     ID3D11Device* Device() const { return m_device.Get(); }
     ID3D11DeviceContext* Context() const { return m_context.Get(); }

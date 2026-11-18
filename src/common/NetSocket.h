@@ -42,7 +42,7 @@ public:
     bool Listen(uint16_t port, int backlog = 8);
     TcpSocket Accept(std::string* outPeerIp = nullptr, int timeoutMs = -1);
 
-    void TuneLowLatency(int bufBytes = 4 * 1024 * 1024);
+    void TuneLowLatency(int sndBufBytes = 4 * 1024 * 1024, int rcvBufBytes = -1);
     void SetTimeouts(int sendTimeoutMs, int recvTimeoutMs);
     // Returns 1 if readable, 0 on timeout, -1 on error/invalid socket
     int WaitReadable(int timeoutMs);
@@ -52,6 +52,10 @@ public:
 
     bool SendPacket(MsgType type, const void* payload, uint32_t payloadSize, uint32_t reserved = 0);
     bool RecvPacket(PacketHeader& outHeader, std::vector<uint8_t>& outPayload);
+    bool RecvPacketRaw(PacketHeader& outHeader,
+                       std::vector<uint8_t>& outPayload,
+                       uint16_t& outRemoteVersion,
+                       bool& outVersionMismatch);
 
     std::string PeerIp() const;
 
@@ -86,6 +90,9 @@ struct DiscoveredPeer {
     uint16_t controlPort = kPortControl;
     uint16_t streamBasePort = kPortStreamBase;
     std::vector<MonitorDesc> monitors;
+    AppVersionTuple receiverVersion{};
+    uint16_t remoteProtocolVersion = kProtocolVersion;
+    bool versionMismatch = false;
 };
 
 std::vector<std::string> GetLocalBroadcastAddresses();

@@ -4,6 +4,7 @@
 #include "../common/CodecDelta.h"
 #include "../common/Logger.h"
 
+#include <bcrypt.h>
 #include <objbase.h>
 #include <algorithm>
 #include <chrono>
@@ -12,6 +13,15 @@
 namespace s2p {
 
 namespace {
+
+struct ComScope {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ~ComScope() {
+        if (SUCCEEDED(hr)) {
+            CoUninitialize();
+        }
+    }
+};
 
 struct EnumMonEntry {
     MonitorDesc desc{};
@@ -70,10 +80,109 @@ void CopyWideSafe(wchar_t* dst, size_t dstChars, const std::wstring& src) {
     wcsncpy_s(dst, dstChars, src.c_str(), _TRUNCATE);
 }
 
+void FillRandomNonce(uint8_t* dst, size_t len) {
+    if (!dst || len == 0) return;
+    if (BCRYPT_SUCCESS(BCryptGenRandom(nullptr, dst, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        return;
+    }
+    uint64_t t = GetTickCount64();
+    for (size_t i = 0; i < len; ++i) {
+        t ^= (t << 13);
+        t ^= (t >> 7);
+        dst[i] = static_cast<uint8_t>((t >> ((i & 7) * 8)) & 0xFFu);
+    }
+}
+
+bool WaitAndRecvRaw(TcpSocket& sock,
+                    PacketHeader& hdr,
+                    std::vector<uint8_t>& payload,
+                    uint16_t& outRemoteVer,
+                    bool& outVerMismatch,
+                    int maxWaitMs,
+                    const std::atomic<bool>& stop) {
+    outRemoteVer = 0;
+    outVerMismatch = false;
+    int waited = 0;
+    while (waited < maxWaitMs && !stop.load() && sock.IsValid()) {
+        int step = std::min(100, maxWaitMs - waited);
+        int wr = sock.WaitReadable(step);
+        if (wr < 0) return false;
+        if (wr > 0) {
+            return sock.RecvPacketRaw(hdr, payload, outRemoteVer, outVerMismatch);
+        }
+        waited += step;
+    }
+    return false;
+}
+
 } // namespace
 
 ReceiverEngine::~ReceiverEngine() {
     Stop();
+}
+
+void ReceiverEngine::SetConfigIniPath(const std::wstring& iniPath) {
+    std::lock_guard<std::mutex> lock(m_cfgMutex);
+    m_configIniPath = iniPath;
+}
+
+void ReceiverEngine::SetPinCallbacks(PinShowCallback onShow, PinDismissCallback onDismiss) {
+    std::lock_guard<std::mutex> lock(m_cfgMutex);
+    m_onPinShow = std::move(onShow);
+    m_onPinDismiss = std::move(onDismiss);
+}
+
+void ReceiverEngine::SetVersionMismatchCallback(VersionMismatchCallback cb) {
+    std::lock_guard<std::mutex> lock(m_cfgMutex);
+    m_onVersionMismatch = std::move(cb);
+}
+
+std::vector<TrustedDeviceEntry> ReceiverEngine::GetTrustedDevices() const {
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgMutex);
+        ini = m_configIniPath;
+    }
+    return LoadTrustedDevices(ini);
+}
+
+bool ReceiverEngine::RemoveTrustedDeviceByKey(const std::wstring& key) {
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgMutex);
+        ini = m_configIniPath;
+    }
+    return RemoveTrustedDevice(ini, key);
+}
+
+bool ReceiverEngine::ClearAllTrustedDevices() {
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgMutex);
+        ini = m_configIniPath;
+    }
+    return ClearTrustedDevices(ini);
+}
+
+void ReceiverEngine::ShowHiddenStreamWindows() {
+    std::lock_guard<std::mutex> wl(m_workersMutex);
+    for (auto& w : m_workers) {
+        w->showRequested.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+        if (w->activeRenderer) {
+            w->activeRenderer->SignalWake();
+        }
+    }
+}
+
+bool ReceiverEngine::HasHiddenStreamWindows() const {
+    std::lock_guard<std::mutex> wl(m_workersMutex);
+    for (const auto& w : m_workers) {
+        if (w->hiddenByUser.load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::vector<MonitorDesc> ReceiverEngine::EnumerateLocalMonitors() {
@@ -178,6 +287,7 @@ void ReceiverEngine::Stop() {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.running = false;
     m_status.sessionActive = false;
+    m_status.hasHiddenStreams = false;
     m_status.stateText = L"Gestoppt";
 }
 
@@ -192,7 +302,24 @@ void ReceiverEngine::DiscoveryLoop() {
 
         PacketHeader hdr{};
         std::memcpy(&hdr, buf, sizeof(hdr));
-        if (!ValidateHeader(hdr) || hdr.type != static_cast<uint16_t>(MsgType::DiscoverReq)) continue;
+        if (hdr.magic != kProtocolMagic || hdr.payloadSize > kMaxFrameBytes) continue;
+        if (hdr.type != static_cast<uint16_t>(MsgType::DiscoverReq)) continue;
+
+        if (hdr.version != kProtocolVersion) {
+            VersionMismatchPayload vm{};
+            vm.protocolVersion = kProtocolVersion;
+            vm.appVersion = CurrentAppVersionTuple();
+            CopyWideSafe(vm.message, _countof(vm.message), GetHostComputerName());
+
+            struct {
+                PacketHeader hdr;
+                VersionMismatchPayload body;
+            } vmReply{};
+            vmReply.hdr = MakeHeader(MsgType::VersionMismatch, sizeof(VersionMismatchPayload));
+            vmReply.body = vm;
+            m_discoverySock.SendTo(senderIp, senderPort, &vmReply, sizeof(vmReply));
+            continue;
+        }
 
         DiscoverReqPayload req{};
         std::memcpy(&req, buf + sizeof(PacketHeader), sizeof(req));
@@ -207,6 +334,7 @@ void ReceiverEngine::DiscoveryLoop() {
         for (uint32_t i = 0; i < resp.monitorCount; ++i) {
             resp.monitors[i] = mons[i];
         }
+        resp.receiverVersion = CurrentAppVersionTuple();
 
         struct {
             PacketHeader hdr;
@@ -230,16 +358,48 @@ void ReceiverEngine::ControlAcceptLoop() {
 }
 
 void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string& peerIp) {
-    DisconnectSession();
-    m_sessionStop = false;
-
-    clientSock.TuneLowLatency(1024 * 1024);
+    // IMPORTANT: Never disconnect an active session until version check + PIN/MAC auth succeed.
+    clientSock.TuneLowLatency(128 * 1024, 128 * 1024);
     clientSock.SetTimeouts(3000, 1000);
+
+    std::wstring iniPath;
+    PinShowCallback onPinShow;
+    PinDismissCallback onPinDismiss;
+    VersionMismatchCallback onVerMismatch;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgMutex);
+        iniPath = m_configIniPath;
+        onPinShow = m_onPinShow;
+        onPinDismiss = m_onPinDismiss;
+        onVerMismatch = m_onVersionMismatch;
+    }
 
     PacketHeader hdr{};
     std::vector<uint8_t> payload;
-    if (!clientSock.RecvPacket(hdr, payload) ||
-        hdr.type != static_cast<uint16_t>(MsgType::HelloSender) ||
+    uint16_t remoteProtoVer = 0;
+    bool rawVerMismatch = false;
+    if (!WaitAndRecvRaw(clientSock, hdr, payload, remoteProtoVer, rawVerMismatch, 3500, m_stop)) {
+        if (rawVerMismatch) {
+            std::wstring msg = L"Surface nutzt Protokoll v" + std::to_wstring(remoteProtoVer) +
+                               L", dieser PC erwartet Protokoll v" + std::to_wstring(kProtocolVersion) +
+                               L" (App v" + FormatAppVersion(CurrentAppVersion()) +
+                               L"). Bitte beide Apps per GitHub-Updater aktualisieren.";
+            VersionMismatchPayload vm{};
+            vm.protocolVersion = kProtocolVersion;
+            vm.appVersion = CurrentAppVersionTuple();
+            CopyWideSafe(vm.message, _countof(vm.message), msg);
+            clientSock.SendPacket(MsgType::VersionMismatch, &vm, sizeof(vm));
+            Logger::Instance().Warn("RCV-VER", msg);
+            if (onVerMismatch) {
+                onVerMismatch(remoteProtoVer, AppVersionTuple{}, msg);
+            }
+        } else {
+            Logger::Instance().Warn("RCV-CTL", L"Expected HelloSender packet (timed out or closed).");
+        }
+        return;
+    }
+
+    if (hdr.type != static_cast<uint16_t>(MsgType::HelloSender) ||
         payload.size() < sizeof(HelloSenderPayload)) {
         Logger::Instance().Warn("RCV-CTL", L"Expected HelloSender packet.");
         return;
@@ -249,6 +409,172 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     std::memcpy(&helloSender, payload.data(), sizeof(helloSender));
     helloSender.senderName[_countof(helloSender.senderName) - 1] = L'\0';
 
+    // Resolve MAC from LAN ARP cache first, falling back to sender-supplied MAC
+    uint8_t resolvedMac[6]{};
+    if (!ResolvePeerMacFromIp(peerIp, resolvedMac) || IsAllZero(resolvedMac, 6)) {
+        std::memcpy(resolvedMac, helloSender.senderMac, 6);
+    }
+
+    TrustedDeviceEntry matchedTrust{};
+    bool trusted = false;
+    if (!iniPath.empty()) {
+        trusted = IsDeviceTrusted(iniPath, resolvedMac, helloSender.senderDeviceId, &matchedTrust);
+    }
+
+    if (trusted) {
+        Logger::Instance().Info("RCV-AUTH",
+            L"Trusted device auto-approved: " +
+            (helloSender.senderName[0] ? std::wstring(helloSender.senderName) : Utf8ToWide(peerIp)) +
+            L" (" + (!matchedTrust.macStr.empty() ? matchedTrust.macStr : matchedTrust.key) + L")");
+        if (!iniPath.empty() && matchedTrust.lastIp != Utf8ToWide(peerIp) &&
+            MakeTrustedDeviceKey(resolvedMac, helloSender.senderDeviceId) == matchedTrust.key) {
+            SaveTrustedDevice(iniPath,
+                              helloSender.senderName[0] ? std::wstring(helloSender.senderName) : matchedTrust.name,
+                              resolvedMac,
+                              helloSender.senderDeviceId,
+                              peerIp);
+        }
+    } else {
+        const std::string expectedPin = GeneratePin6();
+        auto pinSession = std::make_shared<PinPopupSession>();
+        pinSession->req.pinCode = expectedPin;
+        pinSession->req.senderName = helloSender.senderName[0] ? std::wstring(helloSender.senderName) : L"Surface";
+        pinSession->req.senderIp = peerIp;
+        std::memcpy(pinSession->req.senderMac, resolvedMac, 6);
+        std::memcpy(pinSession->req.senderDeviceId, helloSender.senderDeviceId, 16);
+        pinSession->req.senderVersion = helloSender.senderVersion;
+
+        if (onPinShow) {
+            onPinShow(pinSession);
+        }
+
+        PairChallengePayload challenge{};
+        FillRandomNonce(challenge.nonce, sizeof(challenge.nonce));
+        CopyWideSafe(challenge.pcName, _countof(challenge.pcName), GetHostComputerName());
+        challenge.pcVersion = CurrentAppVersionTuple();
+
+        if (!clientSock.SendPacket(MsgType::PairChallenge, &challenge, sizeof(challenge))) {
+            if (onPinDismiss) onPinDismiss();
+            return;
+        }
+
+        Logger::Instance().Info("RCV-AUTH",
+            L"PIN challenge issued for " + pinSession->req.senderName + L" (" + Utf8ToWide(peerIp) + L").");
+
+        uint8_t remainingAttempts = 3;
+        bool authed = false;
+        const auto authDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+
+        while (!m_stop && !pinSession->rejected.load() &&
+               std::chrono::steady_clock::now() < authDeadline &&
+               clientSock.IsValid()) {
+            int wr = clientSock.WaitReadable(50);
+            if (wr < 0) {
+                break;
+            }
+            if (wr == 0) {
+                continue;
+            }
+
+            PacketHeader phdr{};
+            std::vector<uint8_t> ppayload;
+            uint16_t pVer = 0;
+            bool pMismatch = false;
+            if (!clientSock.RecvPacketRaw(phdr, ppayload, pVer, pMismatch)) {
+                if (pMismatch && onVerMismatch) {
+                    onVerMismatch(pVer, AppVersionTuple{}, L"Versionskonflikt waehrend PIN-Pruefung.");
+                }
+                break;
+            }
+
+            if (phdr.type != static_cast<uint16_t>(MsgType::PairVerify) ||
+                ppayload.size() < sizeof(PairVerifyPayload)) {
+                break;
+            }
+
+            PairVerifyPayload pv{};
+            std::memcpy(&pv, ppayload.data(), sizeof(pv));
+            pv.pinCode[sizeof(pv.pinCode) - 1] = '\0';
+            pv.senderName[_countof(pv.senderName) - 1] = L'\0';
+
+            if (ConstantTimePinEquals(pv.pinCode, expectedPin.c_str(), 6)) {
+                bool remember = pinSession->remember.load();
+                uint8_t effectiveMac[6]{};
+                if (!IsAllZero(resolvedMac, 6)) {
+                    std::memcpy(effectiveMac, resolvedMac, 6);
+                } else if (!IsAllZero(pv.senderMac, 6)) {
+                    std::memcpy(effectiveMac, pv.senderMac, 6);
+                } else {
+                    std::memcpy(effectiveMac, helloSender.senderMac, 6);
+                }
+                const uint8_t* effectiveId = !IsAllZero(pv.senderDeviceId, 16)
+                                                 ? pv.senderDeviceId
+                                                 : helloSender.senderDeviceId;
+                std::wstring devName = helloSender.senderName[0]
+                                           ? std::wstring(helloSender.senderName)
+                                           : (pv.senderName[0] ? std::wstring(pv.senderName) : Utf8ToWide(peerIp));
+
+                bool saved = false;
+                if (remember && !iniPath.empty()) {
+                    saved = SaveTrustedDevice(iniPath, devName, effectiveMac, effectiveId, peerIp);
+                }
+
+                PairResultPayload pr{};
+                pr.accepted = 1;
+                pr.remembered = saved ? 1 : 0;
+                pr.remainingAttempts = remainingAttempts;
+                CopyWideSafe(pr.message, _countof(pr.message),
+                             saved ? L"Gekoppelt und MAC gespeichert." : L"Gekoppelt.");
+                if (clientSock.SendPacket(MsgType::PairResult, &pr, sizeof(pr))) {
+                    authed = true;
+                }
+                Logger::Instance().Info("RCV-AUTH",
+                    L"PIN verified for " + devName + (saved ? L" (MAC/Device saved to trusted list)." : L" (one-time session)."));
+                break;
+            }
+
+            if (remainingAttempts > 0) {
+                --remainingAttempts;
+            }
+            PairResultPayload pr{};
+            pr.accepted = 0;
+            pr.remembered = 0;
+            pr.remainingAttempts = remainingAttempts;
+            CopyWideSafe(pr.message, _countof(pr.message),
+                         remainingAttempts > 0
+                             ? L"Falsche PIN - bitte erneut versuchen."
+                             : L"Zu viele falsche PIN-Eingaben.");
+            clientSock.SendPacket(MsgType::PairResult, &pr, sizeof(pr));
+            Logger::Instance().Warn("RCV-AUTH",
+                L"Invalid PIN attempt from " + Utf8ToWide(peerIp) +
+                L", remaining=" + std::to_wstring(remainingAttempts));
+            if (remainingAttempts == 0) {
+                break;
+            }
+        }
+
+        if (!authed && pinSession->rejected.load() && clientSock.IsValid()) {
+            PairResultPayload pr{};
+            pr.accepted = 0;
+            pr.remainingAttempts = 0;
+            CopyWideSafe(pr.message, _countof(pr.message), L"Verbindung am PC abgelehnt.");
+            clientSock.SendPacket(MsgType::PairResult, &pr, sizeof(pr));
+            Logger::Instance().Warn("RCV-AUTH", L"Pairing request rejected by PC user.");
+        }
+
+        if (onPinDismiss) {
+            onPinDismiss();
+        }
+        if (!authed) {
+            clientSock.Close();
+            return;
+        }
+    }
+
+    // Authenticated! Now tear down any previous session cleanly before starting the new one.
+    DisconnectSession();
+    m_sessionStop = false;
+
     std::vector<MonitorHdrInfo> hdrList;
     auto mons = EnumerateLocalMonitorsWithHdr(hdrList);
     HelloReceiverPayload helloResp{};
@@ -257,13 +583,14 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     for (uint32_t i = 0; i < helloResp.monitorCount; ++i) {
         helloResp.monitors[i] = mons[i];
     }
+    helloResp.receiverVersion = CurrentAppVersionTuple();
 
     if (!clientSock.SendPacket(MsgType::HelloReceiver, &helloResp, sizeof(helloResp))) {
         return;
     }
 
     // Wait for StartSession
-    if (!clientSock.RecvPacket(hdr, payload) ||
+    if (!WaitAndRecvRaw(clientSock, hdr, payload, remoteProtoVer, rawVerMismatch, 5000, m_stop) ||
         hdr.type != static_cast<uint16_t>(MsgType::StartSession) ||
         payload.size() < sizeof(StartSessionPayload)) {
         Logger::Instance().Warn("RCV-CTL", L"Expected StartSession packet.");
@@ -297,6 +624,9 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
         w->targetMonitorRect = RECT{ md.left, md.top, md.right, md.bottom };
         w->expectedWidth = spec.width ? spec.width : md.width;
         w->expectedHeight = spec.height ? spec.height : md.height;
+        uint32_t monHz = (md.refreshHz >= 24 && md.refreshHz <= 240) ? md.refreshHz : 60u;
+        w->targetFps = (spec.targetFps >= 15 && spec.targetFps <= 240) ? spec.targetFps : monHz;
+        w->desiredTargetFps.store(w->targetFps);
         w->startFullscreen = m_startFullscreen.load();
         w->stats.monitorIndex = i;
         w->stats.width = w->expectedWidth;
@@ -359,8 +689,9 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.sessionActive = true;
-        m_status.senderName = helloSender.senderName;
+        m_status.senderName = helloSender.senderName[0] ? std::wstring(helloSender.senderName) : Utf8ToWide(peerIp);
         m_status.senderIp = peerIp;
+        m_status.senderVersion = helloSender.senderVersion;
         m_status.localMonitors = mons;
         m_status.localMonitorHdr = hdrList;
         m_status.stateText = L"Verbunden mit " + m_status.senderName + L" (" + Utf8ToWide(peerIp) +
@@ -394,6 +725,21 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
             if (chdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
                 Logger::Instance().Info("RCV-CTL", L"Sender closed session.");
                 break;
+            } else if (chdr.type == static_cast<uint16_t>(MsgType::ReconfigureStream) &&
+                       cpayload.size() >= sizeof(ReconfigureStreamPayload)) {
+                ReconfigureStreamPayload rc{};
+                std::memcpy(&rc, cpayload.data(), sizeof(rc));
+                Logger::Instance().Info("RCV-CTL",
+                    L"Live stream reconfigure stream=" + std::to_wstring(rc.streamIndex) +
+                    L" codec=" + std::to_wstring(rc.codec) +
+                    L" bitrate=" + std::to_wstring(rc.bitrateMbps) + L" Mbit/s" +
+                    L" fps=" + std::to_wstring(rc.targetFps));
+                std::lock_guard<std::mutex> wl(m_workersMutex);
+                for (auto& w : m_workers) {
+                    if (w->monitorIndex == rc.streamIndex && rc.targetFps >= 15 && rc.targetFps <= 240) {
+                        w->desiredTargetFps.store(rc.targetFps);
+                    }
+                }
             } else if (chdr.type == static_cast<uint16_t>(MsgType::ClipboardSync) &&
                        cpayload.size() >= sizeof(ClipboardHeader)) {
                 ClipboardHeader ch{};
@@ -448,7 +794,7 @@ void ReceiverEngine::RequestKeyframe(uint32_t monitorIndex) {
 }
 
 void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ComScope comScope;
 
     TcpSocket sock;
     for (int iter = 0; iter < 50 && !m_stop && !m_sessionStop && !w->stop && w->listenSock.IsValid(); ++iter) {
@@ -458,10 +804,10 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     w->listenSock.Close();
     if (!sock.IsValid()) {
         Logger::Instance().Warn("RCV-STRM", L"Timed out or canceled waiting for stream connection on port " + std::to_wstring(w->port));
-        CoUninitialize();
         return;
     }
-    sock.TuneLowLatency(4 * 1024 * 1024);
+    // Asymmetric low-latency stream socket (small SNDBUF, generous RCVBUF)
+    sock.TuneLowLatency(64 * 1024, 512 * 1024);
     sock.SetTimeouts(3000, 1500);
 
     const uint32_t colorIdx = std::min<uint32_t>(w->targetMonitorIndex, kMaxMonitors - 1);
@@ -471,8 +817,12 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     renderer.SetColorConfig(GetMonitorColorConfig(colorIdx));
     if (!renderer.Create(w->monitorIndex, w->targetMonitorRect, w->expectedWidth, w->expectedHeight, w->startFullscreen)) {
         Logger::Instance().Error("RCV-RND", L"Failed to create D3D11Renderer for monitor " + std::to_wstring(w->monitorIndex));
-        CoUninitialize();
         return;
+    }
+
+    {
+        std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+        w->activeRenderer = &renderer;
     }
 
     bool lastGlobalKvm = m_kvmEnabled.load();
@@ -488,32 +838,242 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         SendFiles(files);
     });
 
-    H264Decoder h264;
-    uint32_t h264W = 0, h264H = 0;
-    bool h264InitFailed = false;
-    bool decodedAnyH264 = false;
-    uint32_t consecutiveH264Fails = 0;
-    auto lastKeyframeReq = std::chrono::steady_clock::time_point{};
-    DeltaDecoder delta;
-    std::vector<uint8_t> cpuBgra;
+    std::atomic<bool> recvStop{ false };
+    std::atomic<bool> streamEnded{ false };
 
-    auto maybeRequestKeyframe = [&]() {
-        auto now = std::chrono::steady_clock::now();
-        if (lastKeyframeReq.time_since_epoch().count() == 0 ||
-            now - lastKeyframeReq >= std::chrono::milliseconds(1000)) {
-            RequestKeyframe(w->monitorIndex);
-            lastKeyframeReq = now;
+    // Dedicated recv + decode worker thread: never stalls on Present(), Win32 resizing, or RawInput
+    std::thread recvDecodeThread([&]() {
+        ComScope decodeCom;
+        H264Decoder h264;
+        uint32_t h264W = 0, h264H = 0;
+        uint64_t h264DeviceGen = renderer.DeviceGeneration();
+        bool h264InitFailed = false;
+        bool decodedAnyH264 = false;
+        uint32_t consecutiveH264Fails = 0;
+        auto lastKeyframeReq = std::chrono::steady_clock::time_point{};
+        DeltaDecoder delta;
+        std::vector<uint8_t> cpuBgra;
+
+        auto maybeRequestKeyframe = [&]() {
+            auto now = std::chrono::steady_clock::now();
+            if (lastKeyframeReq.time_since_epoch().count() == 0 ||
+                now - lastKeyframeReq >= std::chrono::milliseconds(1000)) {
+                RequestKeyframe(w->monitorIndex);
+                lastKeyframeReq = now;
+            }
+        };
+
+        auto windowStart = std::chrono::steady_clock::now();
+        uint64_t windowFrames = 0;
+        uint64_t windowBytes = 0;
+        uint64_t totalFrames = 0;
+
+        while (!m_stop && !m_sessionStop && !w->stop && !recvStop && !streamEnded) {
+            int wr = sock.WaitReadable(50);
+            if (wr < 0) {
+                streamEnded.store(true);
+                break;
+            }
+            if (wr == 0) {
+                continue;
+            }
+
+            // Drain burst of queued packets so we always render the freshest cursor & video frame
+            for (int drained = 0; drained < 8 && wr > 0 && !recvStop && !m_stop && !m_sessionStop && !w->stop; ++drained) {
+                PacketHeader hdr{};
+                std::vector<uint8_t> payload;
+                if (!sock.RecvPacket(hdr, payload)) {
+                    streamEnded.store(true);
+                    break;
+                }
+
+                if (hdr.type == static_cast<uint16_t>(MsgType::StreamEnd)) {
+                    streamEnded.store(true);
+                    break;
+                } else if (hdr.type == static_cast<uint16_t>(MsgType::CursorUpdate) &&
+                           payload.size() >= sizeof(CursorUpdateHeader)) {
+                    CursorUpdateHeader ch{};
+                    std::memcpy(&ch, payload.data(), sizeof(ch));
+                    const uint8_t* shapePtr = (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize)
+                                                  ? (payload.data() + sizeof(ch))
+                                                  : nullptr;
+                    renderer.QueueCursorUpdate(ch.visible != 0, ch.x, ch.y, ch.shapeChanged != 0, ch.shapeType,
+                                               ch.shapeWidth, ch.shapeHeight, ch.shapePitch, ch.hotX, ch.hotY,
+                                               shapePtr, ch.dataSize);
+                } else if (hdr.type == static_cast<uint16_t>(MsgType::VideoFrame) &&
+                           payload.size() >= sizeof(VideoFrameHeader)) {
+                    VideoFrameHeader vh{};
+                    std::memcpy(&vh, payload.data(), sizeof(vh));
+                    if (payload.size() < sizeof(vh) + vh.dataSize) {
+                        wr = sock.WaitReadable(0);
+                        continue;
+                    }
+                    const uint8_t* frameData = payload.data() + sizeof(vh);
+
+                    bool decodedOk = false;
+                    std::wstring codecLabel;
+                    bool isDxva = false;
+                    bool needKeyframeNow = false;
+                    bool needKeyframeThrottled = false;
+
+                    if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
+                        uint32_t outW = vh.width, outH = vh.height;
+                        bool pushCpuFrame = false;
+                        bool pushGpuFrame = false;
+
+                        {
+                            std::unique_lock<std::mutex> gpuLock(renderer.GpuMutex());
+                            uint64_t curGen = renderer.DeviceGeneration();
+                            if (curGen != h264DeviceGen) {
+                                h264.Shutdown();
+                                h264DeviceGen = curGen;
+                                h264W = 0;
+                                h264H = 0;
+                                h264InitFailed = false;
+                                decodedAnyH264 = false;
+                                consecutiveH264Fails = 0;
+                                delta.Reset();
+                            }
+
+                            if (!renderer.Device() || !renderer.Context()) {
+                                needKeyframeThrottled = true;
+                            } else {
+                                if (h264W != vh.width || h264H != vh.height) {
+                                    h264.Shutdown();
+                                    h264W = vh.width;
+                                    h264H = vh.height;
+                                    h264InitFailed = false;
+                                    decodedAnyH264 = false;
+                                    consecutiveH264Fails = 0;
+                                }
+
+                                if (!h264.IsInitialized() && !h264InitFailed) {
+                                    uint32_t fpsHint = w->desiredTargetFps.load();
+                                    bool initOk = h264.Init(renderer.Device(), renderer.Context(),
+                                                            vh.width, vh.height, true, fpsHint);
+                                    if (!initOk) {
+                                        initOk = h264.Init(renderer.Device(), renderer.Context(),
+                                                           vh.width, vh.height, false, fpsHint);
+                                    }
+                                    if (!initOk) {
+                                        h264InitFailed = true;
+                                    } else {
+                                        renderer.EnsureFrameTexture(vh.width, vh.height);
+                                    }
+                                }
+
+                                if (h264.IsInitialized()) {
+                                    if (h264.IsHardwareDxva()) {
+                                        if (renderer.EnsureFrameTexture(vh.width, vh.height)) {
+                                            decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
+                                                                    renderer.FrameTexture(), nullptr, &outW, &outH);
+                                            if (decodedOk && renderer.Context()) {
+                                                renderer.Context()->Flush();
+                                                pushGpuFrame = true;
+                                            }
+                                        }
+                                        codecLabel = L"H.264 (NVDEC/DXVA)";
+                                        isDxva = true;
+                                    } else {
+                                        decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
+                                                                nullptr, &cpuBgra, &outW, &outH);
+                                        if (decodedOk && !cpuBgra.empty()) {
+                                            pushCpuFrame = true;
+                                        }
+                                        codecLabel = L"H.264 (CPU)";
+                                    }
+
+                                    if (decodedOk) {
+                                        decodedAnyH264 = true;
+                                        consecutiveH264Fails = 0;
+                                    } else {
+                                        ++consecutiveH264Fails;
+                                        if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
+                                            Logger::Instance().Warn("RCV-DEC",
+                                                L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
+                                            uint32_t fpsHint = w->desiredTargetFps.load();
+                                            if (!h264.Init(renderer.Device(), renderer.Context(),
+                                                           vh.width, vh.height, false, fpsHint)) {
+                                                h264InitFailed = true;
+                                            }
+                                            consecutiveH264Fails = 0;
+                                            needKeyframeNow = true;
+                                        } else if (consecutiveH264Fails >= 2) {
+                                            needKeyframeThrottled = true;
+                                        }
+                                    }
+                                } else {
+                                    needKeyframeThrottled = true;
+                                }
+                            }
+                        } // Unlock m_gpuMutex before queuing/waking/network I/O
+
+                        if (pushGpuFrame) {
+                            renderer.MarkGpuFrameUpdated();
+                        } else if (pushCpuFrame) {
+                            renderer.QueueCpuFrame(cpuBgra.data(), outW * 4, outW, outH);
+                        }
+                        if (needKeyframeNow) {
+                            RequestKeyframe(w->monitorIndex);
+                            lastKeyframeReq = std::chrono::steady_clock::now();
+                        } else if (needKeyframeThrottled) {
+                            maybeRequestKeyframe();
+                        }
+                    } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
+                        if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
+                            renderer.QueueCpuFrame(delta.FrameData(), delta.StrideBytes(), delta.Width(), delta.Height());
+                            decodedOk = true;
+                            codecLabel = L"Delta Lossless";
+                        } else {
+                            maybeRequestKeyframe();
+                        }
+                    }
+
+                    if (decodedOk) {
+                        ++totalFrames;
+                        ++windowFrames;
+                        windowBytes += payload.size() + sizeof(PacketHeader);
+
+                        auto now = std::chrono::steady_clock::now();
+                        double elapsed = std::chrono::duration<double>(now - windowStart).count();
+                        if (elapsed >= 0.5) {
+                            std::lock_guard<std::mutex> sl(w->statsMutex);
+                            w->stats.width = vh.width;
+                            w->stats.height = vh.height;
+                            w->stats.fps = static_cast<double>(windowFrames) / elapsed;
+                            w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsed * 1000000.0);
+                            w->stats.framesReceived = totalFrames;
+                            w->stats.codecName = codecLabel;
+                            w->stats.hardwareDxva = isDxva;
+                            windowStart = now;
+                            windowFrames = 0;
+                            windowBytes = 0;
+                        }
+                    }
+                }
+
+                wr = sock.WaitReadable(0);
+                if (wr < 0) {
+                    streamEnded.store(true);
+                    break;
+                }
+            }
         }
-    };
 
-    auto windowStart = std::chrono::steady_clock::now();
-    uint64_t windowFrames = 0;
-    uint64_t windowBytes = 0;
-    uint64_t totalFrames = 0;
-    bool needPresent = false;
-    bool streamEnded = false;
+        {
+            std::lock_guard<std::mutex> gpuLock(renderer.GpuMutex());
+            h264.Shutdown();
+        }
+        renderer.SignalWake();
+    });
 
-    while (!m_stop && !m_sessionStop && !w->stop && !streamEnded && !renderer.IsClosedByUser()) {
+    // Dedicated UI/Render loop on window-owning thread
+    while (!m_stop && !m_sessionStop && !w->stop && !streamEnded) {
+        if (w->showRequested.exchange(false, std::memory_order_acquire)) {
+            renderer.ShowFromHidden();
+        }
+        w->hiddenByUser.store(renderer.IsHiddenByUser(), std::memory_order_release);
+
         bool curGlobalKvm = m_kvmEnabled.load();
         if (curGlobalKvm != lastGlobalKvm) {
             lastGlobalKvm = curGlobalKvm;
@@ -524,189 +1084,46 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
             lastColorGen = curColorGen;
             renderer.SetColorConfig(GetMonitorColorConfig(colorIdx));
         }
+
         renderer.PumpMessages();
-        if (renderer.NeedsRepaint()) {
-            renderer.ClearRepaint();
-            needPresent = true;
-        }
 
-        int wr = sock.WaitReadable(needPresent ? 0 : 1);
-        if (wr < 0) {
-            break;
-        }
-
-        // Drain all currently queued packets so we always render the freshest cursor & video frame
-        for (int drained = 0; drained < 8 && wr > 0; ++drained) {
-            PacketHeader hdr{};
-            std::vector<uint8_t> payload;
-            if (!sock.RecvPacket(hdr, payload)) {
-                streamEnded = true;
-                break;
-            }
-
-            if (hdr.type == static_cast<uint16_t>(MsgType::StreamEnd)) {
-                streamEnded = true;
-                break;
-            } else if (hdr.type == static_cast<uint16_t>(MsgType::CursorUpdate) &&
-                       payload.size() >= sizeof(CursorUpdateHeader)) {
-                CursorUpdateHeader ch{};
-                std::memcpy(&ch, payload.data(), sizeof(ch));
-                const uint8_t* shapePtr = (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize)
-                                              ? (payload.data() + sizeof(ch))
-                                              : nullptr;
-                renderer.UpdateCursor(ch.visible != 0, ch.x, ch.y, ch.shapeChanged != 0, ch.shapeType,
-                                      ch.shapeWidth, ch.shapeHeight, ch.shapePitch, ch.hotX, ch.hotY,
-                                      shapePtr, ch.dataSize);
-                needPresent = true;
-            } else if (hdr.type == static_cast<uint16_t>(MsgType::VideoFrame) &&
-                       payload.size() >= sizeof(VideoFrameHeader)) {
-                VideoFrameHeader vh{};
-                std::memcpy(&vh, payload.data(), sizeof(vh));
-                if (payload.size() < sizeof(vh) + vh.dataSize) {
-                    wr = sock.WaitReadable(0);
-                    continue;
-                }
-                const uint8_t* frameData = payload.data() + sizeof(vh);
-
-                bool decodedOk = false;
-                std::wstring codecLabel;
-                bool isDxva = false;
-
-                if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
-                    if (h264W != vh.width || h264H != vh.height) {
-                        h264W = vh.width;
-                        h264H = vh.height;
-                        h264InitFailed = false;
-                        decodedAnyH264 = false;
-                        consecutiveH264Fails = 0;
-                    }
-                    if (!h264.IsInitialized() && !h264InitFailed) {
-                        bool initOk = h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height);
-                        if (!initOk) {
-                            initOk = h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false);
-                        }
-                        if (!initOk) {
-                            h264InitFailed = true;
-                        } else {
-                            renderer.EnsureFrameTexture(vh.width, vh.height);
-                        }
-                    }
-                    if (h264.IsInitialized()) {
-                        renderer.EnsureFrameTexture(vh.width, vh.height);
-                        uint32_t outW = vh.width, outH = vh.height;
-                        if (h264.IsHardwareDxva()) {
-                            decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
-                                                    renderer.FrameTexture(), nullptr, &outW, &outH);
-                            codecLabel = L"H.264 (NVDEC/DXVA)";
-                            isDxva = true;
-                        } else {
-                            decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
-                                                    nullptr, &cpuBgra, &outW, &outH);
-                            if (decodedOk && !cpuBgra.empty()) {
-                                renderer.UploadCpuBgra(cpuBgra.data(), outW * 4, outW, outH);
-                            }
-                            codecLabel = L"H.264 (CPU)";
-                        }
-
-                        if (decodedOk) {
-                            decodedAnyH264 = true;
-                            consecutiveH264Fails = 0;
-                        } else {
-                            ++consecutiveH264Fails;
-                            if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
-                                Logger::Instance().Warn("RCV-DEC", L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
-                                if (!h264.Init(renderer.Device(), renderer.Context(), vh.width, vh.height, false)) {
-                                    h264InitFailed = true;
-                                }
-                                consecutiveH264Fails = 0;
-                                RequestKeyframe(w->monitorIndex);
-                                lastKeyframeReq = std::chrono::steady_clock::now();
-                            } else if (consecutiveH264Fails >= 2) {
-                                maybeRequestKeyframe();
-                            }
-                        }
-                    } else {
-                        maybeRequestKeyframe();
-                    }
-                } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
-                    if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
-                        renderer.UploadCpuBgra(delta.FrameData(), delta.StrideBytes(), delta.Width(), delta.Height());
-                        decodedOk = true;
-                        codecLabel = L"Delta Lossless";
-                    } else {
-                        maybeRequestKeyframe();
-                    }
-                }
-
-                if (decodedOk) {
-                    ++totalFrames;
-                    ++windowFrames;
-                    windowBytes += payload.size() + sizeof(PacketHeader);
-                    needPresent = true;
-
-                    auto now = std::chrono::steady_clock::now();
-                    double elapsed = std::chrono::duration<double>(now - windowStart).count();
-                    if (elapsed >= 0.5) {
-                        std::lock_guard<std::mutex> sl(w->statsMutex);
-                        w->stats.width = vh.width;
-                        w->stats.height = vh.height;
-                        w->stats.fps = static_cast<double>(windowFrames) / elapsed;
-                        w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsed * 1000000.0);
-                        w->stats.framesReceived = totalFrames;
-                        w->stats.codecName = codecLabel;
-                        w->stats.hardwareDxva = isDxva;
-                        windowStart = now;
-                        windowFrames = 0;
-                        windowBytes = 0;
-                    }
-                }
-            }
-
-            wr = sock.WaitReadable(0);
-            if (wr < 0) {
-                streamEnded = true;
-                break;
-            }
-        }
-
-        bool checkDeviceLost = false;
-        if (needPresent) {
+        bool doPresent = renderer.ConsumePendingWork() || renderer.NeedsRepaint();
+        renderer.ClearRepaint();
+        if (doPresent) {
             renderer.Present();
-            needPresent = false;
-            checkDeviceLost = true;
-        } else if (consecutiveH264Fails >= 2) {
-            checkDeviceLost = true;
         }
 
-        if (checkDeviceLost && renderer.ConsumeDeviceLost()) {
-            h264.Shutdown();
-            h264W = 0;
-            h264H = 0;
-            h264InitFailed = false;
-            decodedAnyH264 = false;
-            consecutiveH264Fails = 0;
+        if (renderer.ConsumeDeviceLost()) {
             if (!renderer.RecreateDeviceAndResources()) {
                 Logger::Instance().Error("RCV-D3D", L"Failed recreating D3D11 device after device lost.");
                 break;
             }
-            delta.Reset();
             RequestKeyframe(w->monitorIndex);
-            lastKeyframeReq = std::chrono::steady_clock::now();
+        }
+
+        if (!renderer.NeedsRepaint() && !w->showRequested.load() &&
+            !streamEnded.load() && !m_stop && !m_sessionStop && !w->stop) {
+            HANDLE wake = renderer.WakeHandle();
+            if (wake) {
+                MsgWaitForMultipleObjectsEx(1, &wake, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            } else {
+                MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
         }
     }
 
-    if (renderer.IsClosedByUser() && !m_sessionStop) {
-        std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
-        if (m_activeCtrlSock.IsValid()) {
-            m_activeCtrlSock.SendPacket(MsgType::StopSession, nullptr, 0);
-        }
-        m_sessionStop = true;
-    }
-
-    h264.Shutdown();
-    renderer.Destroy();
+    recvStop.store(true);
     sock.Close();
-    CoUninitialize();
+    if (recvDecodeThread.joinable()) {
+        recvDecodeThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+        w->activeRenderer = nullptr;
+    }
+    w->hiddenByUser.store(false);
+    renderer.Destroy();
 }
 
 void ReceiverEngine::StopStreamWorkers() {
@@ -716,6 +1133,10 @@ void ReceiverEngine::StopStreamWorkers() {
         for (auto& w : m_workers) {
             w->stop = true;
             w->listenSock.Close();
+            std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+            if (w->activeRenderer) {
+                w->activeRenderer->SignalWake();
+            }
         }
         toJoin.swap(m_workers);
     }
@@ -742,8 +1163,10 @@ void ReceiverEngine::DisconnectSession() {
 
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.sessionActive = false;
+    m_status.hasHiddenStreams = false;
     m_status.senderName.clear();
     m_status.senderIp.clear();
+    m_status.senderVersion = AppVersionTuple{};
     m_status.streams.clear();
     if (m_running) {
         m_status.stateText = L"Bereit - Warte auf Verbindung vom Surface (Port " +
@@ -759,10 +1182,19 @@ ReceiverStatus ReceiverEngine::GetStatus() const {
     }
     st.fileStats = m_fileTransfer.GetStats();
     st.streams.clear();
+    st.hasHiddenStreams = false;
     std::lock_guard<std::mutex> wl(m_workersMutex);
     for (const auto& w : m_workers) {
-        std::lock_guard<std::mutex> sl(w->statsMutex);
-        st.streams.push_back(w->stats);
+        ReceiverStreamStats rs;
+        {
+            std::lock_guard<std::mutex> sl(w->statsMutex);
+            rs = w->stats;
+        }
+        rs.hiddenByUser = w->hiddenByUser.load(std::memory_order_acquire);
+        if (rs.hiddenByUser) {
+            st.hasHiddenStreams = true;
+        }
+        st.streams.push_back(std::move(rs));
     }
     return st;
 }

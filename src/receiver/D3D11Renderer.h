@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -23,7 +24,7 @@ public:
     using KvmKeyCallback    = std::function<void(const KvmKeyEvent&)>;
     using KvmToggleCallback = std::function<void(bool)>;
 
-    D3D11Renderer() = default;
+    D3D11Renderer();
     ~D3D11Renderer();
 
     D3D11Renderer(const D3D11Renderer&) = delete;
@@ -46,15 +47,36 @@ public:
                 bool startFullscreen = true);
 
     void Destroy();
-    bool IsClosedByUser() const { return m_closedByUser; }
 
+    // Hide-on-close semantics: WM_CLOSE hides window instead of ending session
+    bool IsClosedByUser() const { return false; }
+    bool IsHiddenByUser() const { return m_hiddenByUser.load(); }
+    void ShowFromHidden();
+
+    // Thread-safe accessors for decoupled recv+decode worker thread
+    std::mutex& GpuMutex() { return m_gpuMutex; }
+    uint64_t DeviceGeneration() const { return m_deviceGen.load(std::memory_order_acquire); }
     ID3D11Device* Device() const { return m_device.Get(); }
     ID3D11DeviceContext* Context() const { return m_context.Get(); }
-
-    // Texture suitable for H264Decoder GPU output (B8G8R8A8_UNORM, RENDER_TARGET | SHADER_RESOURCE)
     ID3D11Texture2D* FrameTexture() const { return m_frameTex.Get(); }
     bool EnsureFrameTexture(uint32_t width, uint32_t height);
 
+    void QueueCpuFrame(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height);
+    void QueueCursorUpdate(bool visible,
+                           int32_t x,
+                           int32_t y,
+                           bool shapeChanged,
+                           uint8_t shapeType,
+                           uint32_t width,
+                           uint32_t height,
+                           uint32_t pitch,
+                           uint32_t hotX,
+                           uint32_t hotY,
+                           const uint8_t* shapeData,
+                           size_t shapeDataSize);
+    void MarkGpuFrameUpdated();
+
+    // Legacy direct calls (Render-thread only)
     void UploadCpuBgra(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height);
     void UpdateCursor(bool visible,
                       int32_t x,
@@ -83,8 +105,12 @@ public:
     void Present();
     bool ConsumeDeviceLost();
     bool RecreateDeviceAndResources();
-    bool NeedsRepaint() const { return m_needRepaint; }
+
+    bool NeedsRepaint() const { return m_needRepaint.load(); }
     void ClearRepaint() { m_needRepaint = false; }
+    bool ConsumePendingWork() { return m_hasPendingWork.exchange(false); }
+    void SignalWake();
+    HANDLE WakeHandle() const { return m_wakeEvent; }
 
     uint32_t MonitorIndex() const { return m_monitorIndex; }
     uint32_t SourceWidth() const { return m_srcWidth; }
@@ -97,6 +123,29 @@ public:
     LRESULT HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 private:
+    struct PendingCpuFrame {
+        bool dirty = false;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t stride = 0;
+        std::vector<uint8_t> bgra;
+    };
+
+    struct PendingCursorUpdate {
+        bool posDirty = false;
+        bool visible = false;
+        int32_t x = 0;
+        int32_t y = 0;
+        bool shapeDirty = false;
+        uint8_t shapeType = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t pitch = 0;
+        uint32_t hotX = 0;
+        uint32_t hotY = 0;
+        std::vector<uint8_t> shapeData;
+    };
+
     bool CreateDeviceAndShaders();
     void CreateDefaultCursorTexture();
     bool CreateSwapChain(uint32_t w, uint32_t h);
@@ -123,9 +172,10 @@ private:
     uint32_t m_winWidth = 1280;
     uint32_t m_winHeight = 720;
     bool m_fullscreen = true;
-    bool m_closedByUser = false;
-    bool m_needRepaint = false;
-    bool m_deviceLost = false;
+    std::atomic<bool> m_hiddenByUser{false};
+    std::atomic<bool> m_needRepaint{false};
+    std::atomic<bool> m_hasPendingWork{false};
+    std::atomic<bool> m_deviceLost{false};
     bool m_kvmEnabled = true;
     bool m_kvmCaptured = false;
     bool m_escReleasedCapture = false;
@@ -142,9 +192,24 @@ private:
     float m_osSdrWhiteScale = 1.0f;
     bool m_hdrSwapChain = false;
     bool m_needSwapChainRebuild = false;
+    bool m_allowTearing = false;
+    bool m_useTearingOnPresent = true;
+    UINT m_swapChainFlags = 0;
+    HANDLE m_frameLatencyWaitable = nullptr;
+    HANDLE m_wakeEvent = nullptr;
     MonitorColorConfig m_colorConfig{};
 
     HWND m_hwnd = nullptr;
+
+    mutable std::mutex m_gpuMutex;
+    std::atomic<uint64_t> m_deviceGen{0};
+
+    std::mutex m_cpuFrameMutex;
+    PendingCpuFrame m_pendingCpuFrame;
+    std::vector<uint8_t> m_cpuUploadScratch;
+
+    std::mutex m_cursorMutex;
+    PendingCursorUpdate m_pendingCursor;
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;

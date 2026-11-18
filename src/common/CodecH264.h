@@ -39,6 +39,8 @@ public:
     std::wstring FriendlyName() const { return m_friendlyName; }
 
     void RequestKeyframe() { m_forceKeyframe = true; }
+    bool SetBitrate(uint32_t bitrateMbps);
+    uint32_t BitrateMbps() const { return m_bitrateBps / 1000000u; }
 
     // Encodes a BGRA D3D11 texture (preferred path).
     bool EncodeTexture(ID3D11Texture2D* bgraTexture,
@@ -54,9 +56,11 @@ public:
                     bool& outIsKeyframe);
 
 private:
+    static constexpr size_t kNv12RingSize = 3;
+
     bool InitMft(bool tryHardware);
     bool EnsureVideoProcessor();
-    bool ConvertBgraToNv12Gpu(ID3D11Texture2D* bgraTex);
+    bool ConvertBgraToNv12Gpu(ID3D11Texture2D* bgraTex, size_t slotIdx);
     bool EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                                    const uint8_t* nv12Cpu,
                                    uint32_t nv12Stride,
@@ -88,15 +92,16 @@ private:
     Microsoft::WRL::ComPtr<IMFMediaEventGenerator> m_eventGen;
     Microsoft::WRL::ComPtr<ICodecAPI> m_codecApi;
 
-    // GPU color conversion BGRA -> NV12
+    // GPU color conversion BGRA -> NV12 (3-slot ring prevents overwriting async MFT in-flight frames)
     Microsoft::WRL::ComPtr<ID3D11VideoDevice> m_videoDev;
     Microsoft::WRL::ComPtr<ID3D11VideoContext> m_videoCtx;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> m_vpEnum;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> m_vp;
     ID3D11Texture2D* m_vpInTex = nullptr;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> m_vpInView;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Tex;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_vpOutView;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Ring[kNv12RingSize];
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_vpOutViewRing[kNv12RingSize];
+    size_t m_nv12RingIdx = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_stagingNv12;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_fallbackStagingBgra;
 
@@ -111,7 +116,12 @@ public:
     H264Decoder(const H264Decoder&) = delete;
     H264Decoder& operator=(const H264Decoder&) = delete;
 
-    bool Init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dCtx, uint32_t width, uint32_t height, bool allowHardware = true);
+    bool Init(ID3D11Device* d3dDevice,
+              ID3D11DeviceContext* d3dCtx,
+              uint32_t width,
+              uint32_t height,
+              bool allowHardware = true,
+              uint32_t fps = 60);
     void Shutdown();
     bool IsInitialized() const { return m_initialized; }
     bool IsHardwareDxva() const { return m_dxvaEnabled; }
@@ -134,6 +144,7 @@ private:
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    uint32_t m_fps = 60;
     uint32_t m_codedWidth = 0;
     uint32_t m_codedHeight = 0;
     uint32_t m_decodedStride = 0;
@@ -153,8 +164,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> m_vpEnum;
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> m_vp;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_uploadNv12;
+    ID3D11Texture2D* m_vpOutTex = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> m_vpOutView;
     uint32_t m_vpW = 0;
     uint32_t m_vpH = 0;
+    std::vector<uint8_t> m_scratchNv12;
+    std::vector<uint8_t> m_scratchBgra;
 };
 
 void CpuBgraToNv12(const uint8_t* bgra, uint32_t bgraStride, uint32_t width, uint32_t height, uint8_t* nv12Out);

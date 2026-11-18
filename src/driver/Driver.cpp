@@ -207,19 +207,19 @@ void SwapChainProcessor::RunCore() {
             DWORD wr = WAIT_TIMEOUT;
             if (m_hAvailableBufferEvent && m_hTerminateEvent.IsValid()) {
                 HANDLE waits[] = { m_hAvailableBufferEvent, m_hTerminateEvent.Get() };
-                wr = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, 16);
+                wr = WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, 8);
                 if (wr == WAIT_OBJECT_0 || wr == WAIT_TIMEOUT) {
                     continue;
                 }
                 break;
             } else if (m_hTerminateEvent.IsValid()) {
-                wr = WaitForSingleObject(m_hTerminateEvent.Get(), 16);
+                wr = WaitForSingleObject(m_hTerminateEvent.Get(), 8);
                 if (wr == WAIT_OBJECT_0) {
                     break;
                 }
                 continue;
             } else {
-                Sleep(16);
+                Sleep(8);
                 continue;
             }
         } else if (SUCCEEDED(hr)) {
@@ -368,7 +368,7 @@ DWORD IndirectDeviceContext::ApplyMonitorConfig(uint32_t count, const VddMonitor
         info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
         info.MonitorDescription.DataSize = 0;
         info.MonitorDescription.pData = nullptr;
-        CoCreateGuid(&info.MonitorContainerId);
+        info.MonitorContainerId = MakeDeterministicMonitorGuid(i);
 
         IDARG_IN_MONITORCREATE mc{};
         mc.ObjectAttributes = &attr;

@@ -1,4 +1,8 @@
 #pragma once
+#include "../common/Protocol.h"
+#include "../common/NetSocket.h"
+#include "../common/Pairing.h"
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,13 +15,30 @@
 #include <thread>
 #include <vector>
 
-#include "../common/Protocol.h"
-#include "../common/NetSocket.h"
 #include "../common/ClipboardSync.h"
 #include "../common/FileTransfer.h"
 #include "../common/ColorProfile.h"
 
+#include <functional>
+
 namespace s2p {
+
+class D3D11Renderer;
+
+struct PinPopupRequest {
+    std::string pinCode;
+    std::wstring senderName;
+    std::string senderIp;
+    uint8_t senderMac[6]{};
+    uint8_t senderDeviceId[16]{};
+    AppVersionTuple senderVersion{};
+};
+
+struct PinPopupSession {
+    PinPopupRequest req;
+    std::atomic<bool> remember{ true }; // Checked by default on PC popup
+    std::atomic<bool> rejected{ false };
+};
 
 struct ReceiverStreamStats {
     uint32_t monitorIndex = 0;
@@ -28,13 +49,16 @@ struct ReceiverStreamStats {
     uint64_t framesReceived = 0;
     std::wstring codecName;
     bool hardwareDxva = false;
+    bool hiddenByUser = false;
 };
 
 struct ReceiverStatus {
     bool running = false;
     bool sessionActive = false;
+    bool hasHiddenStreams = false;
     std::wstring senderName;
     std::string senderIp;
+    AppVersionTuple senderVersion{};
     std::wstring stateText;
     std::vector<MonitorDesc> localMonitors;
     std::vector<MonitorHdrInfo> localMonitorHdr;
@@ -45,6 +69,10 @@ struct ReceiverStatus {
 
 class ReceiverEngine {
 public:
+    using PinShowCallback = std::function<void(std::shared_ptr<PinPopupSession>)>;
+    using PinDismissCallback = std::function<void()>;
+    using VersionMismatchCallback = std::function<void(uint16_t remoteProtoVer, const AppVersionTuple& remoteAppVer, const std::wstring& message)>;
+
     ReceiverEngine() = default;
     ~ReceiverEngine();
 
@@ -53,6 +81,14 @@ public:
 
     static std::vector<MonitorDesc> EnumerateLocalMonitors();
     static std::vector<MonitorDesc> EnumerateLocalMonitorsWithHdr(std::vector<MonitorHdrInfo>& outHdr);
+
+    void SetConfigIniPath(const std::wstring& iniPath);
+    void SetPinCallbacks(PinShowCallback onShow, PinDismissCallback onDismiss);
+    void SetVersionMismatchCallback(VersionMismatchCallback cb);
+
+    std::vector<TrustedDeviceEntry> GetTrustedDevices() const;
+    bool RemoveTrustedDeviceByKey(const std::wstring& key);
+    bool ClearAllTrustedDevices();
 
     bool Start(bool startFullscreen = true);
     void Stop();
@@ -64,7 +100,11 @@ public:
     bool IsKvmEnabled() const { return m_kvmEnabled.load(); }
     void SetMonitorColorConfig(uint32_t monitorIndex, const MonitorColorConfig& cfg);
     MonitorColorConfig GetMonitorColorConfig(uint32_t monitorIndex) const;
-    size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueueFiles(paths); }
+    size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueuePaths(paths); }
+    void CancelFileTransfer() { m_fileTransfer.CancelCurrent(); }
+
+    void ShowHiddenStreamWindows();
+    bool HasHiddenStreamWindows() const;
 
     ReceiverStatus GetStatus() const;
 
@@ -79,9 +119,15 @@ private:
         RECT targetMonitorRect{};
         uint32_t expectedWidth = 1920;
         uint32_t expectedHeight = 1080;
+        uint32_t targetFps = 60;
         bool startFullscreen = true;
 
         std::atomic<bool> stop{false};
+        std::atomic<bool> hiddenByUser{false};
+        std::atomic<bool> showRequested{false};
+        std::atomic<uint32_t> desiredTargetFps{60};
+        std::mutex rendererPtrMutex;
+        D3D11Renderer* activeRenderer = nullptr;
         std::thread thread;
         TcpSocket listenSock;
 
@@ -102,6 +148,12 @@ private:
     std::atomic<bool> m_startFullscreen{true};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
+
+    mutable std::mutex m_cfgMutex;
+    std::wstring m_configIniPath;
+    PinShowCallback m_onPinShow;
+    PinDismissCallback m_onPinDismiss;
+    VersionMismatchCallback m_onVersionMismatch;
 
     mutable std::mutex m_colorMutex;
     MonitorColorConfig m_colorConfigs[kMaxMonitors]{};

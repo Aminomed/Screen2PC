@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <guiddef.h>
 
 namespace s2p::vdd {
 
@@ -38,5 +39,15 @@ struct VddReply {
 };
 
 #pragma pack(pop)
+
+inline GUID MakeDeterministicMonitorGuid(uint32_t connectorIndex) {
+    // Fixed Screen2PC virtual display container UUID base with connectorIndex in last 4 bytes.
+    GUID g{ 0x53325043, 0x5644, 0x4430, { 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } };
+    g.Data4[4] = static_cast<unsigned char>((connectorIndex >> 24) & 0xFFu);
+    g.Data4[5] = static_cast<unsigned char>((connectorIndex >> 16) & 0xFFu);
+    g.Data4[6] = static_cast<unsigned char>((connectorIndex >> 8) & 0xFFu);
+    g.Data4[7] = static_cast<unsigned char>(connectorIndex & 0xFFu);
+    return g;
+}
 
 } // namespace s2p::vdd

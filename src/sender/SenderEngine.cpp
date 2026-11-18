@@ -1,11 +1,14 @@
 #include "SenderEngine.h"
 #include "VirtualDisplayCtl.h"
+#include "../common/BitratePresets.h"
 #include "../common/KvmInput.h"
 #include "../common/Logger.h"
 
 #include <objbase.h>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <map>
 #include <set>
 
 namespace s2p {
@@ -41,18 +44,34 @@ void SleepInterruptible(DWORD totalMs, const std::atomic<bool>& stop) {
     }
 }
 
-bool WaitForControlPacket(TcpSocket& sock,
-                          PacketHeader& hdr,
-                          std::vector<uint8_t>& payload,
-                          int maxWaitMs,
-                          const std::atomic<bool>& stop) {
+bool WaitForControlPacketRaw(TcpSocket& sock,
+                             PacketHeader& hdr,
+                             std::vector<uint8_t>& payload,
+                             uint16_t& outRemoteVersion,
+                             bool& outVersionMismatch,
+                             bool& outClosedCleanly,
+                             int maxWaitMs,
+                             const std::atomic<bool>& stop) {
+    outRemoteVersion = 0;
+    outVersionMismatch = false;
+    outClosedCleanly = false;
     int waited = 0;
     while (waited < maxWaitMs && !stop.load() && sock.IsValid()) {
         int step = std::min(100, maxWaitMs - waited);
         int wr = sock.WaitReadable(step);
-        if (wr < 0) return false;
+        if (wr < 0) {
+            return false;
+        }
         if (wr > 0) {
-            return sock.RecvPacket(hdr, payload);
+            WSASetLastError(0);
+            bool ok = sock.RecvPacketRaw(hdr, payload, outRemoteVersion, outVersionMismatch);
+            if (!ok && !outVersionMismatch) {
+                int err = WSAGetLastError();
+                if (err == 0 || err == WSAECONNRESET) {
+                    outClosedCleanly = true;
+                }
+            }
+            return ok;
         }
         waited += step;
     }
@@ -65,6 +84,21 @@ SenderEngine::~SenderEngine() {
     Disconnect();
 }
 
+void SenderEngine::SetConfigIniPath(const std::wstring& iniPath) {
+    std::lock_guard<std::mutex> lock(m_cfgIoMutex);
+    m_configIniPath = iniPath;
+}
+
+void SenderEngine::SetPinPromptCallback(PinPromptCallback cb) {
+    std::lock_guard<std::mutex> lock(m_cfgIoMutex);
+    m_pinPromptCb = std::move(cb);
+}
+
+std::vector<RECT> SenderEngine::GetActiveVirtualOutputRects() const {
+    std::lock_guard<std::mutex> lock(m_virtualRectsMutex);
+    return m_virtualOutputRects;
+}
+
 std::vector<DiscoveredPeer> SenderEngine::DiscoverPeers(uint32_t timeoutMs) {
     std::vector<DiscoveredPeer> peers;
     UdpSocket udp;
@@ -72,22 +106,45 @@ std::vector<DiscoveredPeer> SenderEngine::DiscoverPeers(uint32_t timeoutMs) {
         return peers;
     }
 
-    DiscoverReqPayload req{};
-    req.senderNonce = static_cast<uint32_t>(GetTickCount64() & 0xFFFFFFFFu);
-    CopyWideSafe(req.senderName, _countof(req.senderName), GetHostComputerName());
+    const uint32_t nonceV2 = static_cast<uint32_t>(GetTickCount64() & 0xFFFFFFFFu);
+    const uint32_t nonceV1 = nonceV2 ^ 0xA5A55A5Au;
+    const std::wstring hostName = GetHostComputerName();
 
     struct {
         PacketHeader hdr;
         DiscoverReqPayload body;
-    } pkt{};
-    pkt.hdr = MakeHeader(MsgType::DiscoverReq, sizeof(DiscoverReqPayload));
-    pkt.body = req;
+    } pktV2{};
+    pktV2.hdr = MakeHeader(MsgType::DiscoverReq, sizeof(DiscoverReqPayload));
+    pktV2.body.senderNonce = nonceV2;
+    CopyWideSafe(pktV2.body.senderName, _countof(pktV2.body.senderName), hostName);
 
-    udp.Broadcast(kPortDiscovery, &pkt, sizeof(pkt));
+    struct {
+        PacketHeader hdr;
+        DiscoverReqPayload body;
+    } pktV1{};
+    pktV1.hdr = MakeHeader(MsgType::DiscoverReq, sizeof(DiscoverReqPayload));
+    pktV1.hdr.version = 1;
+    pktV1.body.senderNonce = nonceV1;
+    CopyWideSafe(pktV1.body.senderName, _countof(pktV1.body.senderName), hostName);
+
+    udp.Broadcast(kPortDiscovery, &pktV2, sizeof(pktV2));
+    udp.Broadcast(kPortDiscovery, &pktV1, sizeof(pktV1));
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    std::set<std::string> seenIps;
+    std::map<std::string, DiscoveredPeer> byIp;
+    std::vector<std::string> order;
+    auto upsertPeer = [&](const std::string& ip, DiscoveredPeer&& candidate, bool overwriteExisting) {
+        auto it = byIp.find(ip);
+        if (it == byIp.end()) {
+            order.push_back(ip);
+            byIp.emplace(ip, std::move(candidate));
+        } else if (overwriteExisting || (it->second.versionMismatch && !candidate.versionMismatch)) {
+            it->second = std::move(candidate);
+        }
+    };
+
     uint8_t buf[4096]{};
+    const size_t minLegacyRespBytes = sizeof(PacketHeader) + sizeof(DiscoverRespPayload) - sizeof(AppVersionTuple);
 
     while (std::chrono::steady_clock::now() < deadline) {
         auto remMs = static_cast<int>(
@@ -98,33 +155,85 @@ std::vector<DiscoveredPeer> SenderEngine::DiscoverPeers(uint32_t timeoutMs) {
         std::string senderIp;
         uint16_t senderPort = 0;
         int n = udp.RecvFrom(buf, sizeof(buf), senderIp, senderPort, std::min(remMs, 150));
-        if (n <= 0) continue;
-        if (static_cast<size_t>(n) < sizeof(PacketHeader) + sizeof(DiscoverRespPayload)) continue;
+        if (n <= 0 || static_cast<size_t>(n) < sizeof(PacketHeader)) continue;
 
         PacketHeader hdr{};
         std::memcpy(&hdr, buf, sizeof(hdr));
-        if (!ValidateHeader(hdr) || hdr.type != static_cast<uint16_t>(MsgType::DiscoverResp)) continue;
+        if (hdr.magic != kProtocolMagic || hdr.payloadSize > kMaxFrameBytes) continue;
+
+        if (hdr.type == static_cast<uint16_t>(MsgType::VersionMismatch) &&
+            static_cast<size_t>(n) >= sizeof(PacketHeader) + sizeof(VersionMismatchPayload)) {
+            VersionMismatchPayload vm{};
+            std::memcpy(&vm, buf + sizeof(PacketHeader), sizeof(vm));
+            vm.message[_countof(vm.message) - 1] = L'\0';
+            if (byIp.find(senderIp) == byIp.end()) {
+                DiscoveredPeer peer;
+                peer.ip = senderIp;
+                peer.pcName = vm.message[0] ? std::wstring(vm.message) : (L"PC (" + Utf8ToWide(senderIp) + L")");
+                peer.versionMismatch = true;
+                peer.remoteProtocolVersion = vm.protocolVersion ? vm.protocolVersion : hdr.version;
+                peer.receiverVersion = vm.appVersion;
+                upsertPeer(senderIp, std::move(peer), false);
+            }
+            continue;
+        }
+
+        if (hdr.type != static_cast<uint16_t>(MsgType::DiscoverResp) ||
+            static_cast<size_t>(n) < minLegacyRespBytes) {
+            continue;
+        }
 
         DiscoverRespPayload resp{};
-        std::memcpy(&resp, buf + sizeof(PacketHeader), sizeof(resp));
-        if (resp.senderNonce != req.senderNonce) continue;
-        if (!seenIps.insert(senderIp).second) continue;
-
-        DiscoveredPeer peer;
-        peer.ip = senderIp;
+        size_t copyBytes = std::min<size_t>(static_cast<size_t>(n) - sizeof(PacketHeader), sizeof(DiscoverRespPayload));
+        std::memcpy(&resp, buf + sizeof(PacketHeader), copyBytes);
         resp.pcName[_countof(resp.pcName) - 1] = L'\0';
-        peer.pcName = resp.pcName;
-        peer.controlPort = resp.controlPort ? resp.controlPort : kPortControl;
-        peer.streamBasePort = resp.streamBasePort ? resp.streamBasePort : kPortStreamBase;
 
-        uint32_t cnt = std::min<uint32_t>(resp.monitorCount, static_cast<uint32_t>(kMaxMonitors));
-        for (uint32_t i = 0; i < cnt; ++i) {
-            resp.monitors[i].friendlyName[_countof(resp.monitors[i].friendlyName) - 1] = L'\0';
-            peer.monitors.push_back(resp.monitors[i]);
+        if (hdr.version == kProtocolVersion) {
+            if (resp.senderNonce != nonceV2) continue;
+
+            DiscoveredPeer peer;
+            peer.ip = senderIp;
+            peer.pcName = resp.pcName;
+            peer.controlPort = resp.controlPort ? resp.controlPort : kPortControl;
+            peer.streamBasePort = resp.streamBasePort ? resp.streamBasePort : kPortStreamBase;
+            peer.receiverVersion = resp.receiverVersion;
+            peer.remoteProtocolVersion = kProtocolVersion;
+            peer.versionMismatch = false;
+
+            uint32_t cnt = std::min<uint32_t>(resp.monitorCount, static_cast<uint32_t>(kMaxMonitors));
+            for (uint32_t i = 0; i < cnt; ++i) {
+                resp.monitors[i].friendlyName[_countof(resp.monitors[i].friendlyName) - 1] = L'\0';
+                peer.monitors.push_back(resp.monitors[i]);
+            }
+            upsertPeer(senderIp, std::move(peer), true);
+        } else {
+            if (resp.senderNonce != nonceV1 && resp.senderNonce != nonceV2) continue;
+
+            DiscoveredPeer peer;
+            peer.ip = senderIp;
+            peer.pcName = resp.pcName[0] ? std::wstring(resp.pcName) : Utf8ToWide(senderIp);
+            peer.controlPort = resp.controlPort ? resp.controlPort : kPortControl;
+            peer.streamBasePort = resp.streamBasePort ? resp.streamBasePort : kPortStreamBase;
+            peer.receiverVersion = resp.receiverVersion;
+            peer.remoteProtocolVersion = hdr.version;
+            peer.versionMismatch = true;
+
+            uint32_t cnt = std::min<uint32_t>(resp.monitorCount, static_cast<uint32_t>(kMaxMonitors));
+            for (uint32_t i = 0; i < cnt; ++i) {
+                resp.monitors[i].friendlyName[_countof(resp.monitors[i].friendlyName) - 1] = L'\0';
+                peer.monitors.push_back(resp.monitors[i]);
+            }
+            upsertPeer(senderIp, std::move(peer), false);
         }
-        peers.push_back(std::move(peer));
     }
 
+    peers.reserve(order.size());
+    for (const auto& ip : order) {
+        auto it = byIp.find(ip);
+        if (it != byIp.end()) {
+            peers.push_back(std::move(it->second));
+        }
+    }
     return peers;
 }
 
@@ -145,6 +254,12 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         m_status.stateText = L"Verbinde mit PC...";
     }
 
+    {
+        std::lock_guard<std::mutex> vl(m_virtualRectsMutex);
+        m_virtualOutputRects.clear();
+    }
+    m_usingExternalDisplays = false;
+    m_remoteStopped = false;
     m_stop = false;
     m_connected = false;
     m_connecting = true;
@@ -161,14 +276,25 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         return false;
     }
 
-    m_controlSock.TuneLowLatency(1024 * 1024);
+    m_controlSock.TuneLowLatency(256 * 1024, 256 * 1024);
     m_controlSock.SetTimeouts(3000, 5000);
+
+    std::wstring iniPath;
+    {
+        std::lock_guard<std::mutex> cl(m_cfgIoMutex);
+        iniPath = m_configIniPath;
+    }
 
     HelloSenderPayload helloReq{};
     CopyWideSafe(helloReq.senderName, _countof(helloReq.senderName), GetHostComputerName());
     helloReq.preferredCodec = static_cast<uint8_t>(cfg.codec);
     helloReq.targetBitrateMbps = cfg.bitrateMbps;
-    helloReq.targetFps = cfg.targetFps;
+    helloReq.targetFps = cfg.targetFps; // 0 = Auto (Monitor-Hz)
+    GetMacForTargetIp(cfg.targetIp, helloReq.senderMac);
+    if (!iniPath.empty()) {
+        LoadOrCreateLocalDeviceId(iniPath, helloReq.senderDeviceId);
+    }
+    helloReq.senderVersion = CurrentAppVersionTuple();
 
     if (!m_controlSock.SendPacket(MsgType::HelloSender, &helloReq, sizeof(helloReq))) {
         m_connecting = false;
@@ -181,8 +307,195 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
 
     PacketHeader hdr{};
     std::vector<uint8_t> payload;
-    if (!WaitForControlPacket(m_controlSock, hdr, payload, 5000, m_stop) ||
-        hdr.type != static_cast<uint16_t>(MsgType::HelloReceiver) ||
+    uint16_t remoteProtoVer = 0;
+    bool rawVerMismatch = false;
+    bool closedCleanly = false;
+
+    auto setVersionMismatchError = [&](uint16_t peerProtoVer, const AppVersionTuple& peerAppVer, const std::wstring& extraMsg) {
+        m_connecting = false;
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_status.connecting = false;
+        m_status.versionMismatch = true;
+        m_status.remoteProtocolVersion = peerProtoVer;
+        m_status.remoteAppVersion = peerAppVer;
+        m_status.stateText = L"Versionskonflikt mit PC";
+
+        std::wstring msg = L"Versionskonflikt: Surface nutzt Protokoll v" + std::to_wstring(kProtocolVersion) +
+                           L" (App v" + FormatAppVersion(CurrentAppVersion()) + L")";
+        if (peerProtoVer > 0) {
+            msg += L", PC meldet Protokoll v" + std::to_wstring(peerProtoVer);
+            if (peerAppVer.major > 0 || peerAppVer.minor > 0) {
+                msg += L" (App v" + FormatVersionTuple(peerAppVer) + L")";
+            }
+        } else {
+            msg += L", PC verwendet vermutlich eine aeltere inkompatible Version (v1)";
+        }
+        if (!extraMsg.empty()) {
+            msg += L" - " + extraMsg;
+        } else {
+            msg += L". Bitte beide Geraete ueber den integrierten GitHub-Updater aktualisieren.";
+        }
+        m_status.lastError = msg;
+        Logger::Instance().Warn("SND-VER", msg);
+        m_controlSock.Close();
+    };
+
+    if (!WaitForControlPacketRaw(m_controlSock, hdr, payload, remoteProtoVer, rawVerMismatch, closedCleanly, 5000, m_stop)) {
+        if (rawVerMismatch) {
+            setVersionMismatchError(remoteProtoVer, AppVersionTuple{}, L"");
+            return false;
+        }
+        if (closedCleanly && !m_stop) {
+            setVersionMismatchError(1, AppVersionTuple{},
+                                    L"Verbindung wurde direkt nach Handshake geschlossen (aelterer Receiver v1?). Bitte beide Apps aktualisieren.");
+            return false;
+        }
+        m_connecting = false;
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_status.connecting = false;
+        m_status.lastError = L"Ungueltige oder fehlende Handshake-Antwort vom PC.";
+        m_controlSock.Close();
+        return false;
+    }
+
+    if (hdr.type == static_cast<uint16_t>(MsgType::VersionMismatch)) {
+        VersionMismatchPayload vm{};
+        if (payload.size() >= sizeof(vm)) {
+            std::memcpy(&vm, payload.data(), sizeof(vm));
+            vm.message[_countof(vm.message) - 1] = L'\0';
+        }
+        setVersionMismatchError(vm.protocolVersion ? vm.protocolVersion : remoteProtoVer,
+                                vm.appVersion,
+                                vm.message[0] ? std::wstring(vm.message) : L"");
+        return false;
+    }
+
+    if (hdr.type == static_cast<uint16_t>(MsgType::PairChallenge)) {
+        PairChallengePayload ch{};
+        if (payload.size() >= sizeof(ch)) {
+            std::memcpy(&ch, payload.data(), sizeof(ch));
+            ch.pcName[_countof(ch.pcName) - 1] = L'\0';
+        }
+        std::wstring pcNameW = ch.pcName[0] ? std::wstring(ch.pcName) : Utf8ToWide(cfg.targetIp);
+        uint8_t attemptsLeft = 3;
+        std::wstring promptMsg = L"Bitte die 6-stellige PIN vom PC-Bildschirm eingeben:";
+        bool authed = false;
+
+        while (!m_stop && !authed) {
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_status.stateText = L"PIN-Bestaetigung am PC (" + pcNameW + L")...";
+            }
+
+            PinPromptCallback pinCb;
+            {
+                std::lock_guard<std::mutex> cl(m_cfgIoMutex);
+                pinCb = m_pinPromptCb;
+            }
+            std::string enteredPin;
+            if (!pinCb || !pinCb(pcNameW, cfg.targetIp, ch.pcVersion, attemptsLeft, promptMsg, enteredPin) || m_stop) {
+                m_connecting = false;
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_status.connecting = false;
+                m_status.authRejected = true;
+                m_status.stateText = L"PIN-Eingabe abgebrochen";
+                m_status.lastError = L"PIN-Kopplung vom Benutzer abgebrochen.";
+                m_controlSock.Close();
+                return false;
+            }
+
+            PairVerifyPayload pv{};
+            strncpy_s(pv.pinCode, _countof(pv.pinCode), enteredPin.c_str(), _TRUNCATE);
+            CopyWideSafe(pv.senderName, _countof(pv.senderName), GetHostComputerName());
+            std::memcpy(pv.senderMac, helloReq.senderMac, 6);
+            std::memcpy(pv.senderDeviceId, helloReq.senderDeviceId, 16);
+
+            if (!m_controlSock.SendPacket(MsgType::PairVerify, &pv, sizeof(pv))) {
+                m_connecting = false;
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_status.connecting = false;
+                m_status.authRejected = true;
+                m_status.stateText = L"Kopplung abgelehnt";
+                m_status.lastError = L"Verbindung waehrend der PIN-Pruefung beendet (evtl. vom PC abgelehnt).";
+                m_controlSock.Close();
+                return false;
+            }
+
+            if (!WaitForControlPacketRaw(m_controlSock, hdr, payload, remoteProtoVer, rawVerMismatch, closedCleanly, 10000, m_stop)) {
+                m_connecting = false;
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_status.connecting = false;
+                m_status.authRejected = true;
+                m_status.stateText = L"PIN-Pruefung fehlgeschlagen";
+                m_status.lastError = L"Keine Antwort auf PIN-Pruefung vom PC erhalten.";
+                m_controlSock.Close();
+                return false;
+            }
+
+            if (hdr.type == static_cast<uint16_t>(MsgType::PairResult) && payload.size() >= sizeof(PairResultPayload)) {
+                PairResultPayload pr{};
+                std::memcpy(&pr, payload.data(), sizeof(pr));
+                pr.message[_countof(pr.message) - 1] = L'\0';
+                if (pr.accepted) {
+                    authed = true;
+                    break;
+                }
+                attemptsLeft = pr.remainingAttempts;
+                promptMsg = pr.message[0] ? std::wstring(pr.message) : L"Falsche PIN.";
+                if (attemptsLeft == 0) {
+                    m_connecting = false;
+                    std::lock_guard<std::mutex> lock(m_stateMutex);
+                    m_status.connecting = false;
+                    m_status.authRejected = true;
+                    m_status.stateText = L"Kopplung abgelehnt";
+                    m_status.lastError = L"PIN-Kopplung abgelehnt: " + promptMsg;
+                    m_controlSock.Close();
+                    return false;
+                }
+            } else {
+                m_connecting = false;
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_status.connecting = false;
+                m_status.authRejected = true;
+                m_status.lastError = L"Unerwartete Antwort waehrend der PIN-Pruefung.";
+                m_controlSock.Close();
+                return false;
+            }
+        }
+
+        if (!authed) {
+            m_connecting = false;
+            m_controlSock.Close();
+            return false;
+        }
+
+        if (!WaitForControlPacketRaw(m_controlSock, hdr, payload, remoteProtoVer, rawVerMismatch, closedCleanly, 5000, m_stop)) {
+            if (rawVerMismatch) {
+                setVersionMismatchError(remoteProtoVer, AppVersionTuple{}, L"");
+                return false;
+            }
+            m_connecting = false;
+            std::lock_guard<std::mutex> lock(m_stateMutex);
+            m_status.connecting = false;
+            m_status.lastError = L"HelloReceiver nach PIN-Bestaetigung ausgeblieben.";
+            m_controlSock.Close();
+            return false;
+        }
+    }
+
+    if (hdr.type == static_cast<uint16_t>(MsgType::VersionMismatch)) {
+        VersionMismatchPayload vm{};
+        if (payload.size() >= sizeof(vm)) {
+            std::memcpy(&vm, payload.data(), sizeof(vm));
+            vm.message[_countof(vm.message) - 1] = L'\0';
+        }
+        setVersionMismatchError(vm.protocolVersion ? vm.protocolVersion : remoteProtoVer,
+                                vm.appVersion,
+                                vm.message[0] ? std::wstring(vm.message) : L"");
+        return false;
+    }
+
+    if (hdr.type != static_cast<uint16_t>(MsgType::HelloReceiver) ||
         payload.size() < sizeof(HelloReceiverPayload)) {
         m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
@@ -217,20 +530,35 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         return false;
     }
 
+    if (cfg.mode != DisplayMode::MirrorPrimary && !captureOutputs.empty()) {
+        std::vector<RECT> vRects;
+        vRects.reserve(captureOutputs.size());
+        for (const auto& o : captureOutputs) {
+            vRects.push_back(o.desktopRect);
+        }
+        {
+            std::lock_guard<std::mutex> vl(m_virtualRectsMutex);
+            m_virtualOutputRects = std::move(vRects);
+        }
+        m_usingExternalDisplays = true;
+    }
+
     StartSessionPayload startReq{};
     uint32_t streamCount = static_cast<uint32_t>(std::min<size_t>(captureOutputs.size(), kMaxMonitors));
     startReq.streamCount = streamCount;
     for (uint32_t i = 0; i < streamCount; ++i) {
         uint32_t targetPcMon = (cfg.mode == DisplayMode::ExtendSecondary && helloResp.monitorCount >= 2) ? 1u : i;
+        uint32_t monHz = (helloResp.monitors[targetPcMon].refreshHz >= 30 && helloResp.monitors[targetPcMon].refreshHz <= 240)
+                             ? helloResp.monitors[targetPcMon].refreshHz
+                             : 60u;
+        uint32_t effFps = ResolveEffectiveFps(cfg.targetFps, monHz);
         startReq.streams[i].monitorIndex = targetPcMon;
         startReq.streams[i].width = captureOutputs[i].width;
         startReq.streams[i].height = captureOutputs[i].height;
-        uint32_t monHz = (helloResp.monitors[targetPcMon].refreshHz >= 30 && helloResp.monitors[targetPcMon].refreshHz <= 240)
-                             ? helloResp.monitors[targetPcMon].refreshHz
-                             : cfg.targetFps;
         startReq.streams[i].refreshHz = monHz;
         startReq.streams[i].codec = static_cast<uint8_t>(cfg.codec);
         startReq.streams[i].bitrateMbps = cfg.bitrateMbps;
+        startReq.streams[i].targetFps = effFps;
     }
 
     if (!m_controlSock.SendPacket(MsgType::StartSession, &startReq, sizeof(startReq))) {
@@ -240,7 +568,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         return false;
     }
 
-    if (!WaitForControlPacket(m_controlSock, hdr, payload, 5000, m_stop) ||
+    if (!WaitForControlPacketRaw(m_controlSock, hdr, payload, remoteProtoVer, rawVerMismatch, closedCleanly, 5000, m_stop) ||
         hdr.type != static_cast<uint16_t>(MsgType::SessionAck) ||
         payload.size() < sizeof(SessionAckPayload)) {
         DisconnectInternal();
@@ -277,12 +605,18 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->refreshHz = startReq.streams[i].refreshHz;
         w->codec = cfg.codec;
         w->bitrateMbps = cfg.bitrateMbps;
-        w->targetFps = std::max<uint32_t>(cfg.targetFps, std::min<uint32_t>(startReq.streams[i].refreshHz, 120u));
+        w->targetFps = startReq.streams[i].targetFps;
+        w->desiredCodec.store(static_cast<uint8_t>(cfg.codec));
+        w->desiredBitrateMbps.store(cfg.bitrateMbps);
+        w->desiredTargetFps.store(cfg.targetFps);
         w->peerIp = cfg.targetIp;
         w->streamPort = static_cast<uint16_t>(kPortStreamBase + i);
         w->stats.monitorIndex = startReq.streams[i].monitorIndex;
         w->stats.width = w->width;
         w->stats.height = w->height;
+        w->stats.configuredBitrateMbps = cfg.bitrateMbps;
+        w->stats.liveBitrateMbps = cfg.bitrateMbps;
+        w->stats.targetFps = w->targetFps;
 
         StreamWorker* raw = w.get();
         w->thread = std::thread([this, raw]() { RunStreamWorker(raw); });
@@ -313,6 +647,8 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
         m_status.connected = true;
+        m_status.remoteAppVersion = helloResp.receiverVersion;
+        m_status.usingExternalDisplays = m_usingExternalDisplays.load();
         m_status.peerName = helloResp.pcName;
         m_status.peerIp = cfg.targetIp;
         m_status.stateText = L"Verbunden mit " + m_status.peerName + L" (" +
@@ -360,7 +696,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
         vdd::VddMonitorSpec s{};
         s.width = hello.monitors[srcIdx].width ? hello.monitors[srcIdx].width : 1920;
         s.height = hello.monitors[srcIdx].height ? hello.monitors[srcIdx].height : 1080;
-        s.refreshHz = hello.monitors[srcIdx].refreshHz ? hello.monitors[srcIdx].refreshHz : cfg.targetFps;
+        s.refreshHz = hello.monitors[srcIdx].refreshHz ? hello.monitors[srcIdx].refreshHz : 60u;
         if (s.refreshHz < 30 || s.refreshHz > 240) s.refreshHz = 60;
         specs.push_back(s);
     }
@@ -452,6 +788,47 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
     return false;
 }
 
+bool SenderEngine::ReconfigureStream(CodecType codec, uint32_t bitrateMbps, uint32_t targetFps) {
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_cfg.codec = codec;
+        m_cfg.bitrateMbps = bitrateMbps;
+        m_cfg.targetFps = targetFps;
+    }
+    if (!m_connected.load()) {
+        return false;
+    }
+
+    std::vector<ReconfigureStreamPayload> notices;
+    {
+        std::lock_guard<std::mutex> wl(m_workersMutex);
+        for (auto& w : m_workers) {
+            w->desiredCodec.store(static_cast<uint8_t>(codec));
+            w->desiredBitrateMbps.store(bitrateMbps);
+            w->desiredTargetFps.store(targetFps);
+            w->forceKeyframe.store(true);
+            w->reconfigPending.store(true);
+
+            ReconfigureStreamPayload req{};
+            req.streamIndex = w->streamIndex;
+            req.codec = static_cast<uint8_t>(codec);
+            req.bitrateMbps = bitrateMbps;
+            req.targetFps = ResolveEffectiveFps(targetFps, w->refreshHz);
+            notices.push_back(req);
+        }
+    }
+
+    if (!notices.empty()) {
+        std::lock_guard<std::mutex> lock(m_controlSendMutex);
+        if (m_controlSock.IsValid()) {
+            for (const auto& req : notices) {
+                m_controlSock.SendPacket(MsgType::ReconfigureStream, &req, sizeof(req));
+            }
+        }
+    }
+    return true;
+}
+
 void SenderEngine::ControlLoop() {
     ComScope comScope;
     auto lastHeartbeat = std::chrono::steady_clock::now();
@@ -478,6 +855,9 @@ void SenderEngine::ControlLoop() {
                     }
                 } else if (hdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
                     Logger::Instance().Info("SND-CTL", L"Receiver requested StopSession.");
+                    if (!m_disconnecting.load()) {
+                        m_remoteStopped = true;
+                    }
                     m_stop = true;
                     break;
                 } else if (hdr.type == static_cast<uint16_t>(MsgType::ClipboardSync) &&
@@ -554,9 +934,15 @@ void SenderEngine::ControlLoop() {
     CleanupSessionResources();
 
     std::lock_guard<std::mutex> lock(m_stateMutex);
+    m_status.usingExternalDisplays = false;
+    if (m_remoteStopped.load()) {
+        m_status.remoteStopped = true;
+    }
     if (m_status.connected) {
         m_status.connected = false;
-        m_status.stateText = L"Getrennt (Verbindung beendet)";
+        m_status.stateText = m_remoteStopped.load()
+                                 ? L"Getrennt (Vom PC beendet)"
+                                 : L"Getrennt (Verbindung beendet)";
     }
     m_status.streams.clear();
 }
@@ -590,8 +976,9 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         Logger::Instance().Error("SND-WRK", L"Failed to connect stream socket on port " + std::to_wstring(w->streamPort));
         return;
     }
-    sock.TuneLowLatency(4 * 1024 * 1024);
-    sock.SetTimeouts(4000, 4000);
+    // Asymmetric low-latency TCP buffers: small SNDBUF prevents multi-frame stale backlog on dynamic scenes
+    sock.TuneLowLatency(256 * 1024, 64 * 1024);
+    sock.SetTimeouts(1500, 1500);
 
     DxgiCapture capture;
     bool capOk = false;
@@ -619,11 +1006,17 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     CodecType activeCodec = w->codec;
     if (activeCodec == CodecType::Auto) activeCodec = CodecType::H264;
 
+    LARGE_INTEGER qpcFreqLi{};
+    QueryPerformanceFrequency(&qpcFreqLi);
+    const int64_t qpcFreq = std::max<int64_t>(1, qpcFreqLi.QuadPart);
+
+    uint32_t effFps = ResolveEffectiveFps(w->desiredTargetFps.load(), w->refreshHz);
+    uint32_t configBitrateMbps = w->desiredBitrateMbps.load();
+    uint32_t liveBitrateMbps = configBitrateMbps;
+
     H264Encoder h264;
-    bool h264Ok = false;
     if (activeCodec == CodecType::H264) {
-        h264Ok = h264.Init(capture.Device(), capture.Context(), w->width, w->height, w->targetFps, w->bitrateMbps);
-        if (!h264Ok) {
+        if (!h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps)) {
             Logger::Instance().Warn("SND-WRK", L"H264Encoder init failed; falling back to DeltaLossless.");
             activeCodec = CodecType::DeltaLossless;
         }
@@ -633,11 +1026,17 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     std::vector<uint8_t> encodedPayload;
     std::vector<uint8_t> sendPkt;
     std::vector<uint8_t> cpuBgra;
+    std::vector<DeltaRect> pendingDirtyRects;
+    bool pendingImageUpdate = false;
+    bool forceFullDirtyRect = false;
     uint32_t cpuStride = 0;
     uint64_t frameIndex = 0;
 
     {
         std::lock_guard<std::mutex> sl(w->statsMutex);
+        w->stats.configuredBitrateMbps = configBitrateMbps;
+        w->stats.liveBitrateMbps = liveBitrateMbps;
+        w->stats.targetFps = effFps;
         if (activeCodec == CodecType::H264) {
             w->stats.codecName = h264.IsHardware() ? L"H.264 (GPU)" : L"H.264 (CPU)";
             w->stats.hardwareAccelerated = h264.IsHardware();
@@ -647,15 +1046,14 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
     }
 
-    // Use a short AcquireNextFrame wait so cursor updates and frames are dispatched immediately
-    // without sleeping away an entire frame interval (~16-31 ms) whenever only the mouse moves.
-    const uint32_t targetFps = std::clamp<uint32_t>(w->targetFps, 30u, 120u);
-    const uint32_t acqTimeoutMs = std::max<uint32_t>(4u, std::min<uint32_t>(8u, 1000u / targetFps));
     auto windowStart = std::chrono::steady_clock::now();
     uint64_t windowFrames = 0;
     uint64_t windowBytes = 0;
     bool sentInitialFrame = false;
     uint32_t consecutiveH264Fails = 0;
+    uint32_t stallCount = 0;
+    uint32_t cleanSendStreak = 0;
+    int64_t nextEncodeQpc = 0;
 
     ID3D11Device* activeD3dDevice = capture.Device();
     auto handleDynamicResizeIfNeeded = [&]() {
@@ -672,35 +1070,112 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         w->width = cw;
         w->height = ch;
         activeD3dDevice = curDev;
+        delta.Reset();
+        if (activeCodec == CodecType::H264) {
+            if (!h264.Init(capture.Device(), capture.Context(), cw, ch, effFps, liveBitrateMbps)) {
+                Logger::Instance().Warn("SND-WRK", L"H264Encoder re-init failed after reset/resize; switching to DeltaLossless.");
+                h264.Shutdown();
+                activeCodec = CodecType::DeltaLossless;
+            }
+        }
         {
             std::lock_guard<std::mutex> sl(w->statsMutex);
             w->stats.width = cw;
             w->stats.height = ch;
-        }
-        delta.Reset();
-        if (activeCodec == CodecType::H264) {
-            if (!h264.Init(capture.Device(), capture.Context(), cw, ch, w->targetFps, w->bitrateMbps)) {
-                Logger::Instance().Warn("SND-WRK", L"H264Encoder re-init failed after reset/resize; switching to DeltaLossless.");
-                h264.Shutdown();
-                activeCodec = CodecType::DeltaLossless;
-                std::lock_guard<std::mutex> sl(w->statsMutex);
-                w->stats.codecName = L"Delta Lossless";
-                w->stats.hardwareAccelerated = false;
-            } else {
-                std::lock_guard<std::mutex> sl(w->statsMutex);
+            w->stats.configuredBitrateMbps = configBitrateMbps;
+            w->stats.liveBitrateMbps = liveBitrateMbps;
+            w->stats.targetFps = effFps;
+            if (activeCodec == CodecType::H264) {
                 w->stats.codecName = h264.IsHardware() ? L"H.264 (GPU)" : L"H.264 (CPU)";
                 w->stats.hardwareAccelerated = h264.IsHardware();
+            } else {
+                w->stats.codecName = L"Delta Lossless";
+                w->stats.hardwareAccelerated = false;
             }
         }
+        pendingDirtyRects.clear();
+        forceFullDirtyRect = true;
         sentInitialFrame = false;
         consecutiveH264Fails = 0;
+        nextEncodeQpc = 0;
+    };
+
+    auto applyLiveReconfigureIfNeeded = [&]() {
+        if (!w->reconfigPending.exchange(false)) return;
+
+        CodecType newCodec = static_cast<CodecType>(w->desiredCodec.load());
+        if (newCodec == CodecType::Auto) newCodec = CodecType::H264;
+        uint32_t newBitrate = w->desiredBitrateMbps.load();
+        uint32_t newEffFps = ResolveEffectiveFps(w->desiredTargetFps.load(), w->refreshHz);
+
+        const bool codecChanged = (newCodec != activeCodec);
+        const bool fpsChanged = (newEffFps != effFps);
+        const bool bitrateChanged = (newBitrate != configBitrateMbps || newBitrate != liveBitrateMbps);
+
+        configBitrateMbps = newBitrate;
+        liveBitrateMbps = newBitrate;
+        effFps = newEffFps;
+        stallCount = 0;
+        cleanSendStreak = 0;
+        nextEncodeQpc = 0;
+
+        if (codecChanged) {
+            if (newCodec == CodecType::DeltaLossless) {
+                h264.Shutdown();
+                delta.Reset();
+                activeCodec = CodecType::DeltaLossless;
+                sentInitialFrame = false;
+                pendingDirtyRects.clear();
+                forceFullDirtyRect = true;
+            } else {
+                delta.Reset();
+                if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps)) {
+                    activeCodec = CodecType::H264;
+                } else {
+                    Logger::Instance().Warn("SND-WRK", L"Live switch to H.264 failed; keeping Delta Lossless.");
+                    activeCodec = CodecType::DeltaLossless;
+                }
+                sentInitialFrame = false;
+            }
+        } else if (activeCodec == CodecType::H264) {
+            if (fpsChanged) {
+                if (!h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps)) {
+                    h264.Shutdown();
+                    activeCodec = CodecType::DeltaLossless;
+                }
+                sentInitialFrame = false;
+            } else if (bitrateChanged) {
+                h264.SetBitrate(liveBitrateMbps);
+            }
+        }
+
+        std::lock_guard<std::mutex> sl(w->statsMutex);
+        w->stats.configuredBitrateMbps = configBitrateMbps;
+        w->stats.liveBitrateMbps = liveBitrateMbps;
+        w->stats.targetFps = effFps;
+        if (activeCodec == CodecType::H264) {
+            w->stats.codecName = h264.IsHardware() ? L"H.264 (GPU)" : L"H.264 (CPU)";
+            w->stats.hardwareAccelerated = h264.IsHardware();
+        } else {
+            w->stats.codecName = L"Delta Lossless";
+            w->stats.hardwareAccelerated = false;
+        }
+        Logger::Instance().Info("SND-CFG",
+            L"Live reconfigure monitor #" + std::to_wstring(w->targetPcMonitor + 1) +
+            L": " + w->stats.codecName + L", " + std::to_wstring(liveBitrateMbps) +
+            L" Mbit/s, " + std::to_wstring(effFps) + L" FPS");
     };
 
     while (!m_stop && !w->stop) {
+        applyLiveReconfigureIfNeeded();
+
+        const uint32_t acqTimeoutMs = std::max<uint32_t>(2u, std::min<uint32_t>(6u, 500u / std::max<uint32_t>(30u, effFps)));
+        const bool collectDirty = (activeCodec == CodecType::DeltaLossless);
+
         bool hasNewImage = false;
         std::vector<DeltaRect> dirtyRects;
         CapturedCursor cursor;
-        if (!capture.AcquireFrame(acqTimeoutMs, hasNewImage, dirtyRects, cursor)) {
+        if (!capture.AcquireFrame(acqTimeoutMs, hasNewImage, dirtyRects, cursor, collectDirty)) {
             if (!capture.IsInitialized()) {
                 SleepInterruptible(100, m_stop);
                 capture.Init(w->adapterIndex, w->outputIndex);
@@ -713,6 +1188,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
         handleDynamicResizeIfNeeded();
 
+        // Dispatch cursor updates immediately regardless of video frame pacer schedule
         if (cursor.updated) {
             CursorUpdateHeader ch{};
             ch.monitorIndex = w->targetPcMonitor;
@@ -740,8 +1216,28 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             }
         }
 
-        bool needKey = w->forceKeyframe.exchange(false) || !sentInitialFrame;
-        if (hasNewImage || needKey) {
+        if (hasNewImage) {
+            pendingImageUpdate = true;
+            if (collectDirty && !forceFullDirtyRect) {
+                if (dirtyRects.empty() || pendingDirtyRects.size() + dirtyRects.size() > 64) {
+                    pendingDirtyRects.clear();
+                    forceFullDirtyRect = true;
+                } else {
+                    pendingDirtyRects.insert(pendingDirtyRects.end(), dirtyRects.begin(), dirtyRects.end());
+                }
+            }
+        }
+
+        LARGE_INTEGER nowQpcLi{};
+        QueryPerformanceCounter(&nowQpcLi);
+        const int64_t nowQpc = nowQpcLi.QuadPart;
+        const bool needKey = w->forceKeyframe.exchange(false) || !sentInitialFrame;
+        const bool dueForEncode = (nextEncodeQpc == 0 || nowQpc >= nextEncodeQpc);
+
+        if ((pendingImageUpdate && dueForEncode) || needKey) {
+            const int64_t intervalQpc = std::max<int64_t>(1, qpcFreq / static_cast<int64_t>(effFps));
+            nextEncodeQpc = nowQpc + intervalQpc; // No catch-up bursts after slow frames
+
             encodedPayload.clear();
             bool isKeyframe = false;
             bool encodeOk = false;
@@ -753,7 +1249,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                     if (++consecutiveH264Fails >= 4) {
                         if (h264.IsHardware()) {
                             Logger::Instance().Warn("SND-WRK", L"GPU H.264 encode failed at runtime; switching to CPU H.264.");
-                            if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, w->targetFps, w->bitrateMbps, false)) {
+                            if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, false)) {
                                 std::lock_guard<std::mutex> sl(w->statsMutex);
                                 w->stats.codecName = L"H.264 (CPU)";
                                 w->stats.hardwareAccelerated = false;
@@ -772,14 +1268,16 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                             w->stats.hardwareAccelerated = false;
                         }
                     }
-                } else {
+                } else if (encodeOk) {
                     consecutiveH264Fails = 0;
                 }
             }
             if (activeCodec == CodecType::DeltaLossless) {
                 if (capture.CopyFrameToCpu(cpuBgra, cpuStride)) {
+                    const std::vector<DeltaRect> emptyHints;
+                    const auto& hints = forceFullDirtyRect ? emptyHints : pendingDirtyRects;
                     encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
-                                            cpuStride, dirtyRects, needKey, encodedPayload, isKeyframe);
+                                            cpuStride, hints, needKey, encodedPayload, isKeyframe);
                 }
             }
 
@@ -799,13 +1297,60 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 std::memcpy(sendPkt.data(), &vh, sizeof(VideoFrameHeader));
                 std::memcpy(sendPkt.data() + sizeof(VideoFrameHeader), encodedPayload.data(), encodedPayload.size());
 
-                if (!sock.SendPacket(MsgType::VideoFrame, sendPkt.data(), static_cast<uint32_t>(sendPkt.size()))) {
+                LARGE_INTEGER sendStartLi{}, sendEndLi{};
+                QueryPerformanceCounter(&sendStartLi);
+                bool sendOk = sock.SendPacket(MsgType::VideoFrame, sendPkt.data(), static_cast<uint32_t>(sendPkt.size()));
+                QueryPerformanceCounter(&sendEndLi);
+                if (!sendOk) {
                     Logger::Instance().Warn("SND-WRK", L"SendPacket(VideoFrame) failed on monitor " + std::to_wstring(w->targetPcMonitor));
                     break;
                 }
+
                 sentInitialFrame = true;
+                pendingImageUpdate = false;
+                pendingDirtyRects.clear();
+                forceFullDirtyRect = false;
                 ++windowFrames;
                 windowBytes += sendPkt.size() + sizeof(PacketHeader);
+
+                if (activeCodec == CodecType::H264) {
+                    const double sendMs = static_cast<double>(sendEndLi.QuadPart - sendStartLi.QuadPart) * 1000.0 /
+                                          static_cast<double>(qpcFreq);
+                    const double stallThreshMs = std::max<double>(18.0, 1200.0 / static_cast<double>(effFps));
+                    if (sendMs > stallThreshMs) {
+                        cleanSendStreak = 0;
+                        if (++stallCount >= 2 && liveBitrateMbps > 15) {
+                            stallCount = 0;
+                            uint32_t newBr = std::max<uint32_t>(15u, (liveBitrateMbps * 3u) / 4u);
+                            if (newBr < liveBitrateMbps && h264.SetBitrate(newBr)) {
+                                liveBitrateMbps = newBr;
+                                std::lock_guard<std::mutex> sl(w->statsMutex);
+                                w->stats.liveBitrateMbps = liveBitrateMbps;
+                                Logger::Instance().Warn("SND-ABR",
+                                    L"Send stall (" + std::to_wstring(static_cast<int>(sendMs)) +
+                                    L" ms) -> reduced H.264 bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                            }
+                        }
+                    } else {
+                        stallCount = 0;
+                        if (sendMs < 10.0 && liveBitrateMbps < configBitrateMbps) {
+                            if (++cleanSendStreak >= effFps * 3u) {
+                                cleanSendStreak = 0;
+                                uint32_t step = std::max<uint32_t>(5u, configBitrateMbps / 8u);
+                                uint32_t newBr = std::min<uint32_t>(configBitrateMbps, liveBitrateMbps + step);
+                                if (newBr > liveBitrateMbps && h264.SetBitrate(newBr)) {
+                                    liveBitrateMbps = newBr;
+                                    std::lock_guard<std::mutex> sl(w->statsMutex);
+                                    w->stats.liveBitrateMbps = liveBitrateMbps;
+                                    Logger::Instance().Info("SND-ABR",
+                                        L"Network recovered -> raised H.264 bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                                }
+                            }
+                        } else if (sendMs >= 10.0) {
+                            cleanSendStreak = 0;
+                        }
+                    }
+                }
             }
         }
 
@@ -816,6 +1361,9 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             w->stats.fps = static_cast<double>(windowFrames) / elapsedSec;
             w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsedSec * 1000000.0);
             w->stats.framesSent = frameIndex;
+            w->stats.configuredBitrateMbps = configBitrateMbps;
+            w->stats.liveBitrateMbps = liveBitrateMbps;
+            w->stats.targetFps = effFps;
             windowStart = now;
             windowFrames = 0;
             windowBytes = 0;
@@ -862,6 +1410,12 @@ void SenderEngine::CleanupSessionResources() {
         if (w->thread.joinable()) w->thread.join();
     }
 
+    m_usingExternalDisplays = false;
+    {
+        std::lock_guard<std::mutex> vl(m_virtualRectsMutex);
+        m_virtualOutputRects.clear();
+    }
+
     if (m_createdVirtualDisplays.exchange(false)) {
         VirtualDisplayCtl::ClearMonitors();
     }
@@ -902,6 +1456,7 @@ void SenderEngine::DisconnectInternal() {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.connected = false;
     m_status.connecting = false;
+    m_status.usingExternalDisplays = false;
     if (m_status.lastError.empty()) {
         m_status.stateText = L"Getrennt";
     }

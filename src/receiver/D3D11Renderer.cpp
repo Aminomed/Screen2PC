@@ -202,8 +202,36 @@ bool D3D11Renderer::QueryMonitorHdrInfo(HMONITOR hMon, MonitorHdrInfo& out) {
     return matched;
 }
 
+D3D11Renderer::D3D11Renderer() {
+    m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+}
+
 D3D11Renderer::~D3D11Renderer() {
     Destroy();
+    if (m_wakeEvent) {
+        CloseHandle(m_wakeEvent);
+        m_wakeEvent = nullptr;
+    }
+}
+
+void D3D11Renderer::SignalWake() {
+    if (m_wakeEvent) {
+        SetEvent(m_wakeEvent);
+    }
+}
+
+void D3D11Renderer::ShowFromHidden() {
+    m_hiddenByUser.store(false);
+    if (m_hwnd && IsWindow(m_hwnd)) {
+        if (IsIconic(m_hwnd)) {
+            ShowWindow(m_hwnd, SW_RESTORE);
+        } else {
+            ShowWindow(m_hwnd, SW_SHOW);
+        }
+        SetForegroundWindow(m_hwnd);
+    }
+    m_needRepaint.store(true);
+    SignalWake();
 }
 
 void D3D11Renderer::SetColorConfig(const MonitorColorConfig& cfg) {
@@ -214,7 +242,7 @@ void D3D11Renderer::SetColorConfig(const MonitorColorConfig& cfg) {
     }
     if (clamped != m_colorConfig) {
         m_colorConfig = clamped;
-        m_needRepaint = true;
+        m_needRepaint.store(true);
     }
 }
 
@@ -414,14 +442,18 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
                            bool startFullscreen) {
     Destroy();
     RegisterRenderClassOnce();
+    if (!m_wakeEvent) {
+        m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
 
     m_monitorIndex = monitorIndex;
     m_targetRect = targetMonitorRect;
     m_srcWidth = std::max<uint32_t>(sourceWidth, 1);
     m_srcHeight = std::max<uint32_t>(sourceHeight, 1);
     m_fullscreen = startFullscreen;
-    m_closedByUser = false;
-    m_deviceLost = false;
+    m_hiddenByUser.store(false);
+    m_hasPendingWork.store(false);
+    m_deviceLost.store(false);
     m_kvmCaptured = false;
     m_escReleasedCapture = false;
     m_suppressEscUp = false;
@@ -467,9 +499,17 @@ bool D3D11Renderer::Create(uint32_t monitorIndex,
     m_winWidth = std::max<uint32_t>(1, static_cast<uint32_t>(rc.right - rc.left));
     m_winHeight = std::max<uint32_t>(1, static_cast<uint32_t>(rc.bottom - rc.top));
 
-    if (!CreateDeviceAndShaders() ||
-        !CreateSwapChain(m_winWidth, m_winHeight) ||
-        !EnsureFrameTexture(m_srcWidth, m_srcHeight)) {
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+        ok = CreateDeviceAndShaders() &&
+             CreateSwapChain(m_winWidth, m_winHeight) &&
+             EnsureFrameTexture(m_srcWidth, m_srcHeight);
+        if (ok) {
+            m_deviceGen.fetch_add(1, std::memory_order_release);
+        }
+    }
+    if (!ok) {
         Destroy();
         return false;
     }
@@ -490,23 +530,42 @@ void D3D11Renderer::Destroy() {
     if (m_hwnd && GetCapture() == m_hwnd) {
         ReleaseCapture();
     }
-    m_cursorSrv.Reset();
-    m_cursorTex.Reset();
-    m_frameSrv.Reset();
-    m_frameTex.Reset();
-    m_colorCb.Reset();
-    m_quadCb.Reset();
-    m_alphaBlend.Reset();
-    m_sampler.Reset();
-    m_ps.Reset();
-    m_vs.Reset();
-    m_rtv.Reset();
-    m_swapChain.Reset();
-    m_context.Reset();
-    m_device.Reset();
+    {
+        std::lock_guard<std::mutex> fl(m_cpuFrameMutex);
+        m_pendingCpuFrame = PendingCpuFrame{};
+    }
+    {
+        std::lock_guard<std::mutex> cl(m_cursorMutex);
+        m_pendingCursor = PendingCursorUpdate{};
+    }
+    {
+        std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+        m_deviceGen.fetch_add(1, std::memory_order_release);
+        if (m_frameLatencyWaitable) {
+            CloseHandle(m_frameLatencyWaitable);
+            m_frameLatencyWaitable = nullptr;
+        }
+        m_cursorSrv.Reset();
+        m_cursorTex.Reset();
+        m_frameSrv.Reset();
+        m_frameTex.Reset();
+        m_colorCb.Reset();
+        m_quadCb.Reset();
+        m_alphaBlend.Reset();
+        m_sampler.Reset();
+        m_ps.Reset();
+        m_vs.Reset();
+        m_rtv.Reset();
+        m_swapChain.Reset();
+        m_context.Reset();
+        m_device.Reset();
+        m_swapChainFlags = 0;
+        m_allowTearing = false;
+        m_useTearingOnPresent = true;
+    }
     m_hdrSwapChain = false;
     m_monitorIsHdr = false;
-    m_deviceLost = false;
+    m_deviceLost.store(false);
     m_needSwapChainRebuild = false;
     m_currentMonitor = nullptr;
 
@@ -639,8 +698,15 @@ void D3D11Renderer::CreateDefaultCursorTexture() {
 
 bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
     if (!m_device || !m_hwnd) return false;
+    if (m_frameLatencyWaitable) {
+        CloseHandle(m_frameLatencyWaitable);
+        m_frameLatencyWaitable = nullptr;
+    }
     m_rtv.Reset();
     m_swapChain.Reset();
+    m_swapChainFlags = 0;
+    m_allowTearing = false;
+    m_useTearingOnPresent = true;
     if (m_context) {
         m_context->OMSetRenderTargets(0, nullptr, nullptr);
         m_context->Flush();
@@ -654,6 +720,30 @@ bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
         FAILED(adapter->GetParent(IID_PPV_ARGS(&factory)))) {
         return false;
     }
+
+    bool tearingSupported = false;
+    ComPtr<IDXGIFactory5> factory5;
+    if (SUCCEEDED(factory.As(&factory5)) && factory5) {
+        BOOL allow = FALSE;
+        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow)))) {
+            tearingSupported = (allow == TRUE);
+        }
+    }
+
+    const UINT tearingBit = tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    const UINT waitableBit = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    UINT flagCandidates[4]{};
+    size_t candCount = 0;
+    auto addCandidate = [&](UINT f) {
+        for (size_t i = 0; i < candCount; ++i) {
+            if (flagCandidates[i] == f) return;
+        }
+        flagCandidates[candCount++] = f;
+    };
+    addCandidate(tearingBit | waitableBit);
+    addCandidate(tearingBit);
+    addCandidate(waitableBit);
+    addCandidate(0);
 
     const bool wantHdr = m_monitorIsHdr && m_colorConfig.hdrOutputEnabled;
     m_hdrSwapChain = false;
@@ -669,31 +759,60 @@ bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
 
     if (wantHdr) {
         scd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        HRESULT hrHdr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &m_swapChain);
-        if (SUCCEEDED(hrHdr) && m_swapChain) {
-            ComPtr<IDXGISwapChain3> sc3;
-            UINT support = 0;
-            if (SUCCEEDED(m_swapChain.As(&sc3)) &&
-                SUCCEEDED(sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support)) &&
-                (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
-                SUCCEEDED(sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709))) {
-                m_hdrSwapChain = true;
-            } else {
-                m_swapChain.Reset();
+        for (size_t i = 0; i < candCount; ++i) {
+            scd.Flags = flagCandidates[i];
+            ComPtr<IDXGISwapChain1> candidateSc;
+            HRESULT hrHdr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &candidateSc);
+            if (SUCCEEDED(hrHdr) && candidateSc) {
+                ComPtr<IDXGISwapChain3> sc3;
+                UINT support = 0;
+                if (SUCCEEDED(candidateSc.As(&sc3)) &&
+                    SUCCEEDED(sc3->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support)) &&
+                    (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
+                    SUCCEEDED(sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709))) {
+                    m_swapChain = candidateSc;
+                    m_swapChainFlags = scd.Flags;
+                    m_hdrSwapChain = true;
+                    break;
+                }
             }
         }
     }
 
     if (!m_swapChain) {
         scd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        HRESULT hr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &m_swapChain);
-        if (FAILED(hr)) {
-            Logger::Instance().Error("RND-SC", L"CreateSwapChainForHwnd failed: " + FormatHr(hr));
+        HRESULT lastHr = E_FAIL;
+        for (size_t i = 0; i < candCount; ++i) {
+            scd.Flags = flagCandidates[i];
+            ComPtr<IDXGISwapChain1> candidateSc;
+            lastHr = factory->CreateSwapChainForHwnd(m_device.Get(), m_hwnd, &scd, nullptr, nullptr, &candidateSc);
+            if (SUCCEEDED(lastHr) && candidateSc) {
+                m_swapChain = candidateSc;
+                m_swapChainFlags = scd.Flags;
+                break;
+            }
+        }
+        if (!m_swapChain) {
+            Logger::Instance().Error("RND-SC", L"CreateSwapChainForHwnd failed: " + FormatHr(lastHr));
             return false;
         }
         ComPtr<IDXGISwapChain3> sc3;
         if (SUCCEEDED(m_swapChain.As(&sc3))) {
             sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        }
+    }
+
+    m_allowTearing = ((m_swapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0);
+    if ((m_swapChainFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
+        ComPtr<IDXGISwapChain2> sc2;
+        if (SUCCEEDED(m_swapChain.As(&sc2)) && sc2) {
+            sc2->SetMaximumFrameLatency(1);
+            m_frameLatencyWaitable = sc2->GetFrameLatencyWaitableObject();
+        }
+    } else {
+        ComPtr<IDXGIDevice1> dxgiDev1;
+        if (SUCCEEDED(dxgiDev.As(&dxgiDev1)) && dxgiDev1) {
+            dxgiDev1->SetMaximumFrameLatency(1);
         }
     }
 
@@ -709,7 +828,9 @@ bool D3D11Renderer::CreateSwapChain(uint32_t w, uint32_t h) {
         L"Monitor #" + std::to_wstring(m_monitorIndex + 1) +
         (m_hdrSwapChain
             ? (L": scRGB 16-bit HDR active (whiteScale=" + std::to_wstring(m_osSdrWhiteScale) + L")")
-            : L": SDR 8-bit B8G8R8A8 active"));
+            : L": SDR 8-bit B8G8R8A8 active") +
+        L" | tearing=" + (m_allowTearing ? L"1" : L"0") +
+        L" | waitable=" + (m_frameLatencyWaitable ? L"1" : L"0"));
     return true;
 }
 
@@ -734,7 +855,7 @@ void D3D11Renderer::RebuildSwapChainIfNeeded() {
         CreateSwapChain(m_winWidth, m_winHeight);
         UpdateTitle();
     }
-    m_needRepaint = true;
+    m_needRepaint.store(true);
 }
 
 void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
@@ -743,9 +864,9 @@ void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
     m_winHeight = h;
     m_rtv.Reset();
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
-    HRESULT hr = m_swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    HRESULT hr = m_swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, m_swapChainFlags);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        m_deviceLost = true;
+        m_deviceLost.store(true);
         return;
     }
     if (SUCCEEDED(hr)) {
@@ -754,7 +875,7 @@ void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
             m_device->CreateRenderTargetView(backBuf.Get(), nullptr, &m_rtv);
         }
     }
-    m_needRepaint = true;
+    m_needRepaint.store(true);
 }
 
 bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
@@ -785,6 +906,72 @@ bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
         return false;
     }
     return true;
+}
+
+void D3D11Renderer::QueueCpuFrame(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height) {
+    if (!bgra || width == 0 || height == 0 ||
+        static_cast<uint64_t>(strideBytes) < static_cast<uint64_t>(width) * 4) {
+        return;
+    }
+    const size_t rowBytes = static_cast<size_t>(width) * 4;
+    const size_t totalBytes = rowBytes * height;
+    {
+        std::lock_guard<std::mutex> lock(m_cpuFrameMutex);
+        m_pendingCpuFrame.bgra.resize(totalBytes);
+        if (strideBytes == rowBytes) {
+            std::memcpy(m_pendingCpuFrame.bgra.data(), bgra, totalBytes);
+        } else {
+            for (uint32_t y = 0; y < height; ++y) {
+                std::memcpy(m_pendingCpuFrame.bgra.data() + static_cast<size_t>(y) * rowBytes,
+                            bgra + static_cast<size_t>(y) * strideBytes,
+                            rowBytes);
+            }
+        }
+        m_pendingCpuFrame.width = width;
+        m_pendingCpuFrame.height = height;
+        m_pendingCpuFrame.stride = static_cast<uint32_t>(rowBytes);
+        m_pendingCpuFrame.dirty = true;
+    }
+    m_hasPendingWork.store(true, std::memory_order_release);
+    SignalWake();
+}
+
+void D3D11Renderer::QueueCursorUpdate(bool visible,
+                                      int32_t x,
+                                      int32_t y,
+                                      bool shapeChanged,
+                                      uint8_t shapeType,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      uint32_t pitch,
+                                      uint32_t hotX,
+                                      uint32_t hotY,
+                                      const uint8_t* shapeData,
+                                      size_t shapeDataSize) {
+    {
+        std::lock_guard<std::mutex> lock(m_cursorMutex);
+        m_pendingCursor.posDirty = true;
+        m_pendingCursor.visible = visible;
+        m_pendingCursor.x = x;
+        m_pendingCursor.y = y;
+        if (shapeChanged && shapeData && shapeDataSize > 0 && width > 0 && height > 0) {
+            m_pendingCursor.shapeDirty = true;
+            m_pendingCursor.shapeType = shapeType;
+            m_pendingCursor.width = width;
+            m_pendingCursor.height = height;
+            m_pendingCursor.pitch = pitch;
+            m_pendingCursor.hotX = hotX;
+            m_pendingCursor.hotY = hotY;
+            m_pendingCursor.shapeData.assign(shapeData, shapeData + shapeDataSize);
+        }
+    }
+    m_hasPendingWork.store(true, std::memory_order_release);
+    SignalWake();
+}
+
+void D3D11Renderer::MarkGpuFrameUpdated() {
+    m_hasPendingWork.store(true, std::memory_order_release);
+    SignalWake();
 }
 
 void D3D11Renderer::UploadCpuBgra(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height) {
@@ -946,94 +1133,178 @@ void D3D11Renderer::PumpMessages() {
 }
 
 void D3D11Renderer::Present() {
-    RebuildSwapChainIfNeeded();
-    if (!m_context || !m_swapChain || !m_rtv || !m_frameSrv) return;
+    const bool visibleForPresent = !m_hiddenByUser.load(std::memory_order_acquire) &&
+                                   (!m_hwnd || !IsIconic(m_hwnd));
 
-    const float clearHdr[4] = { 0.0004f, 0.0004f, 0.0008f, 1.0f };
-    const float clearSdr[4] = { 0.02f, 0.02f, 0.03f, 1.0f };
-    m_context->ClearRenderTargetView(m_rtv.Get(), m_hdrSwapChain ? clearHdr : clearSdr);
-    m_context->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
-
-    D3D11_VIEWPORT vp{};
-    vp.Width = static_cast<float>(m_winWidth);
-    vp.Height = static_cast<float>(m_winHeight);
-    vp.MaxDepth = 1.0f;
-    m_context->RSSetViewports(1, &vp);
-
-    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    m_context->IASetInputLayout(nullptr);
-    m_context->VSSetShader(m_vs.Get(), nullptr, 0);
-    m_context->PSSetShader(m_ps.Get(), nullptr, 0);
-    m_context->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
-
-    // Aspect-preserving destination rect in normalized [0..1] window coords
-    float winAspect = static_cast<float>(m_winWidth) / static_cast<float>(std::max<uint32_t>(1, m_winHeight));
-    float srcAspect = static_cast<float>(m_srcWidth) / static_cast<float>(std::max<uint32_t>(1, m_srcHeight));
-    float drawW = 2.0f, drawH = 2.0f, offX = -1.0f, offY = 1.0f;
-    if (winAspect > srcAspect) {
-        drawW = 2.0f * (srcAspect / winAspect);
-        offX = -drawW * 0.5f;
-    } else if (srcAspect > winAspect) {
-        drawH = 2.0f * (winAspect / srcAspect);
-        offY = drawH * 0.5f;
+    // Wait outside m_gpuMutex so recv+decode thread can feed the GPU unhindered
+    if (visibleForPresent && m_frameLatencyWaitable) {
+        WaitForSingleObjectEx(m_frameLatencyWaitable, 8, FALSE);
     }
 
-    auto uploadColor = [&](bool isCursor) {
-        if (!m_colorCb) return;
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(m_context->Map(m_colorCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-            ColorShaderConstants cb = ComputeColorShaderConstants(m_colorConfig, m_hdrSwapChain, m_osSdrWhiteScale, isCursor);
-            std::memcpy(mapped.pData, &cb, sizeof(cb));
-            m_context->Unmap(m_colorCb.Get(), 0);
-            m_context->PSSetConstantBuffers(1, 1, m_colorCb.GetAddressOf());
+    bool hasCpuFrame = false;
+    uint32_t cpuW = 0, cpuH = 0, cpuStride = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_cpuFrameMutex);
+        if (m_pendingCpuFrame.dirty) {
+            hasCpuFrame = true;
+            cpuW = m_pendingCpuFrame.width;
+            cpuH = m_pendingCpuFrame.height;
+            cpuStride = m_pendingCpuFrame.stride;
+            m_cpuUploadScratch.swap(m_pendingCpuFrame.bgra);
+            m_pendingCpuFrame.dirty = false;
         }
-    };
-
-    auto drawQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, bool blend, bool isCursor) {
-        if (!m_quadCb) return;
-        uploadColor(isCursor);
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(m_context->Map(m_quadCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-            QuadCB cb{ x, y, w, h };
-            std::memcpy(mapped.pData, &cb, sizeof(cb));
-            m_context->Unmap(m_quadCb.Get(), 0);
-            m_context->VSSetConstantBuffers(0, 1, m_quadCb.GetAddressOf());
-            m_context->PSSetShaderResources(0, 1, &srv);
-            m_context->OMSetBlendState(blend ? m_alphaBlend.Get() : nullptr, nullptr, 0xFFFFFFFF);
-            m_context->Draw(4, 0);
-        }
-    };
-
-    drawQuad(offX, offY, drawW, drawH, m_frameSrv.Get(), false, false);
-
-    if (m_cursorVisible && m_cursorSrv && m_cursorW > 0 && m_cursorH > 0) {
-        float cx = static_cast<float>(m_cursorX - static_cast<int32_t>(m_cursorHotX)) / static_cast<float>(m_srcWidth);
-        float cy = static_cast<float>(m_cursorY - static_cast<int32_t>(m_cursorHotY)) / static_cast<float>(m_srcHeight);
-        float cw = static_cast<float>(m_cursorW) / static_cast<float>(m_srcWidth);
-        float ch = static_cast<float>(m_cursorH) / static_cast<float>(m_srcHeight);
-        drawQuad(offX + cx * drawW, offY - cy * drawH, cw * drawW, ch * drawH, m_cursorSrv.Get(), true, true);
     }
 
-    // Immediate present (syncInterval = 0) for minimum display latency on LAN
-    HRESULT hr = m_swapChain->Present(0, 0);
+    PendingCursorUpdate cursorUpd;
+    {
+        std::lock_guard<std::mutex> lock(m_cursorMutex);
+        if (m_pendingCursor.posDirty || m_pendingCursor.shapeDirty) {
+            cursorUpd.posDirty = m_pendingCursor.posDirty;
+            cursorUpd.visible = m_pendingCursor.visible;
+            cursorUpd.x = m_pendingCursor.x;
+            cursorUpd.y = m_pendingCursor.y;
+            cursorUpd.shapeDirty = m_pendingCursor.shapeDirty;
+            if (cursorUpd.shapeDirty) {
+                cursorUpd.shapeType = m_pendingCursor.shapeType;
+                cursorUpd.width = m_pendingCursor.width;
+                cursorUpd.height = m_pendingCursor.height;
+                cursorUpd.pitch = m_pendingCursor.pitch;
+                cursorUpd.hotX = m_pendingCursor.hotX;
+                cursorUpd.hotY = m_pendingCursor.hotY;
+                cursorUpd.shapeData.swap(m_pendingCursor.shapeData);
+            }
+            m_pendingCursor.posDirty = false;
+            m_pendingCursor.shapeDirty = false;
+        }
+    }
+
+    ComPtr<IDXGISwapChain1> scToPresent;
+    UINT presentFlags = 0;
+    {
+        std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+        if (hasCpuFrame && !m_cpuUploadScratch.empty()) {
+            UploadCpuBgra(m_cpuUploadScratch.data(), cpuStride, cpuW, cpuH);
+        }
+        if (cursorUpd.posDirty || cursorUpd.shapeDirty) {
+            UpdateCursor(cursorUpd.visible, cursorUpd.x, cursorUpd.y,
+                         cursorUpd.shapeDirty, cursorUpd.shapeType,
+                         cursorUpd.width, cursorUpd.height, cursorUpd.pitch,
+                         cursorUpd.hotX, cursorUpd.hotY,
+                         cursorUpd.shapeDirty ? cursorUpd.shapeData.data() : nullptr,
+                         cursorUpd.shapeDirty ? cursorUpd.shapeData.size() : 0);
+        }
+
+        if (!visibleForPresent) {
+            return;
+        }
+
+        RebuildSwapChainIfNeeded();
+        if (!m_context || !m_swapChain || !m_rtv || !m_frameSrv) return;
+
+        const float clearHdr[4] = { 0.0004f, 0.0004f, 0.0008f, 1.0f };
+        const float clearSdr[4] = { 0.02f, 0.02f, 0.03f, 1.0f };
+        m_context->ClearRenderTargetView(m_rtv.Get(), m_hdrSwapChain ? clearHdr : clearSdr);
+        m_context->OMSetRenderTargets(1, m_rtv.GetAddressOf(), nullptr);
+
+        D3D11_VIEWPORT vp{};
+        vp.Width = static_cast<float>(m_winWidth);
+        vp.Height = static_cast<float>(m_winHeight);
+        vp.MaxDepth = 1.0f;
+        m_context->RSSetViewports(1, &vp);
+
+        m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        m_context->IASetInputLayout(nullptr);
+        m_context->VSSetShader(m_vs.Get(), nullptr, 0);
+        m_context->PSSetShader(m_ps.Get(), nullptr, 0);
+        m_context->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
+
+        float winAspect = static_cast<float>(m_winWidth) / static_cast<float>(std::max<uint32_t>(1, m_winHeight));
+        float srcAspect = static_cast<float>(m_srcWidth) / static_cast<float>(std::max<uint32_t>(1, m_srcHeight));
+        float drawW = 2.0f, drawH = 2.0f, offX = -1.0f, offY = 1.0f;
+        if (winAspect > srcAspect) {
+            drawW = 2.0f * (srcAspect / winAspect);
+            offX = -drawW * 0.5f;
+        } else if (srcAspect > winAspect) {
+            drawH = 2.0f * (winAspect / srcAspect);
+            offY = drawH * 0.5f;
+        }
+
+        auto uploadColor = [&](bool isCursor) {
+            if (!m_colorCb) return;
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(m_context->Map(m_colorCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                ColorShaderConstants cb = ComputeColorShaderConstants(m_colorConfig, m_hdrSwapChain, m_osSdrWhiteScale, isCursor);
+                std::memcpy(mapped.pData, &cb, sizeof(cb));
+                m_context->Unmap(m_colorCb.Get(), 0);
+                m_context->PSSetConstantBuffers(1, 1, m_colorCb.GetAddressOf());
+            }
+        };
+
+        auto drawQuad = [&](float x, float y, float w, float h, ID3D11ShaderResourceView* srv, bool blend, bool isCursor) {
+            if (!m_quadCb) return;
+            uploadColor(isCursor);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(m_context->Map(m_quadCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                QuadCB cb{ x, y, w, h };
+                std::memcpy(mapped.pData, &cb, sizeof(cb));
+                m_context->Unmap(m_quadCb.Get(), 0);
+                m_context->VSSetConstantBuffers(0, 1, m_quadCb.GetAddressOf());
+                m_context->PSSetShaderResources(0, 1, &srv);
+                m_context->OMSetBlendState(blend ? m_alphaBlend.Get() : nullptr, nullptr, 0xFFFFFFFF);
+                m_context->Draw(4, 0);
+            }
+        };
+
+        drawQuad(offX, offY, drawW, drawH, m_frameSrv.Get(), false, false);
+
+        if (m_cursorVisible && m_cursorSrv && m_cursorW > 0 && m_cursorH > 0) {
+            float cx = static_cast<float>(m_cursorX - static_cast<int32_t>(m_cursorHotX)) / static_cast<float>(m_srcWidth);
+            float cy = static_cast<float>(m_cursorY - static_cast<int32_t>(m_cursorHotY)) / static_cast<float>(m_srcHeight);
+            float cw = static_cast<float>(m_cursorW) / static_cast<float>(m_srcWidth);
+            float ch = static_cast<float>(m_cursorH) / static_cast<float>(m_srcHeight);
+            drawQuad(offX + cx * drawW, offY - cy * drawH, cw * drawW, ch * drawH, m_cursorSrv.Get(), true, true);
+        }
+
+        scToPresent = m_swapChain;
+        if (m_allowTearing && m_useTearingOnPresent) {
+            presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+        }
+    }
+
+    // Never hold m_gpuMutex across IDXGISwapChain::Present()
+    HRESULT hr = scToPresent->Present(0, presentFlags);
+    if (hr == DXGI_ERROR_INVALID_CALL && (presentFlags & DXGI_PRESENT_ALLOW_TEARING) != 0) {
+        Logger::Instance().Warn("RND-D3D", L"DXGI_PRESENT_ALLOW_TEARING returned DXGI_ERROR_INVALID_CALL; falling back to standard flip Present.");
+        m_useTearingOnPresent = false;
+        hr = scToPresent->Present(0, presentFlags & ~DXGI_PRESENT_ALLOW_TEARING);
+    }
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         Logger::Instance().Warn("RND-D3D", L"DXGI device lost during Present: " + FormatHr(hr));
-        m_deviceLost = true;
+        m_deviceLost.store(true);
     }
 }
 
 bool D3D11Renderer::ConsumeDeviceLost() {
-    if (!m_deviceLost && m_device && FAILED(m_device->GetDeviceRemovedReason())) {
-        m_deviceLost = true;
+    bool lost = m_deviceLost.exchange(false);
+    if (!lost) {
+        std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+        if (m_device && FAILED(m_device->GetDeviceRemovedReason())) {
+            lost = true;
+        }
     }
-    bool lost = m_deviceLost;
-    m_deviceLost = false;
     return lost;
 }
 
 bool D3D11Renderer::RecreateDeviceAndResources() {
     if (!m_hwnd || !IsWindow(m_hwnd)) return false;
 
+    std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+    m_deviceGen.fetch_add(1, std::memory_order_release);
+
+    if (m_frameLatencyWaitable) {
+        CloseHandle(m_frameLatencyWaitable);
+        m_frameLatencyWaitable = nullptr;
+    }
     m_cursorSrv.Reset();
     m_cursorTex.Reset();
     m_frameSrv.Reset();
@@ -1048,6 +1319,9 @@ bool D3D11Renderer::RecreateDeviceAndResources() {
     m_swapChain.Reset();
     m_context.Reset();
     m_device.Reset();
+    m_swapChainFlags = 0;
+    m_allowTearing = false;
+    m_useTearingOnPresent = true;
 
     m_currentMonitor = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
     MonitorHdrInfo hdrInfo{};
@@ -1062,9 +1336,10 @@ bool D3D11Renderer::RecreateDeviceAndResources() {
         return false;
     }
 
-    m_deviceLost = false;
-    m_needRepaint = true;
+    m_deviceLost.store(false);
+    m_needRepaint.store(true);
     UpdateTitle();
+    SignalWake();
     return true;
 }
 
@@ -1074,7 +1349,8 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         PAINTSTRUCT ps{};
         BeginPaint(hwnd, &ps);
         EndPaint(hwnd, &ps);
-        m_needRepaint = true;
+        m_needRepaint.store(true);
+        SignalWake();
         return 0;
     }
     case WM_SETCURSOR:
@@ -1085,28 +1361,49 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         break;
     case WM_DISPLAYCHANGE:
         m_needSwapChainRebuild = true;
-        m_needRepaint = true;
+        m_needRepaint.store(true);
+        SignalWake();
         return 0;
     case WM_MOVE: {
         HMONITOR curMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         if (curMon != m_currentMonitor) {
             m_needSwapChainRebuild = true;
-            m_needRepaint = true;
+            m_needRepaint.store(true);
+            SignalWake();
         }
         if (m_kvmCaptured) {
             UpdateCursorClip();
         }
         return 0;
     }
+    case WM_DPICHANGED: {
+        if (!m_fullscreen) {
+            const RECT* suggested = reinterpret_cast<const RECT*>(lp);
+            if (suggested) {
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        m_needSwapChainRebuild = true;
+        m_needRepaint.store(true);
+        SignalWake();
+        return 0;
+    }
     case WM_SIZE: {
         UINT w = LOWORD(lp);
         UINT h = HIWORD(lp);
-        if (w > 0 && h > 0 && m_swapChain) {
-            ResizeSwapChain(w, h);
+        if (w > 0 && h > 0) {
+            std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
+            if (m_swapChain) {
+                ResizeSwapChain(w, h);
+            }
         }
         if (m_kvmCaptured) {
             UpdateCursorClip();
         }
+        SignalWake();
         return 0;
     }
     case WM_ACTIVATE:
@@ -1313,9 +1610,13 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     case WM_CLOSE:
         SetKvmCapture(false);
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+        }
         ReleaseRemoteModifiers();
-        m_closedByUser = true;
+        m_hiddenByUser.store(true);
         ShowWindow(hwnd, SW_HIDE);
+        SignalWake();
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

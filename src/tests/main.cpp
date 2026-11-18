@@ -1,6 +1,8 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <objbase.h>
 #include <atomic>
@@ -11,6 +13,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -19,6 +22,7 @@
 #include "../common/Autostart.h"
 #include "../common/BitratePresets.h"
 #include "../common/ColorProfile.h"
+#include "../common/Pairing.h"
 #include "../common/Updater.h"
 #include "../common/Protocol.h"
 #include "../common/Logger.h"
@@ -28,6 +32,8 @@
 #include "../common/ClipboardSync.h"
 #include "../common/FileTransfer.h"
 #include "../common/KvmInput.h"
+#include "../sender/PowerPolicy.h"
+#include "../driver/DriverProtocol.h"
 
 namespace {
 
@@ -981,6 +987,447 @@ void TestBitratePresets() {
     std::cout << "[PASS] TestBitratePresets\n";
 }
 
+void TestVersionProtocolAndPresets() {
+    // 1. Header version & raw mismatch detection
+    auto v2Hdr = s2p::MakeHeader(s2p::MsgType::HelloSender, 16);
+    uint16_t remoteVer = 0;
+    CHECK(s2p::CheckHeaderVersion(v2Hdr, remoteVer) && remoteVer == s2p::kProtocolVersion,
+          "CheckHeaderVersion failed on current protocol header");
+
+    auto v1Hdr = v2Hdr;
+    v1Hdr.version = 1;
+    CHECK(!s2p::CheckHeaderVersion(v1Hdr, remoteVer) && remoteVer == 1,
+          "CheckHeaderVersion failed to detect v1 mismatch");
+
+    auto badMagicHdr = v2Hdr;
+    badMagicHdr.magic = 0x11223344u;
+    CHECK(!s2p::CheckHeaderVersion(badMagicHdr, remoteVer) && remoteVer == 0,
+          "CheckHeaderVersion did not reset version on invalid magic");
+
+    // 2. Loopback RecvPacketRaw detects raw v1 mismatch & delivers v2 VersionMismatch packet
+    const uint16_t testPort = 48296;
+    s2p::TcpSocket listener;
+    CHECK(listener.Listen(testPort, 2), "Version test TcpSocket::Listen failed");
+
+    s2p::TcpSocket srvSock;
+    std::thread acceptThread([&]() {
+        srvSock = listener.Accept(nullptr, 2500);
+    });
+    s2p::TcpSocket cliSock;
+    CHECK(cliSock.Connect("127.0.0.1", testPort, 2000), "Version test TcpSocket::Connect failed");
+    acceptThread.join();
+    listener.Close();
+    CHECK(srvSock.IsValid(), "Version test server accept failed");
+
+    struct {
+        s2p::PacketHeader hdr;
+        uint32_t body;
+    } legacyPkt{};
+    legacyPkt.hdr = s2p::MakeHeader(s2p::MsgType::HelloSender, sizeof(uint32_t));
+    legacyPkt.hdr.version = 1;
+    legacyPkt.body = 0x12345678u;
+    CHECK(cliSock.SendAll(&legacyPkt, sizeof(legacyPkt)), "Send legacy v1 packet failed");
+
+    s2p::PacketHeader recvHdr{};
+    std::vector<uint8_t> recvPayload;
+    uint16_t detectedVer = 0;
+    bool verMismatch = false;
+    CHECK(!srvSock.RecvPacketRaw(recvHdr, recvPayload, detectedVer, verMismatch),
+          "RecvPacketRaw should return false on protocol version mismatch");
+    CHECK(verMismatch && detectedVer == 1, "RecvPacketRaw failed to report remote v1 mismatch");
+
+    s2p::VersionMismatchPayload vm{};
+    vm.protocolVersion = s2p::kProtocolVersion;
+    vm.appVersion = s2p::CurrentAppVersionTuple();
+    wcscpy_s(vm.message, L"Bitte aktualisieren");
+    CHECK(srvSock.SendPacket(s2p::MsgType::VersionMismatch, &vm, sizeof(vm)), "Send VersionMismatch failed");
+
+    CHECK(cliSock.RecvPacketRaw(recvHdr, recvPayload, detectedVer, verMismatch) &&
+          !verMismatch &&
+          recvHdr.type == static_cast<uint16_t>(s2p::MsgType::VersionMismatch) &&
+          recvPayload.size() == sizeof(vm),
+          "Client failed to receive v2 VersionMismatch packet");
+
+    cliSock.Close();
+    srvSock.Close();
+
+    // 3. FPS presets & effective FPS calculation
+    CHECK(s2p::kFpsPresetCount == 4, "Expected 4 FPS presets (Auto, 60, 90, 120)");
+    CHECK(s2p::FpsFromPresetIndex(0) == 0 &&
+          s2p::FpsFromPresetIndex(1) == 60 &&
+          s2p::FpsFromPresetIndex(2) == 90 &&
+          s2p::FpsFromPresetIndex(3) == 120,
+          "FPS preset order mismatch");
+    CHECK(s2p::FindFpsPresetIndex(0) == 0 && s2p::FindFpsPresetIndex(90) == 2 && s2p::FindFpsPresetIndex(144) == 3,
+          "FindFpsPresetIndex mismatch");
+    CHECK(s2p::ResolveEffectiveFps(0, 144) == 120 &&
+          s2p::ResolveEffectiveFps(0, 60) == 60 &&
+          s2p::ResolveEffectiveFps(90, 144) == 90,
+          "ResolveEffectiveFps mismatch");
+    CHECK(s2p::FormatFpsLabel(0) == L"Auto (Monitor-Hz)" && s2p::FormatFpsLabel(120) == L"120 FPS",
+          "FormatFpsLabel mismatch");
+
+    std::cout << "[PASS] TestVersionProtocolAndPresets\n";
+}
+
+void TestPairingSecurity() {
+    // 1. Cryptographic 6-digit PIN generation + constant-time verify
+    std::set<std::string> pins;
+    for (int i = 0; i < 12; ++i) {
+        std::string p = s2p::GeneratePin6();
+        CHECK(p.size() == 6, "Generated PIN is not 6 chars");
+        for (char c : p) {
+            CHECK(c >= '0' && c <= '9', "Generated PIN contains non-digit");
+        }
+        pins.insert(p);
+    }
+    CHECK(pins.size() >= 2, "GeneratePin6 returned identical values across 12 samples");
+
+    CHECK(s2p::ConstantTimePinEquals("482910", "482910", 6), "ConstantTimePinEquals failed on exact match");
+    CHECK(!s2p::ConstantTimePinEquals("482910", "482911", 6), "ConstantTimePinEquals accepted mismatch");
+    CHECK(!s2p::ConstantTimePinEquals("48291", "48291", 6), "ConstantTimePinEquals accepted short PIN");
+    CHECK(!s2p::ConstantTimePinEquals(nullptr, "482910", 6), "ConstantTimePinEquals failed nullptr check");
+
+    // 2. MAC formatting, trusted key derivation & INI persistence
+    const uint8_t macA[6] = { 0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33 };
+    const uint8_t zeroMac[6]{};
+    const uint8_t devIdA[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+    const uint8_t zeroId[16]{};
+
+    CHECK(s2p::FormatMacAddress(macA) == L"AA:BB:CC:11:22:33", "FormatMacAddress mismatch");
+    CHECK(s2p::MakeTrustedDeviceKey(macA, devIdA) == L"MAC_AABBCC112233", "MAC trusted key mismatch");
+    CHECK(s2p::MakeTrustedDeviceKey(zeroMac, devIdA) == L"ID_0102030405060708090A0B0C0D0E0F10",
+          "DeviceId fallback trusted key mismatch");
+
+    wchar_t tempDir[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring iniPath = std::wstring(tempDir) + L"s2p_pair_test_" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    DeleteFileW(iniPath.c_str());
+
+    uint8_t loadedId1[16]{};
+    uint8_t loadedId2[16]{};
+    CHECK(s2p::LoadOrCreateLocalDeviceId(iniPath, loadedId1) && !s2p::IsAllZero(loadedId1, 16),
+          "LoadOrCreateLocalDeviceId failed");
+    CHECK(s2p::LoadOrCreateLocalDeviceId(iniPath, loadedId2) && std::memcmp(loadedId1, loadedId2, 16) == 0,
+          "LoadOrCreateLocalDeviceId not persistent");
+
+    CHECK(!s2p::IsDeviceTrusted(iniPath, macA, devIdA), "Fresh INI unexpectedly trusted unknown device");
+    CHECK(s2p::SaveTrustedDevice(iniPath, L"Surface Laptop|Test", macA, devIdA, "192.168.1.45"),
+          "SaveTrustedDevice failed");
+    s2p::TrustedDeviceEntry match{};
+    CHECK(s2p::IsDeviceTrusted(iniPath, macA, zeroId, &match) &&
+          match.key == L"MAC_AABBCC112233" &&
+          match.macStr == L"AA:BB:CC:11:22:33" &&
+          match.lastIp == L"192.168.1.45",
+          "IsDeviceTrusted by MAC failed");
+    CHECK(s2p::IsDeviceTrusted(iniPath, zeroMac, devIdA, &match) && match.key == L"MAC_AABBCC112233",
+          "IsDeviceTrusted fallback by deviceId failed");
+
+    // 3. Loopback PIN exchange simulation -> trusted remember -> auto-verify
+    const uint16_t pairPort = 48295;
+    s2p::TcpSocket listener;
+    CHECK(listener.Listen(pairPort, 2), "Pairing loopback Listen failed");
+
+    const std::string expectedPin = s2p::GeneratePin6();
+    std::thread pcAuthThread([&]() {
+        s2p::TcpSocket s = listener.Accept(nullptr, 2500);
+        if (!s.IsValid()) return;
+        s2p::PairChallengePayload ch{};
+        wcscpy_s(ch.pcName, L"Gaming-PC");
+        ch.pcVersion = s2p::CurrentAppVersionTuple();
+        s.SendPacket(s2p::MsgType::PairChallenge, &ch, sizeof(ch));
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            s2p::PacketHeader ph{};
+            std::vector<uint8_t> pp;
+            if (!s.RecvPacket(ph, pp) || pp.size() < sizeof(s2p::PairVerifyPayload)) break;
+            s2p::PairVerifyPayload pv{};
+            std::memcpy(&pv, pp.data(), sizeof(pv));
+            s2p::PairResultPayload pr{};
+            if (s2p::ConstantTimePinEquals(pv.pinCode, expectedPin.c_str(), 6)) {
+                pr.accepted = 1;
+                pr.remembered = s2p::SaveTrustedDevice(iniPath, L"Surface Pro", pv.senderMac, pv.senderDeviceId, "127.0.0.1") ? 1 : 0;
+                pr.remainingAttempts = static_cast<uint8_t>(3 - attempt);
+                s.SendPacket(s2p::MsgType::PairResult, &pr, sizeof(pr));
+                break;
+            } else {
+                pr.accepted = 0;
+                pr.remainingAttempts = static_cast<uint8_t>(2 - attempt);
+                s.SendPacket(s2p::MsgType::PairResult, &pr, sizeof(pr));
+            }
+        }
+        s.Close();
+    });
+
+    s2p::TcpSocket surfSock;
+    CHECK(surfSock.Connect("127.0.0.1", pairPort, 2000), "Pairing loopback Connect failed");
+    s2p::PacketHeader h{};
+    std::vector<uint8_t> pl;
+    CHECK(surfSock.RecvPacket(h, pl) && h.type == static_cast<uint16_t>(s2p::MsgType::PairChallenge),
+          "Missing PairChallenge");
+
+    const uint8_t macB[6] = { 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC };
+    s2p::PairVerifyPayload pvBad{};
+    strncpy_s(pvBad.pinCode, "000000", _TRUNCATE);
+    if (expectedPin == "000000") strncpy_s(pvBad.pinCode, "111111", _TRUNCATE);
+    std::memcpy(pvBad.senderMac, macB, 6);
+    CHECK(surfSock.SendPacket(s2p::MsgType::PairVerify, &pvBad, sizeof(pvBad)), "Send bad PairVerify failed");
+    CHECK(surfSock.RecvPacket(h, pl) && h.type == static_cast<uint16_t>(s2p::MsgType::PairResult) &&
+          pl.size() >= sizeof(s2p::PairResultPayload), "Missing bad PairResult");
+    s2p::PairResultPayload prBad{};
+    std::memcpy(&prBad, pl.data(), sizeof(prBad));
+    CHECK(prBad.accepted == 0 && prBad.remainingAttempts == 2, "Wrong PIN should fail with 2 attempts left");
+
+    s2p::PairVerifyPayload pvGood{};
+    strncpy_s(pvGood.pinCode, expectedPin.c_str(), _TRUNCATE);
+    std::memcpy(pvGood.senderMac, macB, 6);
+    CHECK(surfSock.SendPacket(s2p::MsgType::PairVerify, &pvGood, sizeof(pvGood)), "Send good PairVerify failed");
+    CHECK(surfSock.RecvPacket(h, pl) && h.type == static_cast<uint16_t>(s2p::MsgType::PairResult) &&
+          pl.size() >= sizeof(s2p::PairResultPayload), "Missing good PairResult");
+    s2p::PairResultPayload prGood{};
+    std::memcpy(&prGood, pl.data(), sizeof(prGood));
+    CHECK(prGood.accepted == 1 && prGood.remembered == 1, "Valid PIN should be accepted and remembered");
+
+    surfSock.Close();
+    pcAuthThread.join();
+    listener.Close();
+
+    CHECK(s2p::IsDeviceTrusted(iniPath, macB, zeroId), "Second device not found in trusted list after PIN auth");
+    CHECK(s2p::LoadTrustedDevices(iniPath).size() == 2, "Expected 2 trusted entries");
+    CHECK(s2p::RemoveTrustedDevice(iniPath, L"MAC_AABBCC112233") && s2p::LoadTrustedDevices(iniPath).size() == 1,
+          "RemoveTrustedDevice failed");
+    CHECK(s2p::ClearTrustedDevices(iniPath) && s2p::LoadTrustedDevices(iniPath).empty(),
+          "ClearTrustedDevices failed");
+
+    DeleteFileW(iniPath.c_str());
+    std::cout << "[PASS] TestPairingSecurity\n";
+}
+
+void TestFileTransferRecursiveAndCancel() {
+    // 1. Relative subfolder sanitization & traversal blocking
+    CHECK(s2p::FileTransfer::SanitizeRelativePath(L"Projekte/2026\\Daten") == L"Projekte\\2026\\Daten",
+          "Valid relative path altered");
+    CHECK(s2p::FileTransfer::SanitizeRelativePath(L"..\\..\\Windows\\System32").empty(),
+          "Parent directory traversal must return empty path");
+    CHECK(s2p::FileTransfer::SanitizeRelativePath(L"C:\\Users\\Public").empty(),
+          "Drive-qualified relative path must be rejected");
+    CHECK(s2p::FileTransfer::SanitizeRelativePath(L"\\\\server\\share\\file").empty(),
+          "UNC relative path must be rejected");
+    CHECK(s2p::FileTransfer::SanitizeRelativePath(L"CON\\PRN") == L"_CON\\_PRN",
+          "Reserved Windows folder names not escaped");
+
+    // 2. Recursive directory tree transfer over loopback
+    wchar_t tempBase[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempBase);
+    std::wstring baseDir = std::wstring(tempBase) + L"s2p_ft_rec_" + std::to_wstring(GetCurrentProcessId());
+    std::wstring srcRoot = baseDir + L"\\src";
+    std::wstring folderA = srcRoot + L"\\OrdnerA";
+    std::wstring folderDeep = folderA + L"\\Unter";
+    std::wstring dstDir = baseDir + L"\\dst";
+    CreateDirectoryW(baseDir.c_str(), nullptr);
+    CreateDirectoryW(srcRoot.c_str(), nullptr);
+    CreateDirectoryW(folderA.c_str(), nullptr);
+    CreateDirectoryW(folderDeep.c_str(), nullptr);
+    CreateDirectoryW(dstDir.c_str(), nullptr);
+
+    auto writeBytes = [](const std::wstring& path, const std::vector<uint8_t>& data) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE, "Failed creating temp file");
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD w = 0;
+            WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &w, nullptr);
+            CloseHandle(h);
+        }
+    };
+    auto readBytes = [](const std::wstring& path, std::vector<uint8_t>& out) -> bool {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER sz{};
+        GetFileSizeEx(h, &sz);
+        out.resize(static_cast<size_t>(sz.QuadPart));
+        DWORD r = 0;
+        BOOL ok = ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &r, nullptr);
+        CloseHandle(h);
+        return ok && r == out.size();
+    };
+
+    const std::vector<uint8_t> d1 = { 'H','e','l','l','o','1' };
+    const std::vector<uint8_t> d2(128 * 1024 + 9, 0x5A);
+    std::wstring f1 = folderA + L"\\top.txt";
+    std::wstring f2 = folderDeep + L"\\deep.bin";
+    writeBytes(f1, d1);
+    writeBytes(f2, d2);
+
+    const uint16_t recPort = 48294;
+    s2p::TcpSocket listener;
+    CHECK(listener.Listen(recPort, 2), "Recursive FileTransfer listen failed");
+
+    s2p::TcpSocket srvSock;
+    std::thread acc([&]() { srvSock = listener.Accept(nullptr, 2500); });
+    s2p::TcpSocket cliSock;
+    CHECK(cliSock.Connect("127.0.0.1", recPort, 2000), "Recursive FileTransfer connect failed");
+    acc.join();
+    listener.Close();
+
+    s2p::FileTransfer tx, rx;
+    tx.Start(std::move(cliSock), srcRoot);
+    rx.Start(std::move(srvSock), dstDir);
+
+    CHECK(tx.QueuePaths({ folderA }) == 2, "QueuePaths did not collect 2 files recursively");
+    bool recDone = false;
+    for (int i = 0; i < 80; ++i) {
+        if (rx.GetStats().filesReceived == 2 && tx.GetStats().filesSent == 2) {
+            recDone = true;
+            break;
+        }
+        Sleep(25);
+    }
+    CHECK(recDone, "Recursive folder transfer did not complete");
+
+    std::vector<uint8_t> out1, out2;
+    std::wstring rx1 = dstDir + L"\\OrdnerA\\top.txt";
+    std::wstring rx2 = dstDir + L"\\OrdnerA\\Unter\\deep.bin";
+    CHECK(readBytes(rx1, out1) && out1 == d1, "Transferred top.txt missing or corrupted");
+    CHECK(readBytes(rx2, out2) && out2 == d2, "Transferred deep.bin missing or corrupted");
+
+    // 3. CancelCurrent clears queue & stops active transfer cleanly
+    std::wstring big1 = srcRoot + L"\\big1.bin";
+    std::wstring big2 = srcRoot + L"\\big2.bin";
+    std::vector<uint8_t> bigData(24 * 1024 * 1024, 0x3C); // ~24 MB takes ~150+ ms due to per-byte CRC32
+    std::vector<uint8_t> smallAfter = { 1, 2, 3, 4 };
+    writeBytes(big1, bigData);
+    writeBytes(big2, smallAfter);
+
+    CHECK(tx.QueuePaths({ big1, big2 }) == 2, "Failed queueing cancel test files");
+    bool canceledDuringRun = false;
+    for (int i = 0; i < 200; ++i) {
+        auto st = tx.GetStats();
+        if (st.transferring) {
+            tx.CancelCurrent();
+            canceledDuringRun = true;
+            break;
+        }
+        if (st.filesSent >= 4) break;
+        Sleep(1);
+    }
+    for (int i = 0; i < 60; ++i) {
+        if (!tx.GetStats().transferring && !rx.GetStats().transferring) break;
+        Sleep(25);
+    }
+    CHECK(tx.GetStats().queuedFiles == 0, "CancelCurrent left queued files behind");
+    if (canceledDuringRun) {
+        CHECK(rx.GetStats().filesReceived < 4, "Second queued file transferred despite CancelCurrent");
+    }
+
+    tx.Stop();
+    rx.Stop();
+
+    DeleteFileW(f1.c_str());
+    DeleteFileW(f2.c_str());
+    DeleteFileW(big1.c_str());
+    DeleteFileW(big2.c_str());
+    DeleteFileW(rx1.c_str());
+    DeleteFileW(rx2.c_str());
+    DeleteFileW((dstDir + L"\\big1.bin").c_str());
+    DeleteFileW((dstDir + L"\\big2.bin").c_str());
+    RemoveDirectoryW((dstDir + L"\\OrdnerA\\Unter").c_str());
+    RemoveDirectoryW((dstDir + L"\\OrdnerA").c_str());
+    RemoveDirectoryW(dstDir.c_str());
+    RemoveDirectoryW(folderDeep.c_str());
+    RemoveDirectoryW(folderA.c_str());
+    RemoveDirectoryW(srcRoot.c_str());
+    RemoveDirectoryW(baseDir.c_str());
+
+    std::cout << "[PASS] TestFileTransferRecursiveAndCancel\n";
+}
+
+void TestPowerPolicyIniAndGuid() {
+    const GUID sampleGuid = { 0x381B4222, 0xF694, 0x41F0, { 0x96, 0x85, 0xFF, 0x5B, 0xB2, 0x60, 0xDF, 0x2E } };
+    std::wstring s = s2p::LidCloseGuard::FormatGuidString(sampleGuid);
+    GUID parsed{};
+    CHECK(s2p::LidCloseGuard::ParseGuidString(s, parsed) &&
+          std::memcmp(&sampleGuid, &parsed, sizeof(GUID)) == 0,
+          "GUID Format/Parse roundtrip with braces failed");
+
+    std::wstring noBraces = s.substr(1, s.size() - 2);
+    GUID parsed2{};
+    CHECK(s2p::LidCloseGuard::ParseGuidString(noBraces, parsed2) &&
+          std::memcmp(&sampleGuid, &parsed2, sizeof(GUID)) == 0,
+          "GUID Parse without braces failed");
+
+    GUID bad{};
+    CHECK(!s2p::LidCloseGuard::ParseGuidString(L"not-a-guid", bad), "Invalid GUID unexpectedly parsed");
+
+    wchar_t tempDir[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring iniPath = std::wstring(tempDir) + L"s2p_power_test_" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    DeleteFileW(iniPath.c_str());
+
+    s2p::PowerRestoreState out{};
+    CHECK(!s2p::LidCloseGuard::LoadPowerRestoreIni(iniPath, out), "Empty INI should report no pending restore");
+    CHECK(!s2p::LidCloseGuard::RecoverStaleStateOnStartup(iniPath), "RecoverStaleStateOnStartup should no-op on clean INI");
+
+    s2p::PowerRestoreState st{};
+    st.pending = true;
+    st.schemeGuid = sampleGuid;
+    st.savedAc = 2;
+    st.savedDc = 1;
+    CHECK(s2p::LidCloseGuard::SavePowerRestoreIni(iniPath, st), "SavePowerRestoreIni failed");
+    CHECK(s2p::LidCloseGuard::LoadPowerRestoreIni(iniPath, out) &&
+          out.pending &&
+          std::memcmp(&out.schemeGuid, &sampleGuid, sizeof(GUID)) == 0 &&
+          out.savedAc == 2 &&
+          out.savedDc == 1,
+          "LoadPowerRestoreIni roundtrip mismatch");
+
+    s2p::LidCloseGuard::ClearPowerRestoreIni(iniPath);
+    CHECK(!s2p::LidCloseGuard::LoadPowerRestoreIni(iniPath, out), "ClearPowerRestoreIni did not clear state");
+
+    DeleteFileW(iniPath.c_str());
+    std::cout << "[PASS] TestPowerPolicyIniAndGuid\n";
+}
+
+void TestH264BitrateAndFpsInit() {
+    s2p::H264Encoder enc;
+    CHECK(enc.Init(nullptr, nullptr, 640, 360, 90, 60), "H264Encoder init at 90 FPS / 60 Mbps failed");
+    CHECK(enc.BitrateMbps() == 60, "Initial BitrateMbps mismatch");
+    CHECK(enc.SetBitrate(100) && enc.BitrateMbps() == 100, "H264Encoder::SetBitrate(100) failed");
+    CHECK(enc.SetBitrate(40) && enc.BitrateMbps() == 40, "H264Encoder::SetBitrate(40) failed");
+
+    std::vector<uint8_t> bgra(640 * 360 * 4, 160);
+    std::vector<uint8_t> annexB;
+    bool isKey = false;
+    bool produced = false;
+    for (int f = 0; f < 6; ++f) {
+        if (enc.EncodeBgra(bgra.data(), 640 * 4, static_cast<uint64_t>(f) * 11111ULL, annexB, isKey) &&
+            !annexB.empty()) {
+            produced = true;
+            break;
+        }
+    }
+    CHECK(produced, "H264Encoder at 90 FPS produced no Annex-B after SetBitrate");
+    enc.Shutdown();
+
+    s2p::H264Decoder dec;
+    CHECK(dec.Init(nullptr, nullptr, 640, 360, false, 90), "H264Decoder::Init(..., fps=90) failed");
+    dec.Shutdown();
+
+    std::cout << "[PASS] TestH264BitrateAndFpsInit\n";
+}
+
+void TestVddDeterministicGuid() {
+    GUID g0a = s2p::vdd::MakeDeterministicMonitorGuid(0);
+    GUID g0b = s2p::vdd::MakeDeterministicMonitorGuid(0);
+    GUID g1 = s2p::vdd::MakeDeterministicMonitorGuid(1);
+    GUID g2 = s2p::vdd::MakeDeterministicMonitorGuid(2);
+
+    CHECK(std::memcmp(&g0a, &g0b, sizeof(GUID)) == 0, "Deterministic monitor GUID 0 is not stable");
+    CHECK(std::memcmp(&g0a, &g1, sizeof(GUID)) != 0, "Monitor GUID 0 and 1 collided");
+    CHECK(std::memcmp(&g1, &g2, sizeof(GUID)) != 0, "Monitor GUID 1 and 2 collided");
+
+    std::cout << "[PASS] TestVddDeterministicGuid\n";
+}
+
 } // namespace
 
 int main() {
@@ -1001,6 +1448,12 @@ int main() {
     TestUpdaterParsing();
     TestAppIcons();
     TestBitratePresets();
+    TestVersionProtocolAndPresets();
+    TestPairingSecurity();
+    TestFileTransferRecursiveAndCancel();
+    TestPowerPolicyIniAndGuid();
+    TestH264BitrateAndFpsInit();
+    TestVddDeterministicGuid();
 
     CoUninitialize();
 
