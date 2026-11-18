@@ -321,7 +321,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         m_status.stateText = L"Versionskonflikt mit PC";
 
         std::wstring msg = L"Versionskonflikt: Surface nutzt Protokoll v" + std::to_wstring(kProtocolVersion) +
-                           L" (App v" + FormatAppVersion(CurrentAppVersion()) + L")";
+                           L" (App v" + FormatVersionTuple(CurrentAppVersionTuple()) + L")";
         if (peerProtoVer > 0) {
             msg += L", PC meldet Protokoll v" + std::to_wstring(peerProtoVer);
             if (peerAppVer.major > 0 || peerAppVer.minor > 0) {

@@ -382,7 +382,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
         if (rawVerMismatch) {
             std::wstring msg = L"Surface nutzt Protokoll v" + std::to_wstring(remoteProtoVer) +
                                L", dieser PC erwartet Protokoll v" + std::to_wstring(kProtocolVersion) +
-                               L" (App v" + FormatAppVersion(CurrentAppVersion()) +
+                               L" (App v" + FormatVersionTuple(CurrentAppVersionTuple()) +
                                L"). Bitte beide Apps per GitHub-Updater aktualisieren.";
             VersionMismatchPayload vm{};
             vm.protocolVersion = kProtocolVersion;
