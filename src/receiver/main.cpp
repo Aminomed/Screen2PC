@@ -1122,6 +1122,7 @@ void UpdateUi() {
                  << s.codecName << L"  |  "
                  << std::fixed << std::setprecision(1) << s.fps << L" FPS  |  "
                  << std::setprecision(1) << s.mbps << L" Mbit/s  |  "
+                 << L"Dec: " << std::setprecision(1) << s.avgDecodeMs << L" ms  |  "
                  << L"Frames: " << s.framesReceived;
             if (s.hiddenByUser) body << L" [Versteckt]";
             body << L"\r\n";
@@ -1137,7 +1138,7 @@ void OpenFirewallPortsElevated() {
         L"/c netsh advfirewall firewall delete rule name=\"Screen2PC\" >nul 2>&1 & "
         L"netsh advfirewall firewall delete rule name=\"Screen2PC Discovery\" >nul 2>&1 & "
         L"netsh advfirewall firewall add rule name=\"Screen2PC\" dir=in action=allow protocol=TCP localport=48211-48215 & "
-        L"netsh advfirewall firewall add rule name=\"Screen2PC Discovery\" dir=in action=allow protocol=UDP localport=48210";
+        L"netsh advfirewall firewall add rule name=\"Screen2PC Discovery\" dir=in action=allow protocol=UDP localport=48210,48215";
     ShellExecuteW(g_hwnd, L"runas", L"cmd.exe", cmdArgs, nullptr, SW_HIDE);
 }
 

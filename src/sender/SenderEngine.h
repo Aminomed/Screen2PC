@@ -59,6 +59,9 @@ struct StreamStats {
     uint32_t targetFps = 0;
     std::wstring codecName;
     bool hardwareAccelerated = false;
+    double avgEncodeMs = 0.0;
+    double avgSendMs = 0.0;
+    bool losslessSettleActive = false;
 };
 
 struct SenderStatus {
@@ -145,6 +148,8 @@ private:
                               std::vector<DisplayOutputInfo>& outSelectedOutputs,
                               std::wstring& outError);
     void ControlLoop();
+    void RealtimeUdpLoop();
+    bool DispatchKvmMouse(const KvmMouseEvent& ev);
     void RunStreamWorker(StreamWorker* w);
 
     std::mutex m_lifecycleMutex;
@@ -175,6 +180,11 @@ private:
     TcpSocket m_controlSock;
     std::mutex m_controlSendMutex;
     std::thread m_controlThread;
+    UdpSocket m_realtimeUdpSock;
+    std::thread m_realtimeUdpThread;
+    std::atomic<uint32_t> m_cursorUdpSeq{0};
+    std::atomic<uint32_t> m_lastMouseMoveSeq{0};
+    std::atomic<uint32_t> m_lastMouseBtnSeq{0};
     ClipboardSync m_clipboard;
     FileTransfer m_fileTransfer;
 

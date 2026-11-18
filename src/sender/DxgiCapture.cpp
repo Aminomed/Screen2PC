@@ -160,9 +160,11 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
                                bool& outHasNewImage,
                                std::vector<DeltaRect>& outDirtyRects,
                                CapturedCursor& outCursor,
-                               bool collectDirtyRects) {
+                               bool collectDirtyRects,
+                               std::vector<DeltaMoveRect>* outMoveRects) {
     outHasNewImage = false;
     outDirtyRects.clear();
+    if (outMoveRects) outMoveRects->clear();
     outCursor = CapturedCursor{};
 
     if (!m_initialized) return false;
@@ -253,15 +255,36 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
                     auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(m_metaBuf.data());
                     for (UINT i = 0; i < moveCount; ++i) {
                         const RECT& d = moves[i].DestinationRect;
+                        const POINT& sp = moves[i].SourcePoint;
                         LONG l = std::max<LONG>(0, d.left);
                         LONG t = std::max<LONG>(0, d.top);
-                        if (d.right > l && d.bottom > t) {
-                            outDirtyRects.push_back({
-                                static_cast<uint32_t>(l),
-                                static_cast<uint32_t>(t),
-                                static_cast<uint32_t>(d.right - l),
-                                static_cast<uint32_t>(d.bottom - t)
-                            });
+                        LONG r = std::min<LONG>(static_cast<LONG>(m_width), d.right);
+                        LONG b = std::min<LONG>(static_cast<LONG>(m_height), d.bottom);
+                        if (r > l && b > t) {
+                            uint32_t mw = static_cast<uint32_t>(r - l);
+                            uint32_t mh = static_cast<uint32_t>(b - t);
+                            LONG sx = sp.x + (l - d.left);
+                            LONG sy = sp.y + (t - d.top);
+                            if (outMoveRects &&
+                                sx >= 0 && sy >= 0 &&
+                                static_cast<uint32_t>(sx) + mw <= m_width &&
+                                static_cast<uint32_t>(sy) + mh <= m_height) {
+                                outMoveRects->push_back({
+                                    static_cast<uint32_t>(sx),
+                                    static_cast<uint32_t>(sy),
+                                    static_cast<uint32_t>(l),
+                                    static_cast<uint32_t>(t),
+                                    mw,
+                                    mh
+                                });
+                            } else {
+                                outDirtyRects.push_back({
+                                    static_cast<uint32_t>(l),
+                                    static_cast<uint32_t>(t),
+                                    mw,
+                                    mh
+                                });
+                            }
                         }
                     }
                 }
@@ -293,23 +316,60 @@ bool DxgiCapture::AcquireFrame(uint32_t timeoutMs,
     return true;
 }
 
-bool DxgiCapture::CopyFrameToCpu(std::vector<uint8_t>& outBgra, uint32_t& outStrideBytes) {
+bool DxgiCapture::CopyFrameToCpu(std::vector<uint8_t>& outBgra,
+                                 uint32_t& outStrideBytes,
+                                 const DeltaRect* dirtyBounds) {
     if (!m_initialized || !m_frameTex || !m_stagingTex) return false;
-    m_context->CopyResource(m_stagingTex.Get(), m_frameTex.Get());
+    outStrideBytes = m_width * 4;
+    const size_t totalBytes = static_cast<size_t>(outStrideBytes) * m_height;
+    const bool bufferAlreadySized = (outBgra.size() == totalBytes);
+
+    uint32_t yStart = 0;
+    uint32_t yEnd = m_height;
+    uint32_t xStart = 0;
+    uint32_t xEnd = m_width;
+
+    if (dirtyBounds && bufferAlreadySized && dirtyBounds->w > 0 && dirtyBounds->h > 0) {
+        xStart = std::min(dirtyBounds->x, m_width);
+        yStart = std::min(dirtyBounds->y, m_height);
+        xEnd = std::min(m_width, xStart + dirtyBounds->w);
+        yEnd = std::min(m_height, yStart + dirtyBounds->h);
+    }
+
+    if (xStart < xEnd && yStart < yEnd && (xStart > 0 || yStart > 0 || xEnd < m_width || yEnd < m_height)) {
+        D3D11_BOX box{};
+        box.left = xStart;
+        box.top = yStart;
+        box.front = 0;
+        box.right = xEnd;
+        box.bottom = yEnd;
+        box.back = 1;
+        m_context->CopySubresourceRegion(m_stagingTex.Get(), 0, xStart, yStart, 0, m_frameTex.Get(), 0, &box);
+    } else {
+        xStart = 0;
+        yStart = 0;
+        xEnd = m_width;
+        yEnd = m_height;
+        m_context->CopyResource(m_stagingTex.Get(), m_frameTex.Get());
+    }
+
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(m_context->Map(m_stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         return false;
     }
-    outStrideBytes = m_width * 4;
     if (mapped.RowPitch < outStrideBytes) {
         m_context->Unmap(m_stagingTex.Get(), 0);
         return false;
     }
-    outBgra.resize(static_cast<size_t>(outStrideBytes) * m_height);
-    for (uint32_t y = 0; y < m_height; ++y) {
-        std::memcpy(outBgra.data() + static_cast<size_t>(y) * outStrideBytes,
-                    static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
-                    outStrideBytes);
+    if (!bufferAlreadySized) {
+        outBgra.resize(totalBytes);
+    }
+    const size_t copyBytes = static_cast<size_t>(xEnd - xStart) * 4;
+    const size_t xOffBytes = static_cast<size_t>(xStart) * 4;
+    for (uint32_t y = yStart; y < yEnd; ++y) {
+        std::memcpy(outBgra.data() + static_cast<size_t>(y) * outStrideBytes + xOffBytes,
+                    static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch + xOffBytes,
+                    copyBytes);
     }
     m_context->Unmap(m_stagingTex.Get(), 0);
     return true;

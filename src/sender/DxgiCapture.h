@@ -57,7 +57,8 @@ public:
                       bool& outHasNewImage,
                       std::vector<DeltaRect>& outDirtyRects,
                       CapturedCursor& outCursor,
-                      bool collectDirtyRects = true);
+                      bool collectDirtyRects = true,
+                      std::vector<DeltaMoveRect>* outMoveRects = nullptr);
 
     ID3D11Device* Device() const { return m_device.Get(); }
     ID3D11DeviceContext* Context() const { return m_context.Get(); }
@@ -66,7 +67,9 @@ public:
     uint32_t Height() const { return m_height; }
     bool IsInitialized() const { return m_initialized; }
 
-    bool CopyFrameToCpu(std::vector<uint8_t>& outBgra, uint32_t& outStrideBytes);
+    bool CopyFrameToCpu(std::vector<uint8_t>& outBgra,
+                        uint32_t& outStrideBytes,
+                        const DeltaRect* dirtyBounds = nullptr);
 
 private:
     bool RecreateDuplication();

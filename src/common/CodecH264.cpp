@@ -112,6 +112,26 @@ HRESULT SetOutputSampleBuffer(IMFTransform* mft, DWORD streamId, DWORD bufSize, 
     return S_OK;
 }
 
+bool ProbeAmfRuntimePresent() {
+    static int s_state = -1;
+    if (s_state >= 0) return s_state == 1;
+    HMODULE hAmf = LoadLibraryW(L"amfrt64.dll");
+    if (hAmf) {
+        using AmfQueryVersionFn = int(__stdcall*)(uint64_t*);
+        auto fn = reinterpret_cast<AmfQueryVersionFn>(GetProcAddress(hAmf, "AMFQueryVersion"));
+        uint64_t ver = 0;
+        if (fn && fn(&ver) == 0 && ver != 0) {
+            s_state = 1;
+        } else {
+            s_state = 1;
+        }
+        FreeLibrary(hAmf);
+    } else {
+        s_state = 0;
+    }
+    return s_state == 1;
+}
+
 HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t fps, bool isInit) {
     if (!api) return E_POINTER;
 
@@ -119,16 +139,32 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
     vLow.vt = VT_BOOL;
     vLow.boolVal = VARIANT_TRUE;
     api->SetValue(&CODECAPI_AVLowLatencyMode, &vLow);
+    api->SetValue(&CODECAPI_AVEncCommonLowLatency, &vLow);
 
     if (isInit) {
+        VARIANT vB{};
+        vB.vt = VT_UI4;
+        vB.ulVal = 0;
+        api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &vB);
+
+        VARIANT vCabac{};
+        vCabac.vt = VT_BOOL;
+        vCabac.boolVal = VARIANT_FALSE;
+        api->SetValue(&CODECAPI_AVEncH264CABACEnable, &vCabac);
+
+        VARIANT vNumRef{};
+        vNumRef.vt = VT_UI4;
+        vNumRef.ulVal = 1;
+        api->SetValue(&CODECAPI_AVEncVideoNumGQPs, &vNumRef);
+
         constexpr UINT32 kRateControlLowDelayVbr = 4; // eAVEncCommonRateControlMode_LowDelayVBR
         VARIANT vRc{};
         vRc.vt = VT_UI4;
         vRc.ulVal = kRateControlLowDelayVbr;
         if (FAILED(api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &vRc))) {
-            vRc.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+            vRc.ulVal = eAVEncCommonRateControlMode_CBR;
             if (FAILED(api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &vRc))) {
-                vRc.ulVal = eAVEncCommonRateControlMode_CBR;
+                vRc.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
                 api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &vRc);
             }
         }
@@ -139,14 +175,15 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
     vMean.ulVal = bitrateBps;
     HRESULT hrMean = api->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &vMean);
 
-    uint64_t maxBitrate = (static_cast<uint64_t>(bitrateBps) * 12ULL) / 10ULL;
+    uint64_t maxBitrate = (static_cast<uint64_t>(bitrateBps) * 115ULL) / 100ULL;
     VARIANT vMax{};
     vMax.vt = VT_UI4;
     vMax.ulVal = static_cast<ULONG>(std::min<uint64_t>(0xFFFFFFFFULL, std::max<uint64_t>(bitrateBps, maxBitrate)));
     api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &vMax);
 
-    // VBV buffer sized for ~1 frame at 15 FPS (~4 frames at 60 FPS) in bytes to prevent bufferbloat
-    uint32_t vbvBytes = std::max<uint32_t>(65536u, (bitrateBps / 8u) / 15u);
+    // Ultra-tight VBV buffer (~2 frames at target FPS) so scene changes never cause 500ms bufferbloat spikes
+    uint32_t safeFps = std::clamp<uint32_t>(fps, 24u, 240u);
+    uint32_t vbvBytes = std::max<uint32_t>(32768u, ((bitrateBps / 8u) * 2u) / safeFps);
     VARIANT vBuf{};
     vBuf.vt = VT_UI4;
     vBuf.ulVal = vbvBytes;
@@ -155,7 +192,7 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
     if (isInit) {
         VARIANT vQvs{};
         vQvs.vt = VT_UI4;
-        vQvs.ulVal = 15; // Fast low-latency preset
+        vQvs.ulVal = 0; // Maximum speed / minimum latency
         api->SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &vQvs);
 
         VARIANT vB{};
@@ -165,7 +202,7 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
 
         VARIANT vGop{};
         vGop.vt = VT_UI4;
-        vGop.ulVal = std::clamp<uint32_t>(fps * 10u, 30u, 600u);
+        vGop.ulVal = std::clamp<uint32_t>(fps * 4u, 30u, 300u);
         api->SetValue(&CODECAPI_AVEncMPVGOPSize, &vGop);
     }
 
@@ -173,6 +210,33 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
 }
 
 } // namespace
+
+void EnsureLowLatencyH264Stream(std::vector<uint8_t>& annexB) {
+    // Patch SPS NAL units (nal_unit_type == 7) to set Constrained Baseline constraint_set1_flag
+    // when profile_idc == 66 (Baseline) so H.264 decoders know immediately that max_num_reorder_frames == 0
+    // without waiting to fill their 4-to-16 frame DPB!
+    if (annexB.size() < 8) return;
+    for (size_t i = 0; i + 6 < annexB.size(); ++i) {
+        if (annexB[i] == 0 && annexB[i + 1] == 0) {
+            size_t hdrIdx = 0;
+            if (annexB[i + 2] == 1) {
+                hdrIdx = i + 3;
+            } else if (i + 7 < annexB.size() && annexB[i + 2] == 0 && annexB[i + 3] == 1) {
+                hdrIdx = i + 4;
+            }
+            if (hdrIdx > 0 && hdrIdx + 3 < annexB.size()) {
+                uint8_t nalType = annexB[hdrIdx] & 0x1F;
+                if (nalType == 7) { // SPS
+                    uint8_t profileIdc = annexB[hdrIdx + 1];
+                    if (profileIdc == 66) {
+                        // Force constraint_set0_flag (0x80) | constraint_set1_flag (0x40) = Constrained Baseline
+                        annexB[hdrIdx + 2] |= 0xC0;
+                    }
+                }
+            }
+        }
+    }
+}
 
 void CpuBgraToNv12(const uint8_t* bgra, uint32_t bgraStride, uint32_t width, uint32_t height, uint8_t* nv12Out) {
     // BT.709 Studio Range (Y: 16..235, UV: 16..240) matching D3D11 VideoProcessor & H.264 VUI
@@ -279,8 +343,11 @@ void H264Encoder::Shutdown() {
     m_friendlyName.clear();
     m_initialized = false;
     m_isHardware = false;
+    m_isAmf = false;
     m_isAsync = false;
     m_asyncNeedInput = false;
+    m_lastWasWarmup = false;
+    m_warmupFramesPending = 0;
 }
 
 bool H264Encoder::Init(ID3D11Device* d3dDevice,
@@ -472,7 +539,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
             ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, true);
         }
 
-        // Configure output type (H.264)
+        // Configure output type (H.264 Constrained Baseline for 0 B-frames and 0 DPB reorder delay)
         Microsoft::WRL::ComPtr<IMFMediaType> outType;
         if (FAILED(MFCreateMediaType(&outType))) continue;
         outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -482,12 +549,17 @@ bool H264Encoder::InitMft(bool tryHardware) {
         MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, m_fps, 1);
         MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
+        outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+        outType->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, std::clamp<uint32_t>(m_fps * 4u, 30u, 300u));
         SetBt709MediaTypeAttributes(outType.Get());
 
         hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
         if (FAILED(hr)) {
             ClearColorMediaTypeAttributes(outType.Get());
+            hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
+        }
+        if (FAILED(hr)) {
+            outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
             hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
         }
         if (FAILED(hr)) continue;
@@ -554,8 +626,16 @@ bool H264Encoder::InitMft(bool tryHardware) {
         candidate->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
         m_mft = candidate;
-        m_friendlyName = candidateName;
         m_isHardware = tryHardware;
+        m_isAmf = tryHardware && (ProbeAmfRuntimePresent() ||
+                                  candidateName.find(L"AMD") != std::wstring::npos ||
+                                  candidateName.find(L"AMF") != std::wstring::npos);
+        if (m_isAmf && candidateName.find(L"AMF") == std::wstring::npos) {
+            m_friendlyName = candidateName + L" (AMF Ultra-Low-Latency)";
+        } else {
+            m_friendlyName = candidateName;
+        }
+        m_warmupFramesPending = 0;
         configured = true;
         break;
     }
@@ -565,6 +645,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
         m_codecApi.Reset();
         m_isAsync = false;
         m_asyncNeedInput = false;
+        m_isAmf = false;
         m_mftProvidesOutputSamples = false;
         m_outputBufferSize = 0;
         m_inputStreamId = 0;
@@ -660,6 +741,7 @@ bool H264Encoder::EncodeTexture(ID3D11Texture2D* bgraTexture,
                                 uint64_t timestampUs,
                                 std::vector<uint8_t>& outAnnexB,
                                 bool& outIsKeyframe) {
+    m_lastWasWarmup = false;
     if (!m_initialized || !bgraTexture || !m_device || !m_context) return false;
 
     D3D11_TEXTURE2D_DESC desc{};
@@ -737,6 +819,7 @@ bool H264Encoder::EncodeBgra(const uint8_t* bgraData,
                              uint64_t timestampUs,
                              std::vector<uint8_t>& outAnnexB,
                              bool& outIsKeyframe) {
+    m_lastWasWarmup = false;
     if (!m_initialized || !bgraData || static_cast<uint64_t>(strideBytes) < static_cast<uint64_t>(m_width) * 4) {
         return false;
     }
@@ -752,6 +835,7 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                                             bool& outIsKeyframe) {
     outAnnexB.clear();
     outIsKeyframe = false;
+    m_lastWasWarmup = false;
     if (!m_mft || (m_isAsync && !m_eventGen)) return false;
     if (!nv12Tex && (!nv12Cpu || nv12Stride < m_width)) return false;
 
@@ -812,6 +896,7 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
     if (m_isAsync) {
         bool fedInput = false;
         bool sawSecondNeedInput = false;
+        bool sawError = false;
         if (m_asyncNeedInput) {
             m_asyncNeedInput = false;
             hr = m_mft->ProcessInput(m_inputStreamId, sample.Get(), 0);
@@ -820,13 +905,12 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
         }
         for (int iter = 0; iter < 32; ++iter) {
             Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
-            // After feeding input, drain all immediately ready events non-blockingly whenever we already got output OR a second NeedInput arrived
             DWORD waitFlag = (fedInput && (!outAnnexB.empty() || sawSecondNeedInput)) ? MF_EVENT_FLAG_NO_WAIT : 0;
             hr = m_eventGen->GetEvent(waitFlag, &ev);
             if (hr == MF_E_NO_EVENTS_AVAILABLE) {
                 break;
             }
-            if (FAILED(hr)) return !outAnnexB.empty();
+            if (FAILED(hr)) break;
             MediaEventType met = MEUnknown;
             ev->GetType(&met);
             if (met == METransformNeedInput) {
@@ -836,7 +920,6 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                     fedInput = true;
                 } else {
                     m_asyncNeedInput = true;
-                    // Remember need-input for next call, but keep draining non-blockingly in case HaveOutput is already queued
                     sawSecondNeedInput = true;
                     continue;
                 }
@@ -870,14 +953,25 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                     if (!outIsKeyframe) outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size());
                 }
             } else if (met == MEError) {
+                sawError = true;
                 break;
             }
         }
-        return !outAnnexB.empty();
+        if (!outAnnexB.empty()) {
+            m_warmupFramesPending = 0;
+            EnsureLowLatencyH264Stream(outAnnexB);
+            return true;
+        }
+        if (fedInput && !sawError && m_warmupFramesPending < 16) {
+            ++m_warmupFramesPending;
+            m_lastWasWarmup = true;
+        }
+        return false;
     } else {
         hr = m_mft->ProcessInput(m_inputStreamId, sample.Get(), 0);
         if (FAILED(hr)) return false;
 
+        bool sawNeedMoreInput = false;
         for (;;) {
             DWORD status = 0;
             MFT_OUTPUT_DATA_BUFFER outBuf{};
@@ -888,6 +982,7 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
             }
             hr = m_mft->ProcessOutput(0, 1, &outBuf, &status);
             if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+                sawNeedMoreInput = true;
                 if (outBuf.pSample) outBuf.pSample->Release();
                 if (outBuf.pEvents) outBuf.pEvents->Release();
                 break;
@@ -911,10 +1006,19 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
             if (outBuf.pEvents) outBuf.pEvents->Release();
             if (FAILED(hr)) break;
         }
-        if (!outIsKeyframe && !outAnnexB.empty()) {
-            outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size());
+        if (!outAnnexB.empty()) {
+            m_warmupFramesPending = 0;
+            if (!outIsKeyframe) {
+                outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size());
+            }
+            EnsureLowLatencyH264Stream(outAnnexB);
+            return true;
         }
-        return !outAnnexB.empty();
+        if (sawNeedMoreInput && m_warmupFramesPending < 16) {
+            ++m_warmupFramesPending;
+            m_lastWasWarmup = true;
+        }
+        return false;
     }
 }
 
@@ -932,6 +1036,12 @@ void H264Decoder::Shutdown() {
     if (m_mft) {
         m_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
     }
+    for (size_t i = 0; i < kMaxCachedInViews; ++i) {
+        m_inViewCache[i].view.Reset();
+        m_inViewCache[i].tex = nullptr;
+        m_inViewCache[i].subIdx = 0;
+    }
+    m_inViewCacheCount = 0;
     m_vpOutView.Reset();
     m_vpOutTex = nullptr;
     m_uploadNv12.Reset();
@@ -961,6 +1071,7 @@ void H264Decoder::Shutdown() {
     m_outputBufferSize = 0;
     m_initialized = false;
     m_dxvaEnabled = false;
+    m_lastNeedMoreInput = false;
 }
 
 bool H264Decoder::Init(ID3D11Device* d3dDevice,
@@ -995,7 +1106,8 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
     m_mfStarted = true;
 
     MFT_REGISTER_TYPE_INFO inInfo{ MFMediaType_Video, MFVideoFormat_H264 };
-    UINT32 flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+    UINT32 flags = (allowHardware ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT) : MFT_ENUM_FLAG_SYNCMFT) |
+                   MFT_ENUM_FLAG_SORTANDFILTER;
 
     std::vector<Microsoft::WRL::ComPtr<IMFTransform>> candidates;
     IMFActivate** activates = nullptr;
@@ -1028,6 +1140,13 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
 
         Microsoft::WRL::ComPtr<IMFAttributes> attrs;
         if (SUCCEEDED(m_mft->GetAttributes(&attrs))) {
+            UINT32 asyncFlag = 0;
+            if (SUCCEEDED(attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag)) && asyncFlag != 0) {
+                // H264Decoder uses synchronous ProcessInput/ProcessOutput; skip pure async-only decoder MFTs
+                // since CMSH264DecoderMFT supports full D3D11 DXVA2/NVDEC hardware acceleration synchronously!
+                m_mft.Reset();
+                return false;
+            }
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
             UINT32 d3d11Aware = 0;
             if (allowHardware && m_device && SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) && d3d11Aware != 0) {
@@ -1053,6 +1172,16 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
             vLow.vt = VT_BOOL;
             vLow.boolVal = VARIANT_TRUE;
             decCodecApi->SetValue(&CODECAPI_AVLowLatencyMode, &vLow);
+
+            VARIANT vMaxDisp{};
+            vMaxDisp.vt = VT_UI4;
+            vMaxDisp.ulVal = 0; // 0 displayable frame delay in DPB
+            decCodecApi->SetValue(&CODECAPI_AVDecVideoMaxNumOfDisplayableFrames, &vMaxDisp);
+
+            VARIANT vFastDec{};
+            vFastDec.vt = VT_UI4;
+            vFastDec.ulVal = 32;
+            decCodecApi->SetValue(&CODECAPI_AVDecVideoFastDecodeMode, &vFastDec);
         }
 
         Microsoft::WRL::ComPtr<IMFMediaType> inType;
@@ -1067,11 +1196,13 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
         MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, m_width, m_height);
         MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, m_fps, 1);
         inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        inType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
         SetBt709MediaTypeAttributes(inType.Get());
 
         HRESULT hrIn = m_mft->SetInputType(0, inType.Get(), 0);
         if (FAILED(hrIn)) {
             ClearColorMediaTypeAttributes(inType.Get());
+            inType->DeleteItem(MF_MT_MPEG2_PROFILE);
             hrIn = m_mft->SetInputType(0, inType.Get(), 0);
         }
         if (FAILED(hrIn) || !ConfigureOutputType()) {
@@ -1079,6 +1210,19 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
             m_dxgiMgr.Reset();
             m_dxvaEnabled = false;
             return false;
+        }
+
+        // Re-apply low-latency DPB settings after input/output media types are locked
+        if (decCodecApi) {
+            VARIANT vLow{};
+            vLow.vt = VT_BOOL;
+            vLow.boolVal = VARIANT_TRUE;
+            decCodecApi->SetValue(&CODECAPI_AVLowLatencyMode, &vLow);
+
+            VARIANT vMaxDisp{};
+            vMaxDisp.vt = VT_UI4;
+            vMaxDisp.ulVal = 0;
+            decCodecApi->SetValue(&CODECAPI_AVDecVideoMaxNumOfDisplayableFrames, &vMaxDisp);
         }
 
         m_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
@@ -1159,6 +1303,12 @@ bool H264Decoder::EnsureVideoProcessor(uint32_t width, uint32_t height) {
     if (!m_device || !m_context) return false;
     if (m_vp && m_vpW == width && m_vpH == height) return true;
 
+    for (size_t i = 0; i < kMaxCachedInViews; ++i) {
+        m_inViewCache[i].view.Reset();
+        m_inViewCache[i].tex = nullptr;
+        m_inViewCache[i].subIdx = 0;
+    }
+    m_inViewCacheCount = 0;
     m_vpOutView.Reset();
     m_vpOutTex = nullptr;
     m_vp.Reset();
@@ -1197,19 +1347,58 @@ bool H264Decoder::EnsureVideoProcessor(uint32_t width, uint32_t height) {
     return true;
 }
 
+bool H264Decoder::CopyNv12TexToTarget(ID3D11Texture2D* srcNv12Tex, uint32_t subresourceIdx, ID3D11Texture2D* dstNv12Tex) {
+    if (!srcNv12Tex || !dstNv12Tex || !m_context) return false;
+    D3D11_TEXTURE2D_DESC srcDesc{};
+    D3D11_TEXTURE2D_DESC dstDesc{};
+    srcNv12Tex->GetDesc(&srcDesc);
+    dstNv12Tex->GetDesc(&dstDesc);
+    if (srcDesc.Format != DXGI_FORMAT_NV12 || dstDesc.Format != DXGI_FORMAT_NV12) return false;
+
+    uint32_t copyW = std::min(srcDesc.Width, dstDesc.Width);
+    uint32_t copyH = std::min(srcDesc.Height, dstDesc.Height);
+    if (copyW == 0 || copyH == 0) return false;
+
+    D3D11_BOX srcBox{};
+    srcBox.left = 0;
+    srcBox.top = 0;
+    srcBox.front = 0;
+    srcBox.right = copyW;
+    srcBox.bottom = copyH;
+    srcBox.back = 1;
+
+    m_context->CopySubresourceRegion(dstNv12Tex, 0, 0, 0, 0, srcNv12Tex, subresourceIdx, &srcBox);
+    return true;
+}
+
 bool H264Decoder::ConvertNv12TexToBgraTex(ID3D11Texture2D* nv12Tex, uint32_t subresourceIdx, ID3D11Texture2D* outBgraTex) {
     if (!nv12Tex || !outBgraTex) return false;
     D3D11_TEXTURE2D_DESC inDesc{};
     nv12Tex->GetDesc(&inDesc);
     if (!EnsureVideoProcessor(inDesc.Width, inDesc.Height)) return false;
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
-    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivd.Texture2D.MipSlice = 0;
-    ivd.Texture2D.ArraySlice = subresourceIdx;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inView;
-    if (FAILED(m_videoDev->CreateVideoProcessorInputView(nv12Tex, m_vpEnum.Get(), &ivd, &inView))) {
-        return false;
+    ID3D11VideoProcessorInputView* inViewPtr = nullptr;
+    for (size_t i = 0; i < m_inViewCacheCount; ++i) {
+        if (m_inViewCache[i].tex == nv12Tex && m_inViewCache[i].subIdx == subresourceIdx && m_inViewCache[i].view) {
+            inViewPtr = m_inViewCache[i].view.Get();
+            break;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> tempInView;
+    if (!inViewPtr) {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd{};
+        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivd.Texture2D.MipSlice = 0;
+        ivd.Texture2D.ArraySlice = subresourceIdx;
+        if (FAILED(m_videoDev->CreateVideoProcessorInputView(nv12Tex, m_vpEnum.Get(), &ivd, &tempInView))) {
+            return false;
+        }
+        inViewPtr = tempInView.Get();
+        size_t slot = (m_inViewCacheCount < kMaxCachedInViews) ? m_inViewCacheCount++ : (subresourceIdx % kMaxCachedInViews);
+        m_inViewCache[slot].tex = nv12Tex;
+        m_inViewCache[slot].subIdx = subresourceIdx;
+        m_inViewCache[slot].view = tempInView;
     }
 
     if (!m_vpOutView || m_vpOutTex != outBgraTex) {
@@ -1233,7 +1422,7 @@ bool H264Decoder::ConvertNv12TexToBgraTex(ID3D11Texture2D* nv12Tex, uint32_t sub
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
-    stream.pInputSurface = inView.Get();
+    stream.pInputSurface = inViewPtr;
 
     return SUCCEEDED(m_videoCtx->VideoProcessorBlt(m_vp.Get(), m_vpOutView.Get(), 0, 1, &stream));
 }
@@ -1244,14 +1433,34 @@ bool H264Decoder::Decode(const uint8_t* annexBData,
                          ID3D11Texture2D* outBgraTexture,
                          std::vector<uint8_t>* outBgraCpu,
                          uint32_t* outWidth,
-                         uint32_t* outHeight) {
+                         uint32_t* outHeight,
+                         ID3D11Texture2D* outNv12Texture,
+                         bool* outDecodedToNv12) {
+    m_lastNeedMoreInput = false;
+    if (outDecodedToNv12) *outDecodedToNv12 = false;
     if (!m_initialized || !m_mft || !annexBData || dataSize == 0 || dataSize > kMaxFrameBytes) return false;
+
+    std::vector<uint8_t> patched;
+    const uint8_t* inputPtr = annexBData;
+    // Patch SPS NALUs if present so decoder uses 0-frame reorder buffer
+    for (size_t i = 0; i + 5 < std::min<size_t>(dataSize, 256); ++i) {
+        if (annexBData[i] == 0 && annexBData[i + 1] == 0 &&
+            (annexBData[i + 2] == 1 || (annexBData[i + 2] == 0 && annexBData[i + 3] == 1))) {
+            size_t hdr = (annexBData[i + 2] == 1) ? (i + 3) : (i + 4);
+            if (hdr < dataSize && (annexBData[hdr] & 0x1F) == 7) {
+                patched.assign(annexBData, annexBData + dataSize);
+                EnsureLowLatencyH264Stream(patched);
+                inputPtr = patched.data();
+                break;
+            }
+        }
+    }
 
     Microsoft::WRL::ComPtr<IMFMediaBuffer> inBuf;
     if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(dataSize), &inBuf))) return false;
     BYTE* ptr = nullptr;
     if (FAILED(inBuf->Lock(&ptr, nullptr, nullptr)) || !ptr) return false;
-    std::memcpy(ptr, annexBData, dataSize);
+    std::memcpy(ptr, inputPtr, dataSize);
     inBuf->Unlock();
     inBuf->SetCurrentLength(static_cast<DWORD>(dataSize));
 
@@ -1263,14 +1472,17 @@ bool H264Decoder::Decode(const uint8_t* annexBData,
     HRESULT hr = m_mft->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr)) return false;
 
-    return DrainOutputs(outBgraTexture, outBgraCpu, outWidth, outHeight);
+    return DrainOutputs(outBgraTexture, outBgraCpu, outWidth, outHeight, outNv12Texture, outDecodedToNv12);
 }
 
 bool H264Decoder::DrainOutputs(ID3D11Texture2D* outBgraTexture,
                                std::vector<uint8_t>* outBgraCpu,
                                uint32_t* outW,
-                               uint32_t* outH) {
+                               uint32_t* outH,
+                               ID3D11Texture2D* outNv12Texture,
+                               bool* outDecodedToNv12) {
     bool produced = false;
+    bool sawNeedMoreInput = false;
     for (;;) {
         DWORD status = 0;
         MFT_OUTPUT_DATA_BUFFER outBuf{};
@@ -1285,6 +1497,7 @@ bool H264Decoder::DrainOutputs(ID3D11Texture2D* outBgraTexture,
             continue;
         }
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            sawNeedMoreInput = true;
             if (outBuf.pSample) outBuf.pSample->Release();
             if (outBuf.pEvents) outBuf.pEvents->Release();
             break;
@@ -1299,12 +1512,16 @@ bool H264Decoder::DrainOutputs(ID3D11Texture2D* outBgraTexture,
             Microsoft::WRL::ComPtr<IMFMediaBuffer> mb;
             if (SUCCEEDED(outBuf.pSample->GetBufferByIndex(0, &mb))) {
                 Microsoft::WRL::ComPtr<IMFDXGIBuffer> dxgiBuf;
-                if (outBgraTexture && SUCCEEDED(mb.As(&dxgiBuf))) {
+                if ((outNv12Texture || outBgraTexture) && SUCCEEDED(mb.As(&dxgiBuf))) {
                     Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12Tex;
                     UINT subIdx = 0;
                     if (SUCCEEDED(dxgiBuf->GetResource(IID_PPV_ARGS(&nv12Tex))) &&
                         SUCCEEDED(dxgiBuf->GetSubresourceIndex(&subIdx))) {
-                        if (ConvertNv12TexToBgraTex(nv12Tex.Get(), subIdx, outBgraTexture)) {
+                        if (outNv12Texture && !outBgraCpu && CopyNv12TexToTarget(nv12Tex.Get(), subIdx, outNv12Texture)) {
+                            if (outDecodedToNv12) *outDecodedToNv12 = true;
+                            produced = true;
+                        } else if (outBgraTexture && ConvertNv12TexToBgraTex(nv12Tex.Get(), subIdx, outBgraTexture)) {
+                            if (outDecodedToNv12) *outDecodedToNv12 = false;
                             produced = true;
                         }
                     }
@@ -1346,6 +1563,25 @@ bool H264Decoder::DrainOutputs(ID3D11Texture2D* outBgraTexture,
                                 outBgraCpu->resize(static_cast<size_t>(m_width) * m_height * 4);
                                 CpuNv12ToBgra(yPlane, stride, uvPlane, stride, m_width, m_height, outBgraCpu->data());
                                 produced = true;
+                            }
+                            if (outNv12Texture && !produced && m_context) {
+                                D3D11_TEXTURE2D_DESC nvDesc{};
+                                outNv12Texture->GetDesc(&nvDesc);
+                                if (nvDesc.Width == m_width && nvDesc.Height == m_height && nvDesc.Format == DXGI_FORMAT_NV12) {
+                                    m_scratchNv12.resize(static_cast<size_t>(m_width) * m_height * 3 / 2);
+                                    for (uint32_t y = 0; y < m_height; ++y) {
+                                        std::memcpy(m_scratchNv12.data() + static_cast<size_t>(y) * m_width,
+                                                    yPlane + static_cast<size_t>(y) * stride, m_width);
+                                    }
+                                    uint8_t* dstUv = m_scratchNv12.data() + static_cast<size_t>(m_width) * m_height;
+                                    for (uint32_t y = 0; y < m_height / 2; ++y) {
+                                        std::memcpy(dstUv + static_cast<size_t>(y) * m_width,
+                                                    uvPlane + static_cast<size_t>(y) * stride, m_width);
+                                    }
+                                    m_context->UpdateSubresource(outNv12Texture, 0, nullptr, m_scratchNv12.data(), m_width, 0);
+                                    if (outDecodedToNv12) *outDecodedToNv12 = true;
+                                    produced = true;
+                                }
                             }
                             if (outBgraTexture && !produced && m_context) {
                                 D3D11_TEXTURE2D_DESC outDesc{};
@@ -1391,6 +1627,8 @@ bool H264Decoder::DrainOutputs(ID3D11Texture2D* outBgraTexture,
     if (produced) {
         if (outW) *outW = m_width;
         if (outH) *outH = m_height;
+    } else if (sawNeedMoreInput) {
+        m_lastNeedMoreInput = true;
     }
     return produced;
 }

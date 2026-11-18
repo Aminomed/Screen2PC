@@ -18,6 +18,10 @@ int32_t g_virtualPosY = 0;
 std::chrono::steady_clock::time_point g_lastInjectTick{};
 std::chrono::steady_clock::time_point g_lastMonitorEnumTick{};
 std::vector<RECT> g_cachedMonitorRects;
+int32_t g_cachedVLeft = 0;
+int32_t g_cachedVTop = 0;
+int32_t g_cachedVWidth = 0;
+int32_t g_cachedVHeight = 0;
 
 BOOL CALLBACK CollectMonitorRectsProc(HMONITOR, HDC, LPRECT lprc, LPARAM dwData) {
     if (lprc && dwData) {
@@ -29,10 +33,21 @@ BOOL CALLBACK CollectMonitorRectsProc(HMONITOR, HDC, LPRECT lprc, LPARAM dwData)
 
 const std::vector<RECT>& GetCachedMonitorRectsLocked(std::chrono::steady_clock::time_point now) {
     if (g_cachedMonitorRects.empty() ||
-        (now - g_lastMonitorEnumTick) > std::chrono::milliseconds(1000)) {
+        g_cachedVWidth <= 0 || g_cachedVHeight <= 0 ||
+        (now - g_lastMonitorEnumTick) > std::chrono::milliseconds(500)) {
         g_cachedMonitorRects.clear();
         EnumDisplayMonitors(nullptr, nullptr, CollectMonitorRectsProc,
                             reinterpret_cast<LPARAM>(&g_cachedMonitorRects));
+        g_cachedVLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        g_cachedVTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        g_cachedVWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        g_cachedVHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (g_cachedVWidth <= 0 || g_cachedVHeight <= 0) {
+            g_cachedVLeft = 0;
+            g_cachedVTop = 0;
+            g_cachedVWidth = std::max<int32_t>(1, GetSystemMetrics(SM_CXSCREEN));
+            g_cachedVHeight = std::max<int32_t>(1, GetSystemMetrics(SM_CYSCREEN));
+        }
         g_lastMonitorEnumTick = now;
     }
     return g_cachedMonitorRects;
@@ -235,41 +250,31 @@ bool KvmInput::InjectMouse(const KvmMouseEvent& ev, const RECT& targetDesktopRec
         return false;
     }
 
-    int32_t vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int32_t vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int32_t vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int32_t vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    if (vWidth <= 0 || vHeight <= 0) {
-        vLeft = 0;
-        vTop = 0;
-        vWidth = std::max<int32_t>(1, GetSystemMetrics(SM_CXSCREEN));
-        vHeight = std::max<int32_t>(1, GetSystemMetrics(SM_CYSCREEN));
-    }
-
     int32_t dx = 0, dy = 0;
     {
         std::lock_guard<std::mutex> lock(g_cursorStateMutex);
         auto now = std::chrono::steady_clock::now();
+        const auto& mons = GetCachedMonitorRectsLocked(now);
+        const int32_t vLeft = g_cachedVLeft;
+        const int32_t vTop = g_cachedVTop;
+        const int32_t vWidth = g_cachedVWidth;
+        const int32_t vHeight = g_cachedVHeight;
 
         if (ev.isRelative != 0) {
-            POINT osPt{};
-            bool gotOsPt = (GetCursorPos(&osPt) != FALSE);
             if (!g_hasVirtualPos ||
-                (now - g_lastInjectTick) > std::chrono::milliseconds(200) ||
-                (gotOsPt && (now - g_lastInjectTick) > std::chrono::milliseconds(40) &&
-                 (std::abs(osPt.x - g_virtualPosX) > 6 || std::abs(osPt.y - g_virtualPosY) > 6))) {
-                if (gotOsPt) {
+                (now - g_lastInjectTick) > std::chrono::milliseconds(250)) {
+                POINT osPt{};
+                if (GetCursorPos(&osPt) != FALSE) {
                     g_virtualPosX = osPt.x;
                     g_virtualPosY = osPt.y;
                     g_hasVirtualPos = true;
-                } else {
+                } else if (!g_hasVirtualPos) {
                     g_virtualPosX = targetDesktopRect.left + std::max<int32_t>(1, (targetDesktopRect.right - targetDesktopRect.left) / 2);
                     g_virtualPosY = targetDesktopRect.top + std::max<int32_t>(1, (targetDesktopRect.bottom - targetDesktopRect.top) / 2);
                     g_hasVirtualPos = true;
                 }
             }
 
-            const auto& mons = GetCachedMonitorRectsLocked(now);
             double rdx = std::clamp(static_cast<double>(ev.normX), -100000.0, 100000.0);
             double rdy = std::clamp(static_cast<double>(ev.normY), -100000.0, 100000.0);
             int32_t dpx = static_cast<int32_t>(std::llround(rdx));

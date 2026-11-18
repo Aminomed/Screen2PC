@@ -50,6 +50,8 @@ struct ReceiverStreamStats {
     std::wstring codecName;
     bool hardwareDxva = false;
     bool hiddenByUser = false;
+    double avgDecodeMs = 0.0;
+    bool directNv12Active = false;
 };
 
 struct ReceiverStatus {
@@ -136,6 +138,7 @@ private:
     };
 
     void DiscoveryLoop();
+    void RealtimeUdpLoop();
     void ControlAcceptLoop();
     void HandleControlClient(TcpSocket clientSock, const std::string& peerIp);
     void RunStreamWorker(StreamReceiverWorker* w);
@@ -160,9 +163,17 @@ private:
     std::atomic<uint64_t> m_colorGeneration[kMaxMonitors]{};
 
     UdpSocket m_discoverySock;
+    UdpSocket m_realtimeUdpSock;
     TcpSocket m_controlListenSock;
     std::thread m_discoveryThread;
+    std::thread m_realtimeUdpThread;
     std::thread m_controlThread;
+
+    std::mutex m_peerIpMutex;
+    std::string m_activePeerIp;
+    std::atomic<uint32_t> m_mouseUdpSeq{0};
+    std::atomic<uint32_t> m_mouseBtnSeq{0};
+    std::atomic<uint32_t> m_lastCursorUdpSeq{0};
 
     std::mutex m_ctrlSendMutex;
     TcpSocket m_activeCtrlSock;

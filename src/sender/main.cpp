@@ -458,6 +458,11 @@ void UpdateUiFromState() {
             if (s.configuredBitrateMbps > 0 && s.liveBitrateMbps > 0 && s.liveBitrateMbps < s.configuredBitrateMbps) {
                 ss << L" (ABR " << s.liveBitrateMbps << L"/" << s.configuredBitrateMbps << L")";
             }
+            ss << L"  |  Enc: " << std::setprecision(1) << s.avgEncodeMs
+               << L"ms Send: " << std::setprecision(1) << s.avgSendMs << L"ms";
+            if (s.losslessSettleActive) {
+                ss << L" [100% Settle]";
+            }
             ss << L"  |  Frames: " << s.framesSent << L"\r\n";
         }
         ss << L"Dateien: Gesendet " << st.fileStats.filesSent

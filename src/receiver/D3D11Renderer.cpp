@@ -47,11 +47,11 @@ VSOut VSMain(uint vid : SV_VertexID) {
 }
 
 Texture2D tex0 : register(t0);
+Texture2D<float2> texUV : register(t1);
 SamplerState samp0 : register(s0);
 
-float4 PSMain(VSOut i) : SV_Target {
-    float4 sampleCol = tex0.Sample(samp0, i.uv);
-    float3 rgb = saturate(sampleCol.rgb);
+float3 ApplyColorGrade(float3 rgb) {
+    rgb = saturate(rgb);
     rgb = saturate((rgb - 0.5) * params0.y + 0.5);
     rgb = pow(max(rgb, 1e-6), params0.x) * step(1e-6, rgb);
     float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
@@ -60,7 +60,25 @@ float4 PSMain(VSOut i) : SV_Target {
     if (params1.w < 0.5) {
         rgb = saturate(rgb);
     }
-    return float4(rgb, sampleCol.a);
+    return rgb;
+}
+
+float4 PSMain(VSOut i) : SV_Target {
+    float4 sampleCol = tex0.Sample(samp0, i.uv);
+    return float4(ApplyColorGrade(sampleCol.rgb), sampleCol.a);
+}
+
+float4 PSMainNv12(VSOut i) : SV_Target {
+    float yVal = tex0.Sample(samp0, i.uv).r;
+    float2 uvVal = texUV.Sample(samp0, i.uv).rg;
+    float y = (yVal - (16.0 / 255.0)) * (255.0 / 219.0);
+    float u = (uvVal.x - (128.0 / 255.0)) * (255.0 / 224.0);
+    float v = (uvVal.y - (128.0 / 255.0)) * (255.0 / 224.0);
+    float3 rgb;
+    rgb.r = y + 1.5748 * v;
+    rgb.g = y - 0.187324 * u - 0.468124 * v;
+    rgb.b = y + 1.8556 * u;
+    return float4(ApplyColorGrade(rgb), 1.0);
 }
 )";
 
@@ -547,12 +565,16 @@ void D3D11Renderer::Destroy() {
         }
         m_cursorSrv.Reset();
         m_cursorTex.Reset();
+        m_nv12UvSrv.Reset();
+        m_nv12YSrv.Reset();
+        m_nv12Tex.Reset();
         m_frameSrv.Reset();
         m_frameTex.Reset();
         m_colorCb.Reset();
         m_quadCb.Reset();
         m_alphaBlend.Reset();
         m_sampler.Reset();
+        m_psNv12.Reset();
         m_ps.Reset();
         m_vs.Reset();
         m_rtv.Reset();
@@ -566,6 +588,7 @@ void D3D11Renderer::Destroy() {
     m_hdrSwapChain = false;
     m_monitorIsHdr = false;
     m_deviceLost.store(false);
+    m_frameIsNv12.store(false);
     m_needSwapChainRebuild = false;
     m_currentMonitor = nullptr;
 
@@ -576,7 +599,7 @@ void D3D11Renderer::Destroy() {
 }
 
 bool D3D11Renderer::CreateDeviceAndShaders() {
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     D3D_FEATURE_LEVEL flOut{};
     const D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
 
@@ -587,7 +610,13 @@ bool D3D11Renderer::CreateDeviceAndShaders() {
 
     if (FAILED(hr)) {
         hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            fls, _countof(fls), D3D11_SDK_VERSION,
+            &m_device, &flOut, &m_context);
+    }
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             fls, _countof(fls), D3D11_SDK_VERSION,
             &m_device, &flOut, &m_context);
     }
@@ -602,7 +631,7 @@ bool D3D11Renderer::CreateDeviceAndShaders() {
         mt->SetMultithreadProtected(TRUE);
     }
 
-    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    ComPtr<ID3DBlob> vsBlob, psBlob, psNv12Blob, errBlob;
     hr = D3DCompile(kQuadShaderSrc, std::strlen(kQuadShaderSrc), nullptr, nullptr, nullptr,
                     "VSMain", "vs_5_0", 0, 0, &vsBlob, &errBlob);
     if (FAILED(hr)) {
@@ -615,9 +644,16 @@ bool D3D11Renderer::CreateDeviceAndShaders() {
         Logger::Instance().Error("RND-PS", L"D3DCompile PS failed: " + FormatHr(hr));
         return false;
     }
+    hr = D3DCompile(kQuadShaderSrc, std::strlen(kQuadShaderSrc), nullptr, nullptr, nullptr,
+                    "PSMainNv12", "ps_5_0", 0, 0, &psNv12Blob, &errBlob);
+    if (FAILED(hr)) {
+        Logger::Instance().Error("RND-PS-NV12", L"D3DCompile PSMainNv12 failed: " + FormatHr(hr));
+        return false;
+    }
 
     if (FAILED(m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vs)) ||
-        FAILED(m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps))) {
+        FAILED(m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps)) ||
+        FAILED(m_device->CreatePixelShader(psNv12Blob->GetBufferPointer(), psNv12Blob->GetBufferSize(), nullptr, &m_psNv12))) {
         return false;
     }
 
@@ -880,16 +916,20 @@ void D3D11Renderer::ResizeSwapChain(uint32_t w, uint32_t h) {
 
 bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
     if (!m_device) return false;
-    uint32_t targetW = std::max<uint32_t>(width, 1);
-    uint32_t targetH = std::max<uint32_t>(height, 1);
-    if (m_frameTex && m_srcWidth == targetW && m_srcHeight == targetH) {
+    uint32_t targetW = std::max<uint32_t>(width, 2) & ~1u;
+    uint32_t targetH = std::max<uint32_t>(height, 2) & ~1u;
+    if (m_frameTex && m_srcWidth == std::max<uint32_t>(width, 1) && m_srcHeight == std::max<uint32_t>(height, 1)) {
         return true;
     }
-    m_srcWidth = targetW;
-    m_srcHeight = targetH;
+    m_srcWidth = std::max<uint32_t>(width, 1);
+    m_srcHeight = std::max<uint32_t>(height, 1);
     UpdateTitle();
     m_frameSrv.Reset();
     m_frameTex.Reset();
+    m_nv12UvSrv.Reset();
+    m_nv12YSrv.Reset();
+    m_nv12Tex.Reset();
+    m_frameIsNv12.store(false);
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = m_srcWidth;
@@ -905,10 +945,41 @@ bool D3D11Renderer::EnsureFrameTexture(uint32_t width, uint32_t height) {
         FAILED(m_device->CreateShaderResourceView(m_frameTex.Get(), nullptr, &m_frameSrv))) {
         return false;
     }
+
+    D3D11_TEXTURE2D_DESC nvd{};
+    nvd.Width = targetW;
+    nvd.Height = targetH;
+    nvd.MipLevels = 1;
+    nvd.ArraySize = 1;
+    nvd.Format = DXGI_FORMAT_NV12;
+    nvd.SampleDesc.Count = 1;
+    nvd.Usage = D3D11_USAGE_DEFAULT;
+    nvd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(m_device->CreateTexture2D(&nvd, nullptr, &m_nv12Tex)) && m_nv12Tex) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC yDesc{};
+        yDesc.Format = DXGI_FORMAT_R8_UNORM;
+        yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        yDesc.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(m_nv12Tex.Get(), &yDesc, &m_nv12YSrv);
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC uvDesc{};
+        uvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+        uvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        uvDesc.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(m_nv12Tex.Get(), &uvDesc, &m_nv12UvSrv);
+    }
+
     return true;
 }
 
-void D3D11Renderer::QueueCpuFrame(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height) {
+void D3D11Renderer::QueueCpuFrame(const uint8_t* bgra,
+                                  uint32_t strideBytes,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t dirtyX,
+                                  uint32_t dirtyY,
+                                  uint32_t dirtyW,
+                                  uint32_t dirtyH) {
     if (!bgra || width == 0 || height == 0 ||
         static_cast<uint64_t>(strideBytes) < static_cast<uint64_t>(width) * 4) {
         return;
@@ -917,21 +988,53 @@ void D3D11Renderer::QueueCpuFrame(const uint8_t* bgra, uint32_t strideBytes, uin
     const size_t totalBytes = rowBytes * height;
     {
         std::lock_guard<std::mutex> lock(m_cpuFrameMutex);
+        const bool dimChanged = (m_pendingCpuFrame.width != width ||
+                                 m_pendingCpuFrame.height != height ||
+                                 m_pendingCpuFrame.bgra.size() != totalBytes);
         m_pendingCpuFrame.bgra.resize(totalBytes);
-        if (strideBytes == rowBytes) {
+
+        uint32_t y0 = 0, y1 = height;
+        if (!dimChanged && dirtyW > 0 && dirtyH > 0 && dirtyY < height) {
+            y0 = dirtyY;
+            y1 = std::min(height, dirtyY + dirtyH);
+        }
+        if (strideBytes == rowBytes && y0 == 0 && y1 == height) {
             std::memcpy(m_pendingCpuFrame.bgra.data(), bgra, totalBytes);
         } else {
-            for (uint32_t y = 0; y < height; ++y) {
+            for (uint32_t y = y0; y < y1; ++y) {
                 std::memcpy(m_pendingCpuFrame.bgra.data() + static_cast<size_t>(y) * rowBytes,
                             bgra + static_cast<size_t>(y) * strideBytes,
                             rowBytes);
             }
+        }
+        if (m_pendingCpuFrame.dirty && !dimChanged) {
+            if (m_pendingCpuFrame.dirtyW == 0 || m_pendingCpuFrame.dirtyH == 0 || dirtyW == 0 || dirtyH == 0) {
+                m_pendingCpuFrame.dirtyX = 0;
+                m_pendingCpuFrame.dirtyY = 0;
+                m_pendingCpuFrame.dirtyW = width;
+                m_pendingCpuFrame.dirtyH = height;
+            } else {
+                uint32_t ux0 = std::min(m_pendingCpuFrame.dirtyX, dirtyX);
+                uint32_t uy0 = std::min(m_pendingCpuFrame.dirtyY, dirtyY);
+                uint32_t ux1 = std::min(width, std::max(m_pendingCpuFrame.dirtyX + m_pendingCpuFrame.dirtyW, dirtyX + dirtyW));
+                uint32_t uy1 = std::min(height, std::max(m_pendingCpuFrame.dirtyY + m_pendingCpuFrame.dirtyH, dirtyY + dirtyH));
+                m_pendingCpuFrame.dirtyX = ux0;
+                m_pendingCpuFrame.dirtyY = uy0;
+                m_pendingCpuFrame.dirtyW = (ux1 > ux0) ? (ux1 - ux0) : width;
+                m_pendingCpuFrame.dirtyH = (uy1 > uy0) ? (uy1 - uy0) : height;
+            }
+        } else {
+            m_pendingCpuFrame.dirtyX = dimChanged ? 0 : dirtyX;
+            m_pendingCpuFrame.dirtyY = dimChanged ? 0 : dirtyY;
+            m_pendingCpuFrame.dirtyW = dimChanged ? width : dirtyW;
+            m_pendingCpuFrame.dirtyH = dimChanged ? height : dirtyH;
         }
         m_pendingCpuFrame.width = width;
         m_pendingCpuFrame.height = height;
         m_pendingCpuFrame.stride = static_cast<uint32_t>(rowBytes);
         m_pendingCpuFrame.dirty = true;
     }
+    m_frameIsNv12.store(false, std::memory_order_release);
     m_hasPendingWork.store(true, std::memory_order_release);
     SignalWake();
 }
@@ -969,18 +1072,49 @@ void D3D11Renderer::QueueCursorUpdate(bool visible,
     SignalWake();
 }
 
-void D3D11Renderer::MarkGpuFrameUpdated() {
+void D3D11Renderer::MarkGpuFrameUpdated(bool isNv12) {
+    m_frameIsNv12.store(isNv12, std::memory_order_release);
     m_hasPendingWork.store(true, std::memory_order_release);
     SignalWake();
 }
 
-void D3D11Renderer::UploadCpuBgra(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height) {
+void D3D11Renderer::UploadCpuBgra(const uint8_t* bgra,
+                                  uint32_t strideBytes,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t dirtyX,
+                                  uint32_t dirtyY,
+                                  uint32_t dirtyW,
+                                  uint32_t dirtyH) {
     if (!m_context || !bgra || width == 0 || height == 0 ||
         static_cast<uint64_t>(strideBytes) < static_cast<uint64_t>(width) * 4) {
         return;
     }
+    const bool hadTex = (m_frameTex != nullptr && m_srcWidth == width && m_srcHeight == height);
     if (!EnsureFrameTexture(width, height) || !m_frameTex) return;
+
+    if (hadTex && dirtyW > 0 && dirtyH > 0 &&
+        dirtyX < width && dirtyY < height &&
+        (dirtyX > 0 || dirtyY > 0 || dirtyW < width || dirtyH < height)) {
+        uint32_t x1 = std::min(width, dirtyX + dirtyW);
+        uint32_t y1 = std::min(height, dirtyY + dirtyH);
+        if (x1 > dirtyX && y1 > dirtyY) {
+            D3D11_BOX box{};
+            box.left = dirtyX;
+            box.top = dirtyY;
+            box.front = 0;
+            box.right = x1;
+            box.bottom = y1;
+            box.back = 1;
+            const uint8_t* subPtr = bgra + static_cast<size_t>(dirtyY) * strideBytes + static_cast<size_t>(dirtyX) * 4;
+            m_context->UpdateSubresource(m_frameTex.Get(), 0, &box, subPtr, strideBytes, 0);
+            m_frameIsNv12.store(false, std::memory_order_release);
+            return;
+        }
+    }
+
     m_context->UpdateSubresource(m_frameTex.Get(), 0, nullptr, bgra, strideBytes, 0);
+    m_frameIsNv12.store(false, std::memory_order_release);
 }
 
 void D3D11Renderer::UpdateCursor(bool visible,
@@ -1136,13 +1270,14 @@ void D3D11Renderer::Present() {
     const bool visibleForPresent = !m_hiddenByUser.load(std::memory_order_acquire) &&
                                    (!m_hwnd || !IsIconic(m_hwnd));
 
-    // Wait outside m_gpuMutex so recv+decode thread can feed the GPU unhindered
+    // Wait outside m_gpuMutex with a short 2ms cap so WM_INPUT mouse messages are never blocked for 8ms!
     if (visibleForPresent && m_frameLatencyWaitable) {
-        WaitForSingleObjectEx(m_frameLatencyWaitable, 8, FALSE);
+        WaitForSingleObjectEx(m_frameLatencyWaitable, 2, FALSE);
     }
 
     bool hasCpuFrame = false;
     uint32_t cpuW = 0, cpuH = 0, cpuStride = 0;
+    uint32_t cpuDirtyX = 0, cpuDirtyY = 0, cpuDirtyW = 0, cpuDirtyH = 0;
     {
         std::lock_guard<std::mutex> lock(m_cpuFrameMutex);
         if (m_pendingCpuFrame.dirty) {
@@ -1150,6 +1285,10 @@ void D3D11Renderer::Present() {
             cpuW = m_pendingCpuFrame.width;
             cpuH = m_pendingCpuFrame.height;
             cpuStride = m_pendingCpuFrame.stride;
+            cpuDirtyX = m_pendingCpuFrame.dirtyX;
+            cpuDirtyY = m_pendingCpuFrame.dirtyY;
+            cpuDirtyW = m_pendingCpuFrame.dirtyW;
+            cpuDirtyH = m_pendingCpuFrame.dirtyH;
             m_cpuUploadScratch.swap(m_pendingCpuFrame.bgra);
             m_pendingCpuFrame.dirty = false;
         }
@@ -1183,7 +1322,8 @@ void D3D11Renderer::Present() {
     {
         std::lock_guard<std::mutex> gpuLock(m_gpuMutex);
         if (hasCpuFrame && !m_cpuUploadScratch.empty()) {
-            UploadCpuBgra(m_cpuUploadScratch.data(), cpuStride, cpuW, cpuH);
+            UploadCpuBgra(m_cpuUploadScratch.data(), cpuStride, cpuW, cpuH,
+                          cpuDirtyX, cpuDirtyY, cpuDirtyW, cpuDirtyH);
         }
         if (cursorUpd.posDirty || cursorUpd.shapeDirty) {
             UpdateCursor(cursorUpd.visible, cursorUpd.x, cursorUpd.y,
@@ -1215,7 +1355,6 @@ void D3D11Renderer::Present() {
         m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
         m_context->IASetInputLayout(nullptr);
         m_context->VSSetShader(m_vs.Get(), nullptr, 0);
-        m_context->PSSetShader(m_ps.Get(), nullptr, 0);
         m_context->PSSetSamplers(0, 1, m_sampler.GetAddressOf());
 
         float winAspect = static_cast<float>(m_winWidth) / static_cast<float>(std::max<uint32_t>(1, m_winHeight));
@@ -1249,13 +1388,35 @@ void D3D11Renderer::Present() {
                 std::memcpy(mapped.pData, &cb, sizeof(cb));
                 m_context->Unmap(m_quadCb.Get(), 0);
                 m_context->VSSetConstantBuffers(0, 1, m_quadCb.GetAddressOf());
-                m_context->PSSetShaderResources(0, 1, &srv);
+                m_context->PSSetShader(m_ps.Get(), nullptr, 0);
+                ID3D11ShaderResourceView* srvs[2] = { srv, nullptr };
+                m_context->PSSetShaderResources(0, 2, srvs);
                 m_context->OMSetBlendState(blend ? m_alphaBlend.Get() : nullptr, nullptr, 0xFFFFFFFF);
                 m_context->Draw(4, 0);
             }
         };
 
-        drawQuad(offX, offY, drawW, drawH, m_frameSrv.Get(), false, false);
+        const bool useNv12 = m_frameIsNv12.load(std::memory_order_acquire) &&
+                             m_psNv12 && m_nv12YSrv && m_nv12UvSrv;
+        if (useNv12 && m_quadCb) {
+            uploadColor(false);
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(m_context->Map(m_quadCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                QuadCB cb{ offX, offY, drawW, drawH };
+                std::memcpy(mapped.pData, &cb, sizeof(cb));
+                m_context->Unmap(m_quadCb.Get(), 0);
+                m_context->VSSetConstantBuffers(0, 1, m_quadCb.GetAddressOf());
+                m_context->PSSetShader(m_psNv12.Get(), nullptr, 0);
+                ID3D11ShaderResourceView* srvs[2] = { m_nv12YSrv.Get(), m_nv12UvSrv.Get() };
+                m_context->PSSetShaderResources(0, 2, srvs);
+                m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+                m_context->Draw(4, 0);
+                ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
+                m_context->PSSetShaderResources(0, 2, nullSrvs);
+            }
+        } else {
+            drawQuad(offX, offY, drawW, drawH, m_frameSrv.Get(), false, false);
+        }
 
         if (m_cursorVisible && m_cursorSrv && m_cursorW > 0 && m_cursorH > 0) {
             float cx = static_cast<float>(m_cursorX - static_cast<int32_t>(m_cursorHotX)) / static_cast<float>(m_srcWidth);
@@ -1307,12 +1468,16 @@ bool D3D11Renderer::RecreateDeviceAndResources() {
     }
     m_cursorSrv.Reset();
     m_cursorTex.Reset();
+    m_nv12UvSrv.Reset();
+    m_nv12YSrv.Reset();
+    m_nv12Tex.Reset();
     m_frameSrv.Reset();
     m_frameTex.Reset();
     m_colorCb.Reset();
     m_quadCb.Reset();
     m_alphaBlend.Reset();
     m_sampler.Reset();
+    m_psNv12.Reset();
     m_ps.Reset();
     m_vs.Reset();
     m_rtv.Reset();
@@ -1322,6 +1487,7 @@ bool D3D11Renderer::RecreateDeviceAndResources() {
     m_swapChainFlags = 0;
     m_allowTearing = false;
     m_useTearingOnPresent = true;
+    m_frameIsNv12.store(false);
 
     m_currentMonitor = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
     MonitorHdrInfo hdrInfo{};
@@ -1450,6 +1616,22 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 }
                 m_pendingRelDx += dx;
                 m_pendingRelDy += dy;
+
+                // Immediate sub-millisecond UDP dispatch (if no more WM_INPUT messages are queued in the thread queue
+                // or >= 1ms has elapsed since last flush, dispatch immediately without waiting for PumpMessages end!)
+                MSG nextMsg{};
+                if (!PeekMessageW(&nextMsg, hwnd, WM_INPUT, WM_INPUT, PM_NOREMOVE)) {
+                    FlushRelativeMouseMove();
+                } else {
+                    LARGE_INTEGER nowQpc{}, freq{};
+                    QueryPerformanceCounter(&nowQpc);
+                    QueryPerformanceFrequency(&freq);
+                    uint64_t minTicks = static_cast<uint64_t>(std::max<LONGLONG>(1, freq.QuadPart / 1000)); // 1ms (1000 Hz)
+                    if (static_cast<uint64_t>(nowQpc.QuadPart) - m_lastMouseFlushQpc >= minTicks) {
+                        m_lastMouseFlushQpc = static_cast<uint64_t>(nowQpc.QuadPart);
+                        FlushRelativeMouseMove();
+                    }
+                }
             }
         }
         return 0;

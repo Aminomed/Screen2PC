@@ -14,6 +14,7 @@ constexpr uint16_t kPortDiscovery    = 48210; // UDP Broadcast discovery
 constexpr uint16_t kPortControl      = 48211; // TCP Control & Handshake
 constexpr uint16_t kPortStreamBase   = 48212; // TCP Stream per monitor (48212 + monitorIndex)
 constexpr uint16_t kPortFileTransfer = 48214; // Dedicated bidirectional TCP File Transfer
+constexpr uint16_t kPortRealtimeUdp  = 48215; // Ultra-low-latency bidirectional UDP for KvmMouse & CursorUpdate
 
 constexpr size_t   kMaxMonitors     = 2;
 constexpr size_t   kMaxFrameBytes   = 64 * 1024 * 1024; // 64 MB safety cap

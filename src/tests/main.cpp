@@ -179,6 +179,59 @@ void TestDeltaCodec() {
     CHECK(!enc.Encode(frame1.data(), 16384, 4097, 16384 * 4, {}, true, payload3, isKey3),
           "Oversized >64MP Delta encode accepted");
 
+    // DLT2: MergeAndBoundRects + MoveRects + FastMotion 2x2 + Lossless Settle + LastBoundingRect
+    {
+        std::vector<s2p::DeltaRect> many;
+        for (uint32_t i = 0; i < 80; ++i) {
+            many.push_back(s2p::DeltaRect{ (i % 10) * 60, (i / 10) * 40, 20, 20 });
+        }
+        auto merged = s2p::DeltaEncoder::MergeAndBoundRects(many, 640, 360, 16);
+        CHECK(!merged.empty() && merged.size() <= 16, "MergeAndBoundRects failed to bound rect count");
+
+        s2p::DeltaEncoder enc2;
+        s2p::DeltaDecoder dec2;
+        std::vector<uint8_t> fA, fB, pA, pMove, pFast, pSettle;
+        FillPatternBgra(fA, 640, 360, 640 * 4, 7);
+        bool kA = false;
+        CHECK(enc2.Encode(fA.data(), 640, 360, 640 * 4, {}, true, pA, kA), "DLT2 keyframe failed");
+        CHECK(dec2.Decode(pA.data(), pA.size(), 640, 360), "DLT2 decode keyframe failed");
+
+        // Scroll/Move 200x100 block from (40,40) to (120,140)
+        fB = fA;
+        for (uint32_t y = 0; y < 100; ++y) {
+            std::memcpy(fB.data() + static_cast<size_t>(140 + y) * 640 * 4 + 120 * 4,
+                        fA.data() + static_cast<size_t>(40 + y) * 640 * 4 + 40 * 4,
+                        200 * 4);
+        }
+        std::vector<s2p::DeltaMoveRect> moves = { { 40, 40, 120, 140, 200, 100 } };
+        bool kMove = false;
+        CHECK(enc2.Encode(fB.data(), 640, 360, 640 * 4, {}, false, pMove, kMove, moves), "DLT2 MoveRect encode failed");
+        CHECK(dec2.Decode(pMove.data(), pMove.size(), 640, 360), "DLT2 MoveRect decode failed");
+        CHECK(std::memcmp(fB.data(), dec2.FrameData(), fB.size()) == 0, "DLT2 MoveRect round-trip mismatch");
+        CHECK(dec2.LastBoundingRect().x == 120 && dec2.LastBoundingRect().y == 140 &&
+              dec2.LastBoundingRect().w == 200 && dec2.LastBoundingRect().h == 100,
+              "DLT2 LastBoundingRect mismatch after MoveRect");
+
+        // Fast-motion 2x2 (>35% dirty area) followed by 100% lossless settle
+        std::vector<uint8_t> fC;
+        FillPatternBgra(fC, 640, 360, 640 * 4, 99);
+        std::vector<s2p::DeltaRect> fullHint = { { 0, 0, 640, 360 } };
+        bool kFast = false, usedFast = false;
+        CHECK(enc2.Encode(fC.data(), 640, 360, 640 * 4, fullHint, false, pFast, kFast, {}, true, &usedFast),
+              "DLT2 fast-motion encode failed");
+        CHECK(usedFast, "DLT2 fast-motion flag not triggered on >35% dirty area");
+        CHECK(dec2.Decode(pFast.data(), pFast.size(), 640, 360), "DLT2 fast-motion decode failed");
+        CHECK(dec2.LastDecodeUsedFastMotion(), "DLT2 decoder did not report fast-motion");
+
+        bool kSettle = false, usedFastSettle = false;
+        CHECK(enc2.Encode(fC.data(), 640, 360, 640 * 4, fullHint, false, pSettle, kSettle, {}, false, &usedFastSettle),
+              "DLT2 lossless settle encode failed");
+        CHECK(!usedFastSettle, "DLT2 settle should not use fast-motion");
+        CHECK(dec2.Decode(pSettle.data(), pSettle.size(), 640, 360), "DLT2 lossless settle decode failed");
+        CHECK(std::memcmp(fC.data(), dec2.FrameData(), fC.size()) == 0,
+              "DLT2 lossless settle did not restore 100% bit-exact frame");
+    }
+
     std::cout << "[PASS] TestDeltaCodec\n";
 }
 
@@ -253,6 +306,13 @@ void TestColorAndH264() {
         dec.Shutdown();
         decCpuOnly.Shutdown();
     };
+
+    // Verify EnsureLowLatencyH264Stream patches Baseline SPS (profile_idc=66) with constraint_set0|1 (0xC0)
+    {
+        std::vector<uint8_t> sps = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x28, 0x95, 0xA0, 0x1E, 0x00, 0x89, 0xF9, 0x61 };
+        s2p::EnsureLowLatencyH264Stream(sps);
+        CHECK((sps[6] & 0xC0u) == 0xC0u, "EnsureLowLatencyH264Stream did not set constraint_set0|1 on Baseline SPS");
+    }
 
     // Neutral gray (128, 128, 128) BT.709 Studio round-trip must have zero chromatic cast
     {

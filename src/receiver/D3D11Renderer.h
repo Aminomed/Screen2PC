@@ -59,9 +59,18 @@ public:
     ID3D11Device* Device() const { return m_device.Get(); }
     ID3D11DeviceContext* Context() const { return m_context.Get(); }
     ID3D11Texture2D* FrameTexture() const { return m_frameTex.Get(); }
+    ID3D11Texture2D* Nv12Texture() const { return m_nv12Tex.Get(); }
+    bool HasNv12Pipeline() const { return m_psNv12 != nullptr && m_nv12Tex != nullptr && m_nv12YSrv != nullptr && m_nv12UvSrv != nullptr; }
     bool EnsureFrameTexture(uint32_t width, uint32_t height);
 
-    void QueueCpuFrame(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height);
+    void QueueCpuFrame(const uint8_t* bgra,
+                       uint32_t strideBytes,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t dirtyX = 0,
+                       uint32_t dirtyY = 0,
+                       uint32_t dirtyW = 0,
+                       uint32_t dirtyH = 0);
     void QueueCursorUpdate(bool visible,
                            int32_t x,
                            int32_t y,
@@ -74,10 +83,17 @@ public:
                            uint32_t hotY,
                            const uint8_t* shapeData,
                            size_t shapeDataSize);
-    void MarkGpuFrameUpdated();
+    void MarkGpuFrameUpdated(bool isNv12 = false);
 
     // Legacy direct calls (Render-thread only)
-    void UploadCpuBgra(const uint8_t* bgra, uint32_t strideBytes, uint32_t width, uint32_t height);
+    void UploadCpuBgra(const uint8_t* bgra,
+                       uint32_t strideBytes,
+                       uint32_t width,
+                       uint32_t height,
+                       uint32_t dirtyX = 0,
+                       uint32_t dirtyY = 0,
+                       uint32_t dirtyW = 0,
+                       uint32_t dirtyH = 0);
     void UpdateCursor(bool visible,
                       int32_t x,
                       int32_t y,
@@ -128,6 +144,10 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t stride = 0;
+        uint32_t dirtyX = 0;
+        uint32_t dirtyY = 0;
+        uint32_t dirtyW = 0;
+        uint32_t dirtyH = 0;
         std::vector<uint8_t> bgra;
     };
 
@@ -176,6 +196,7 @@ private:
     std::atomic<bool> m_needRepaint{false};
     std::atomic<bool> m_hasPendingWork{false};
     std::atomic<bool> m_deviceLost{false};
+    std::atomic<bool> m_frameIsNv12{false};
     bool m_kvmEnabled = true;
     bool m_kvmCaptured = false;
     bool m_escReleasedCapture = false;
@@ -183,6 +204,7 @@ private:
     uint8_t m_suppressKeyUpMask = 0;
     int32_t m_pendingRelDx = 0;
     int32_t m_pendingRelDy = 0;
+    uint64_t m_lastMouseFlushQpc = 0;
     bool m_hasLastAbsRaw = false;
     LONG m_lastAbsRawX = 0;
     LONG m_lastAbsRawY = 0;
@@ -218,6 +240,7 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D11VertexShader> m_vs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> m_ps;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> m_psNv12;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> m_sampler;
     Microsoft::WRL::ComPtr<ID3D11BlendState> m_alphaBlend;
     Microsoft::WRL::ComPtr<ID3D11Buffer> m_quadCb;
@@ -225,6 +248,9 @@ private:
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_frameTex;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_frameSrv;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_nv12Tex;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_nv12YSrv;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_nv12UvSrv;
 
     // Cursor overlay
     bool m_cursorVisible = false;
