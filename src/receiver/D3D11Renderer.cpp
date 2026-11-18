@@ -1073,6 +1073,10 @@ void D3D11Renderer::QueueCursorUpdate(bool visible,
 }
 
 void D3D11Renderer::MarkGpuFrameUpdated(bool isNv12) {
+    {
+        std::lock_guard<std::mutex> lock(m_cpuFrameMutex);
+        m_pendingCpuFrame.dirty = false;
+    }
     m_frameIsNv12.store(isNv12, std::memory_order_release);
     m_hasPendingWork.store(true, std::memory_order_release);
     SignalWake();

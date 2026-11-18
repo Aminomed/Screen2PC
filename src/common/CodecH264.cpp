@@ -834,12 +834,12 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
     if (!m_mft || (m_isAsync && !m_eventGen)) return false;
     if (!nv12Tex && (!nv12Cpu || nv12Stride < m_width)) return false;
 
-    if (m_forceKeyframe && m_codecApi) {
+    bool applyForceKeyframe = (m_forceKeyframe && m_codecApi);
+    if (applyForceKeyframe) {
         VARIANT v{};
         v.vt = VT_UI4;
         v.ulVal = 1;
         m_codecApi->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
-        m_forceKeyframe = false;
     }
 
     Microsoft::WRL::ComPtr<IMFMediaBuffer> inBuf;
@@ -896,11 +896,15 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
             m_asyncNeedInput = false;
             hr = m_mft->ProcessInput(m_inputStreamId, sample.Get(), 0);
             if (FAILED(hr)) return false;
+            m_forceKeyframe = false;
             fedInput = true;
         }
         for (int iter = 0; iter < 32; ++iter) {
             Microsoft::WRL::ComPtr<IMFMediaEvent> ev;
-            DWORD waitFlag = (fedInput && (!outAnnexB.empty() || sawSecondNeedInput)) ? MF_EVENT_FLAG_NO_WAIT : 0;
+            const bool allowNoWaitOnSecondNeedInput = (m_frameCounter <= 4);
+            DWORD waitFlag = (fedInput && (!outAnnexB.empty() || (sawSecondNeedInput && allowNoWaitOnSecondNeedInput)))
+                                 ? MF_EVENT_FLAG_NO_WAIT
+                                 : 0;
             hr = m_eventGen->GetEvent(waitFlag, &ev);
             if (hr == MF_E_NO_EVENTS_AVAILABLE) {
                 break;
@@ -912,6 +916,7 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                 if (!fedInput) {
                     hr = m_mft->ProcessInput(m_inputStreamId, sample.Get(), 0);
                     if (FAILED(hr)) return false;
+                    m_forceKeyframe = false;
                     fedInput = true;
                 } else {
                     m_asyncNeedInput = true;
@@ -1455,6 +1460,10 @@ bool H264Decoder::Decode(const uint8_t* annexBData,
     sample->SetSampleTime(static_cast<LONGLONG>(timestampUs) * 10);
 
     HRESULT hr = m_mft->ProcessInput(0, sample.Get(), 0);
+    if (hr == MF_E_NOTACCEPTING) {
+        DrainOutputs(outBgraTexture, outBgraCpu, outWidth, outHeight, outNv12Texture, outDecodedToNv12);
+        hr = m_mft->ProcessInput(0, sample.Get(), 0);
+    }
     if (FAILED(hr)) return false;
 
     return DrainOutputs(outBgraTexture, outBgraCpu, outWidth, outHeight, outNv12Texture, outDecodedToNv12);

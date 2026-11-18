@@ -1135,6 +1135,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     std::mutex sendQueueMutex;
     std::condition_variable sendQueueCv;
     std::optional<PendingVideoPacket> pendingPacket;
+    std::atomic<bool> sendQueueOccupied{false};
     bool sendThreadExit = false;
     std::atomic<bool> sendFailed{false};
     std::atomic<uint64_t> sentPacketBytes{0};
@@ -1153,6 +1154,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 }
                 pkt = std::move(*pendingPacket);
                 pendingPacket.reset();
+                sendQueueOccupied.store(false, std::memory_order_release);
             }
 
             LARGE_INTEGER s0{}, s1{};
@@ -1196,12 +1198,12 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         {
             std::lock_guard<std::mutex> ql(sendQueueMutex);
             if (pendingPacket.has_value()) {
-                // Dropped an older queued frame: if it was an H.264 delta/IDR, force next H.264 IDR
-                if (pendingPacket->codec == CodecType::H264) {
-                    w->forceKeyframe.store(true);
-                }
+                // Should rarely happen because we gate encoding on !sendQueueOccupied;
+                // if it does, force a keyframe so the decoder never references a dropped frame.
+                w->forceKeyframe.store(true);
             }
             pendingPacket = std::move(pkt);
+            sendQueueOccupied.store(true, std::memory_order_release);
         }
         sendQueueCv.notify_one();
     };
@@ -1488,12 +1490,15 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             }
         }
 
-        const bool needKey = w->forceKeyframe.exchange(false) || !sentInitialFrame;
-        const bool dueForEncode = (nextEncodeQpc == 0 || nowQpc >= nextEncodeQpc);
+        const bool socketReady = !sendQueueOccupied.load(std::memory_order_acquire);
+        const bool hasKeyReq = w->forceKeyframe.load(std::memory_order_acquire) || !sentInitialFrame;
+        const bool dueForEncode = (w->desiredTargetFps.load() == 0 && effFps >= w->refreshHz) ||
+                                  (nextEncodeQpc == 0 || nowQpc >= nextEncodeQpc);
 
-        if ((pendingImageUpdate && dueForEncode) || needKey) {
-            const int64_t intervalQpc = std::max<int64_t>(1, qpcFreq / static_cast<int64_t>(effFps));
-            nextEncodeQpc = nowQpc + intervalQpc; // No catch-up bursts after slow frames
+        if (socketReady && ((pendingImageUpdate && dueForEncode) || hasKeyReq)) {
+            const bool needKey = w->forceKeyframe.exchange(false) || !sentInitialFrame;
+            const int64_t intervalQpc = std::max<int64_t>(1, (qpcFreq * 9) / (static_cast<int64_t>(effFps) * 10));
+            nextEncodeQpc = nowQpc + intervalQpc; // 10% slack avoids beat-frequency stalls vs DXGI VSync
 
             encodedPayload.clear();
             bool isKeyframe = false;
@@ -1587,17 +1592,23 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             windowEncodeMsSum += encMs;
             ++windowEncodeCount;
 
-            if (encodeOk && !encodedPayload.empty() &&
-                encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
-                queueVideoPacket(encodedCodec, isKeyframe, encodedPayload);
-                sentInitialFrame = true;
-                pendingImageUpdate = false;
-                pendingDirtyRects.clear();
-                pendingMoveRects.clear();
-                forceFullDirtyRect = false;
-                ++windowFrames;
+            if (encodeOk && !encodedPayload.empty()) {
+                if (encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
+                    queueVideoPacket(encodedCodec, isKeyframe, encodedPayload);
+                    sentInitialFrame = true;
+                    pendingImageUpdate = false;
+                    pendingDirtyRects.clear();
+                    pendingMoveRects.clear();
+                    forceFullDirtyRect = false;
+                    ++windowFrames;
+                } else {
+                    w->forceKeyframe.store(true);
+                    if (encodedCodec == CodecType::DeltaLossless) {
+                        delta.Reset();
+                    }
+                }
             }
-        } else if (sentInitialFrame && !pendingImageUpdate) {
+        } else if (socketReady && sentInitialFrame && !pendingImageUpdate) {
             // Lossless Settle pass after brief stillness following fast-motion 2x2 or H.264 compression
             const int64_t settleDelayQpc = (qpcFreq * (activeCodec == CodecType::H264 ? 150 : 120)) / 1000;
             const bool dueSettle = (lastMotionQpc > 0 && (nowQpc - lastMotionQpc) >= settleDelayQpc);
