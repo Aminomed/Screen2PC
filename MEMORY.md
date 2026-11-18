@@ -6,8 +6,8 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Ultra-Low-Latency Architecture: UDP Mouse/Cursor, 0-Delay H.264/AMF/NV12, DLT2 LZ4+MoveRects+Settle (Release v1.5.0.33)`
-- **Status:** Alle 3 Stufen der Ultra-Low-Latency-Architektur sind vollständig implementiert und im grünen CI-Build **Run `44323074177`** (Commit `40c11db`, **GitHub Release `v1.5.0.33`**, alle Unit-Tests PASS, INF/CAT OK) veröffentlicht. Details zu den bisherigen 6 priorisierten Verbesserungen (`v1.5.0.31`):
+- **Phase:** `Ultra-Low-Latency Architecture: UDP Mouse/Cursor, 0-Delay H.264/AMF/NV12, DLT2 LZ4+MoveRects+Settle & Multi-Monitor Flicker Fix (Release v1.5.0.34)`
+- **Status:** Alle 3 Stufen der Ultra-Low-Latency-Architektur plus Multi-Monitor-H.264-Stabilitäts- & Latenz-Fixes sind im grünen CI-Build **Run `44424706329`** (Commit `3543036`, **GitHub Release `v1.5.0.34`**, alle Unit-Tests PASS, INF/CAT OK) veröffentlicht. Details zu den bisherigen 6 priorisierten Verbesserungen (`v1.5.0.31`):
   1. **Latenz- & FPS-Durchbruch bei dynamischem Bildinhalt (`CodecH264`, `D3D11Renderer`, `NetSocket`, `ReceiverEngine`, `SenderEngine`):**
      - Asymmetrische TCP-Puffer (`(256 KB, 64 KB)` Sender / `(64 KB, 512 KB)` Receiver -> verhindert Queue-Bloat bei Burst-Bewegungen).
      - `CodecH264`: `LowDelayVBR` mit `MIN_LATENCY`, Live-`SetBitrate`, Hardware-`NV12`-Converter mit 3-Slot-Texture-Ring + dynamisches ABR-Backoff auf Sender-Seite (senkt/hebt Bitrate bei Encoder-Stau dynamisch bis runter auf `15 Mbit/s` bzw. 50 %).
