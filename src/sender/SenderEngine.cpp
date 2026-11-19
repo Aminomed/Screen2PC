@@ -1560,9 +1560,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             pendingImageUpdate = true;
             lastMotionQpc = nowQpc;
             losslessSettleActive = false;
-            if (activeCodec == CodecType::H264) {
-                h264NeedsSettle = true;
-            }
             if (collectDirty && !forceFullDirtyRect) {
                 if (dirtyRects.empty() && moveRects.empty()) {
                     pendingDirtyRects.clear();
