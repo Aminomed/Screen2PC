@@ -754,6 +754,52 @@ void StartConnectAttempt(const std::wstring& targetIpW, bool manualAction) {
     });
 }
 
+void SwitchDisplayModeWhileConnected(HWND hwnd) {
+    if (!g_engine || !g_engine->IsConnected() || g_closing.load()) return;
+    wchar_t ipBuf[128]{};
+    GetDlgItemTextW(hwnd, IDC_IP_EDIT, ipBuf, _countof(ipBuf));
+    std::wstring ipW = TrimWide(ipBuf);
+    if (ipW.empty()) return;
+
+    if (g_connectBusy.exchange(true)) return;
+
+    g_userManualDisconnect = false;
+    g_reconnectArmed = false;
+    g_wasConnected = false;
+
+    s2p::SenderConfig cfg;
+    cfg.targetIp = s2p::WideToUtf8(ipW);
+
+    LRESULT modeIdx = SendDlgItemMessageW(hwnd, IDC_MODE_COMBO, CB_GETCURSEL, 0, 0);
+    if (modeIdx == 1) cfg.mode = s2p::DisplayMode::ExtendPrimary;
+    else if (modeIdx == 2) cfg.mode = s2p::DisplayMode::ExtendSecondary;
+    else if (modeIdx == 3) cfg.mode = s2p::DisplayMode::MirrorPrimary;
+    else cfg.mode = s2p::DisplayMode::ExtendAll;
+
+    int codecIdx = 0, brIdx = s2p::kDefaultBitratePresetIdx, fpsIdx = 0;
+    ReadStreamSettingsFromUi(hwnd, cfg.codec, cfg.bitrateMbps, cfg.targetFps, codecIdx, brIdx, fpsIdx);
+
+    EnableWindow(GetDlgItem(hwnd, IDC_BTN_CONNECT), FALSE);
+    SetDlgItemTextW(hwnd, IDC_STATUS_LABEL, L"Wechsle Anzeigemodus...");
+
+    if (g_connectThread.joinable()) {
+        g_connectThread.join();
+    }
+    g_connectThread = std::thread([cfg]() {
+        if (g_engine && !g_closing.load()) {
+            g_engine->SignalStop();
+            g_engine->Disconnect();
+        }
+        if (g_engine && !g_closing.load()) {
+            g_engine->Connect(cfg);
+        }
+        g_connectBusy = false;
+        if (!g_closing.load() && g_hwnd) {
+            PostMessageW(g_hwnd, WM_CONNECT_DONE, 0, 0);
+        }
+    });
+}
+
 void StartAsyncDiscovery() {
     if (g_scanning || g_closing.load()) return;
     g_scanning = true;
@@ -1454,6 +1500,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 LRESULT idx = SendDlgItemMessageW(hwnd, IDC_MODE_COMBO, CB_GETCURSEL, 0, 0);
                 SaveSetting(L"ModeIdx", static_cast<int>(idx));
+                if (g_engine && g_engine->IsConnected() && !g_connectBusy.load()) {
+                    SwitchDisplayModeWhileConnected(hwnd);
+                }
             }
             return 0;
         case IDC_CODEC_COMBO:
