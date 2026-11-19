@@ -1334,8 +1334,10 @@ void UpdateUi() {
     SendDlgItemMessageW(g_hwnd, IDC_FILE_PROGRESS, PBM_SETPOS, progVal, 0);
     SetDlgItemTextW(g_hwnd, IDC_FILE_STATUS, FormatFileProgressText(st.fileStats).c_str());
 
-    if (st.fileStats.batchCompleted && st.fileStats.batchId != 0 &&
-        st.fileStats.batchId != g_lastNotifiedBatchId && !g_closing.load()) {
+    if (!st.fileStats.active) {
+        g_lastNotifiedBatchId = 0;
+    } else if (st.fileStats.batchCompleted && st.fileStats.batchId != 0 &&
+               st.fileStats.batchId != g_lastNotifiedBatchId && !g_closing.load()) {
         g_lastNotifiedBatchId = st.fileStats.batchId;
         if (IsWindowVisible(g_hwnd)) {
             MessageBoxW(g_hwnd, st.fileStats.lastEvent.c_str(), L"Dateitransfer abgeschlossen", MB_OK | MB_ICONINFORMATION);
