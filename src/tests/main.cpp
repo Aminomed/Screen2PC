@@ -689,6 +689,50 @@ void TestKvmInput() {
     nanEv.normY = -std::numeric_limits<float>::infinity();
     CHECK(!s2p::KvmInput::InjectMouse(nanEv, rightMon), "Non-finite InjectMouse event unexpectedly succeeded");
 
+    // 5. Independent KVM mouse & scroll speed scaling (25..500%)
+    CHECK(s2p::KvmInput::ClampSpeedPct(0) == s2p::KvmInput::kMinSpeedPct &&
+          s2p::KvmInput::ClampSpeedPct(10) == s2p::KvmInput::kMinSpeedPct &&
+          s2p::KvmInput::ClampSpeedPct(999) == s2p::KvmInput::kMaxSpeedPct &&
+          s2p::KvmInput::ClampSpeedPct(175) == 175,
+          "ClampSpeedPct bounds failed");
+
+    double ax = 0.0, ay = 0.0;
+    int32_t sdx = 0, sdy = 0;
+    s2p::KvmInput::ScaleRelativeDelta(3, -4, 100, ax, ay, sdx, sdy);
+    CHECK(sdx == 3 && sdy == -4 && ax == 0.0 && ay == 0.0, "ScaleRelativeDelta 100% failed");
+
+    // 150% fractional accumulation: (1,1) -> (1,1) rem 0.5; (1,1) -> (2,2) rem 0.0
+    s2p::KvmInput::ScaleRelativeDelta(1, 1, 150, ax, ay, sdx, sdy);
+    CHECK(sdx == 1 && sdy == 1, "ScaleRelativeDelta 150% step 1 failed");
+    s2p::KvmInput::ScaleRelativeDelta(1, 1, 150, ax, ay, sdx, sdy);
+    CHECK(sdx == 2 && sdy == 2 && std::abs(ax) < 1e-9 && std::abs(ay) < 1e-9,
+          "ScaleRelativeDelta 150% step 2 accumulation failed");
+
+    // Negative fractional accumulation at 150%
+    s2p::KvmInput::ScaleRelativeDelta(-1, 0, 150, ax, ay, sdx, sdy);
+    CHECK(sdx == -1 && sdy == 0, "ScaleRelativeDelta negative 150% step 1 failed");
+    s2p::KvmInput::ScaleRelativeDelta(-1, 0, 150, ax, ay, sdx, sdy);
+    CHECK(sdx == -2 && sdy == 0 && std::abs(ax) < 1e-9,
+          "ScaleRelativeDelta negative 150% step 2 failed");
+
+    // Slow 25% accumulation: 4x +1 raw -> 0, 0, 0, 1
+    int sumSlow = 0;
+    for (int i = 0; i < 4; ++i) {
+        s2p::KvmInput::ScaleRelativeDelta(1, 0, 25, ax, ay, sdx, sdy);
+        sumSlow += sdx;
+    }
+    CHECK(sumSlow == 1, "ScaleRelativeDelta 25% accumulation failed");
+
+    // Scroll scaling
+    double wAcc = 0.0;
+    CHECK(s2p::KvmInput::ScaleScrollDelta(120, 200, wAcc) == 240, "ScaleScrollDelta 200% positive failed");
+    CHECK(s2p::KvmInput::ScaleScrollDelta(-120, 200, wAcc) == -240, "ScaleScrollDelta 200% negative failed");
+    CHECK(s2p::KvmInput::ScaleScrollDelta(120, 150, wAcc) == 180, "ScaleScrollDelta 150% failed");
+    CHECK(s2p::KvmInput::ScaleScrollDelta(30, 50, wAcc) == 15, "ScaleScrollDelta 50% high-res failed");
+    CHECK(s2p::KvmInput::ScaleScrollDelta(2, 25, wAcc) == 0, "ScaleScrollDelta 25% step 1 should accumulate");
+    CHECK(s2p::KvmInput::ScaleScrollDelta(2, 25, wAcc) == 1, "ScaleScrollDelta 25% step 2 should emit 1");
+    CHECK(s2p::KvmInput::ScaleScrollDelta(0, 200, wAcc) == 0, "ScaleScrollDelta 0 should emit 0");
+
     std::cout << "[PASS] TestKvmInput\n";
 }
 

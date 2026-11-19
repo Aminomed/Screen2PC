@@ -38,6 +38,10 @@ public:
     }
     void SetKvmEnabled(bool enabled);
     bool IsKvmEnabled() const { return m_kvmEnabled; }
+    void SetKvmMouseSpeedPct(uint32_t pct);
+    uint32_t GetKvmMouseSpeedPct() const { return m_kvmMouseSpeedPct.load(std::memory_order_relaxed); }
+    void SetKvmScrollSpeedPct(uint32_t pct);
+    uint32_t GetKvmScrollSpeedPct() const { return m_kvmScrollSpeedPct.load(std::memory_order_relaxed); }
 
     // Must be called from the thread that will pump messages & Present() for this window.
     bool Create(uint32_t monitorIndex,
@@ -202,8 +206,14 @@ private:
     bool m_escReleasedCapture = false;
     bool m_suppressEscUp = false;
     uint8_t m_suppressKeyUpMask = 0;
+    std::atomic<uint32_t> m_kvmMouseSpeedPct{150};
+    std::atomic<uint32_t> m_kvmScrollSpeedPct{200};
     int32_t m_pendingRelDx = 0;
     int32_t m_pendingRelDy = 0;
+    double m_relAccumX = 0.0;
+    double m_relAccumY = 0.0;
+    double m_wheelAccumV = 0.0;
+    double m_wheelAccumH = 0.0;
     uint64_t m_lastMouseFlushQpc = 0;
     bool m_hasLastAbsRaw = false;
     LONG m_lastAbsRawX = 0;

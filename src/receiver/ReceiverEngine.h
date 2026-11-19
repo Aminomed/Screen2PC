@@ -100,6 +100,10 @@ public:
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
     void SetKvmEnabled(bool enabled) { m_kvmEnabled = enabled; }
     bool IsKvmEnabled() const { return m_kvmEnabled.load(); }
+    void SetKvmMouseSpeedPct(uint32_t pct);
+    uint32_t GetKvmMouseSpeedPct() const { return m_kvmMouseSpeedPct.load(); }
+    void SetKvmScrollSpeedPct(uint32_t pct);
+    uint32_t GetKvmScrollSpeedPct() const { return m_kvmScrollSpeedPct.load(); }
     void SetMonitorColorConfig(uint32_t monitorIndex, const MonitorColorConfig& cfg);
     MonitorColorConfig GetMonitorColorConfig(uint32_t monitorIndex) const;
     size_t SendFiles(const std::vector<std::wstring>& paths) { return m_fileTransfer.QueuePaths(paths); }
@@ -151,6 +155,8 @@ private:
     std::atomic<bool> m_startFullscreen{true};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
+    std::atomic<uint32_t> m_kvmMouseSpeedPct{150};
+    std::atomic<uint32_t> m_kvmScrollSpeedPct{200};
 
     mutable std::mutex m_cfgMutex;
     std::wstring m_configIniPath;

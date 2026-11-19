@@ -56,6 +56,29 @@ public:
                                         int32_t& outDx,
                                         int32_t& outDy);
 
+    static constexpr uint32_t kMinSpeedPct = 25;
+    static constexpr uint32_t kMaxSpeedPct = 500;
+    static constexpr uint32_t kDefaultMouseSpeedPct = 150;
+    static constexpr uint32_t kDefaultScrollSpeedPct = 200;
+
+    static uint32_t ClampSpeedPct(uint32_t pct);
+
+    // Scales raw relative mouse deltas (dx, dy) by speedPct (25..500%) using
+    // sub-pixel fractional accumulators so slow movements never lose precision.
+    static void ScaleRelativeDelta(int32_t rawDx,
+                                   int32_t rawDy,
+                                   uint32_t speedPct,
+                                   double& accumX,
+                                   double& accumY,
+                                   int32_t& outDx,
+                                   int32_t& outDy);
+
+    // Scales wheel delta (e.g. +/-120 per detent) by speedPct (25..500%) using
+    // a fractional accumulator so non-integer multipliers remain smooth.
+    static int32_t ScaleScrollDelta(int32_t rawDelta,
+                                    uint32_t speedPct,
+                                    double& accum);
+
     // Pure user-mode injection via Win32 SendInput (zero kernel hooks/drivers).
     static bool InjectMouse(const KvmMouseEvent& ev, const RECT& targetDesktopRect);
     static bool InjectKey(const KvmKeyEvent& ev);

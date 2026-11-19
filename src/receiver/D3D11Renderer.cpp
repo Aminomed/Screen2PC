@@ -314,6 +314,10 @@ void D3D11Renderer::SetKvmCapture(bool captured) {
     m_kvmCaptured = captured;
     m_pendingRelDx = 0;
     m_pendingRelDy = 0;
+    m_relAccumX = 0.0;
+    m_relAccumY = 0.0;
+    m_wheelAccumV = 0.0;
+    m_wheelAccumH = 0.0;
     m_hasLastAbsRaw = false;
 
     if (m_kvmCaptured && m_hwnd) {
@@ -324,6 +328,14 @@ void D3D11Renderer::SetKvmCapture(bool captured) {
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
     }
     UpdateTitle();
+}
+
+void D3D11Renderer::SetKvmMouseSpeedPct(uint32_t pct) {
+    m_kvmMouseSpeedPct.store(KvmInput::ClampSpeedPct(pct), std::memory_order_relaxed);
+}
+
+void D3D11Renderer::SetKvmScrollSpeedPct(uint32_t pct) {
+    m_kvmScrollSpeedPct.store(KvmInput::ClampSpeedPct(pct), std::memory_order_relaxed);
 }
 
 void D3D11Renderer::ReleaseRemoteModifiers() {
@@ -360,15 +372,24 @@ void D3D11Renderer::FlushRelativeMouseMove() {
     if (m_pendingRelDx == 0 && m_pendingRelDy == 0) {
         return;
     }
+    int32_t scaledDx = 0;
+    int32_t scaledDy = 0;
+    KvmInput::ScaleRelativeDelta(
+        m_pendingRelDx, m_pendingRelDy,
+        m_kvmMouseSpeedPct.load(std::memory_order_relaxed),
+        m_relAccumX, m_relAccumY, scaledDx, scaledDy);
+    m_pendingRelDx = 0;
+    m_pendingRelDy = 0;
+    if (scaledDx == 0 && scaledDy == 0) {
+        return;
+    }
     KvmMouseEvent ev{};
     ev.monitorIndex = m_monitorIndex;
     ev.action = kMouseMove;
     ev.isRelative = 1;
-    ev.normX = static_cast<float>(m_pendingRelDx);
-    ev.normY = static_cast<float>(m_pendingRelDy);
+    ev.normX = static_cast<float>(scaledDx);
+    ev.normY = static_cast<float>(scaledDy);
     ev.wheelDelta = 0;
-    m_pendingRelDx = 0;
-    m_pendingRelDy = 0;
     m_kvmMouseCb(ev);
 }
 
@@ -391,6 +412,15 @@ void D3D11Renderer::WarpSurfaceCursorToClientPoint(int32_t clientX, int32_t clie
 
 void D3D11Renderer::EmitMouseEvent(uint8_t action, int32_t clientX, int32_t clientY, int32_t wheelDelta) {
     if (!m_kvmEnabled || !m_kvmMouseCb) return;
+
+    if (action == kMouseWheel || action == kMouseHWheel) {
+        double& accum = (action == kMouseWheel) ? m_wheelAccumV : m_wheelAccumH;
+        wheelDelta = KvmInput::ScaleScrollDelta(
+            wheelDelta, m_kvmScrollSpeedPct.load(std::memory_order_relaxed), accum);
+        if (wheelDelta == 0) {
+            return;
+        }
+    }
 
     if (m_kvmCaptured) {
         if (action == kMouseMove) {

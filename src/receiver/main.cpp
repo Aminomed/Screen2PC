@@ -24,6 +24,7 @@
 #include "../common/AppIcon.h"
 #include "../common/Autostart.h"
 #include "../common/ColorProfile.h"
+#include "../common/KvmInput.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
 #include "../common/Pairing.h"
@@ -66,6 +67,12 @@ constexpr int IDC_BTN_CANCELFILE    = 216;
 constexpr int IDC_FILE_STATUS       = 217;
 constexpr int IDC_BTN_SHOW_STREAMS  = 218;
 constexpr int IDC_BTN_TRUSTED       = 219;
+constexpr int IDC_LBL_MOUSE_SPEED   = 220;
+constexpr int IDC_TB_MOUSE_SPEED    = 221;
+constexpr int IDC_VAL_MOUSE_SPEED   = 222;
+constexpr int IDC_LBL_SCROLL_SPEED  = 223;
+constexpr int IDC_TB_SCROLL_SPEED   = 224;
+constexpr int IDC_VAL_SCROLL_SPEED  = 225;
 
 constexpr int IDM_SHOW              = 3001;
 constexpr int IDM_EXIT              = 3002;
@@ -112,7 +119,7 @@ constexpr int IDC_TR_BTN_REFRESH    = 705;
 constexpr int IDC_TR_BTN_CLOSE      = 706;
 
 constexpr int kMainBaseW    = 580;
-constexpr int kMainBaseH    = 624;
+constexpr int kMainBaseH    = 684;
 constexpr int kColorBaseW   = 472;
 constexpr int kColorBaseH   = 422;
 constexpr int kPinPopBaseW  = 430;
@@ -195,6 +202,15 @@ bool LoadBoolPref(const wchar_t* key, int defVal) {
 
 void SaveBoolPref(const wchar_t* key, bool val) {
     WritePrivateProfileStringW(L"Receiver", key, val ? L"1" : L"0", GetReceiverIniPath().c_str());
+}
+
+uint32_t LoadUintPref(const wchar_t* key, uint32_t defVal) {
+    return static_cast<uint32_t>(
+        GetPrivateProfileIntW(L"Receiver", key, static_cast<int>(defVal), GetReceiverIniPath().c_str()));
+}
+
+void SaveUintPref(const wchar_t* key, uint32_t val) {
+    WritePrivateProfileStringW(L"Receiver", key, std::to_wstring(val).c_str(), GetReceiverIniPath().c_str());
 }
 
 std::wstring DefaultUpdateButtonText() {
@@ -1167,24 +1183,32 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
     mv(IDC_CHK_AUTOSTART,    16, 164, 548,  22);
     mv(IDC_CHK_AUTOUPDATE,   16, 190, 548,  22);
 
-    mv(IDC_BTN_DISCONN,      16, 220, 268,  30);
-    mv(IDC_BTN_SHOW_STREAMS, 296,220, 268,  30);
+    mv(IDC_LBL_MOUSE_SPEED,  16, 218, 170,  22);
+    mv(IDC_TB_MOUSE_SPEED,  190, 216, 304,  26);
+    mv(IDC_VAL_MOUSE_SPEED, 500, 218,  64,  22);
 
-    mv(IDC_BTN_COLORS,       16, 256, 268,  28);
-    mv(IDC_BTN_TRUSTED,      296,256, 268,  28);
+    mv(IDC_LBL_SCROLL_SPEED, 16, 248, 170,  22);
+    mv(IDC_TB_SCROLL_SPEED, 190, 246, 304,  26);
+    mv(IDC_VAL_SCROLL_SPEED,500, 248,  64,  22);
 
-    mv(IDC_BTN_FIREWALL,     16, 290, 268,  28);
-    mv(IDC_BTN_UPDATE,       296,290, 268,  28);
+    mv(IDC_BTN_DISCONN,      16, 280, 268,  30);
+    mv(IDC_BTN_SHOW_STREAMS, 296,280, 268,  30);
 
-    mv(IDC_BTN_SENDFILE,     16, 326, 176,  28);
-    mv(IDC_BTN_SENDFOLDER,   202,326, 176,  28);
-    mv(IDC_BTN_OPEN_DL,      388,326, 176,  28);
+    mv(IDC_BTN_COLORS,       16, 316, 268,  28);
+    mv(IDC_BTN_TRUSTED,      296,316, 268,  28);
 
-    mv(IDC_FILE_PROGRESS,    16, 360, 434,  20);
-    mv(IDC_BTN_CANCELFILE,   458,358, 106,  24);
-    mv(IDC_FILE_STATUS,      16, 384, 548,  18);
+    mv(IDC_BTN_FIREWALL,     16, 350, 268,  28);
+    mv(IDC_BTN_UPDATE,       296,350, 268,  28);
 
-    mv(IDC_STATS_TEXT,       16, 408, 548, 200, g_monoFont);
+    mv(IDC_BTN_SENDFILE,     16, 386, 176,  28);
+    mv(IDC_BTN_SENDFOLDER,   202,386, 176,  28);
+    mv(IDC_BTN_OPEN_DL,      388,386, 176,  28);
+
+    mv(IDC_FILE_PROGRESS,    16, 420, 434,  20);
+    mv(IDC_BTN_CANCELFILE,   458,418, 106,  24);
+    mv(IDC_FILE_STATUS,      16, 444, 548,  18);
+
+    mv(IDC_STATS_TEXT,       16, 468, 548, 200, g_monoFont);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -1220,6 +1244,26 @@ void CreateUiControls(HWND hwnd) {
     HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start automatisch auf GitHub nach Updates suchen",
                           BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CHK_AUTOUPDATE);
     SendMessageW(chkUpd, BM_SETCHECK, LoadBoolPref(L"AutoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    addCtrl(L"STATIC", L"Maus-Tempo (KVM):", SS_CENTERIMAGE, IDC_LBL_MOUSE_SPEED);
+    HWND tbMouse = addCtrl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, IDC_TB_MOUSE_SPEED);
+    SendMessageW(tbMouse, TBM_SETRANGE, TRUE, MAKELONG(s2p::KvmInput::kMinSpeedPct, s2p::KvmInput::kMaxSpeedPct));
+    SendMessageW(tbMouse, TBM_SETTICFREQ, 50, 0);
+    SendMessageW(tbMouse, TBM_SETPAGESIZE, 0, 25);
+    uint32_t mousePct = s2p::KvmInput::ClampSpeedPct(LoadUintPref(L"KvmMouseSpeedPct", s2p::KvmInput::kDefaultMouseSpeedPct));
+    SendMessageW(tbMouse, TBM_SETPOS, TRUE, static_cast<LPARAM>(mousePct));
+    addCtrl(L"STATIC", (std::to_wstring(mousePct) + L" %").c_str(), SS_RIGHT | SS_CENTERIMAGE, IDC_VAL_MOUSE_SPEED);
+    if (g_engine) g_engine->SetKvmMouseSpeedPct(mousePct);
+
+    addCtrl(L"STATIC", L"Scroll-Tempo (KVM):", SS_CENTERIMAGE, IDC_LBL_SCROLL_SPEED);
+    HWND tbScroll = addCtrl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, IDC_TB_SCROLL_SPEED);
+    SendMessageW(tbScroll, TBM_SETRANGE, TRUE, MAKELONG(s2p::KvmInput::kMinSpeedPct, s2p::KvmInput::kMaxSpeedPct));
+    SendMessageW(tbScroll, TBM_SETTICFREQ, 50, 0);
+    SendMessageW(tbScroll, TBM_SETPAGESIZE, 0, 25);
+    uint32_t scrollPct = s2p::KvmInput::ClampSpeedPct(LoadUintPref(L"KvmScrollSpeedPct", s2p::KvmInput::kDefaultScrollSpeedPct));
+    SendMessageW(tbScroll, TBM_SETPOS, TRUE, static_cast<LPARAM>(scrollPct));
+    addCtrl(L"STATIC", (std::to_wstring(scrollPct) + L" %").c_str(), SS_RIGHT | SS_CENTERIMAGE, IDC_VAL_SCROLL_SPEED);
+    if (g_engine) g_engine->SetKvmScrollSpeedPct(scrollPct);
 
     addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_DISCONN);
     addCtrl(L"BUTTON", L"Streamfenster wieder einblenden", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_SHOW_STREAMS);
@@ -1311,6 +1355,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
+
+    case WM_HSCROLL: {
+        HWND tb = reinterpret_cast<HWND>(lp);
+        if (tb) {
+            int id = GetDlgCtrlID(tb);
+            if (id == IDC_TB_MOUSE_SPEED || id == IDC_TB_SCROLL_SPEED) {
+                uint32_t pct = s2p::KvmInput::ClampSpeedPct(
+                    static_cast<uint32_t>(SendMessageW(tb, TBM_GETPOS, 0, 0)));
+                std::wstring label = std::to_wstring(pct) + L" %";
+                if (id == IDC_TB_MOUSE_SPEED) {
+                    SetDlgItemTextW(hwnd, IDC_VAL_MOUSE_SPEED, label.c_str());
+                    if (g_engine) g_engine->SetKvmMouseSpeedPct(pct);
+                    SaveUintPref(L"KvmMouseSpeedPct", pct);
+                } else {
+                    SetDlgItemTextW(hwnd, IDC_VAL_SCROLL_SPEED, label.c_str());
+                    if (g_engine) g_engine->SetKvmScrollSpeedPct(pct);
+                    SaveUintPref(L"KvmScrollSpeedPct", pct);
+                }
+                return 0;
+            }
+        }
+        break;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {

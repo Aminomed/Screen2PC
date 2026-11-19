@@ -2,6 +2,7 @@
 #include "D3D11Renderer.h"
 #include "../common/CodecH264.h"
 #include "../common/CodecDelta.h"
+#include "../common/KvmInput.h"
 #include "../common/Logger.h"
 
 #include <bcrypt.h>
@@ -234,6 +235,30 @@ MonitorColorConfig ReceiverEngine::GetMonitorColorConfig(uint32_t monitorIndex) 
     if (monitorIndex >= kMaxMonitors) return MonitorColorConfig{};
     std::lock_guard<std::mutex> lock(m_colorMutex);
     return m_colorConfigs[monitorIndex];
+}
+
+void ReceiverEngine::SetKvmMouseSpeedPct(uint32_t pct) {
+    uint32_t clamped = KvmInput::ClampSpeedPct(pct);
+    m_kvmMouseSpeedPct.store(clamped);
+    std::lock_guard<std::mutex> wl(m_workersMutex);
+    for (const auto& w : m_workers) {
+        std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+        if (w->activeRenderer) {
+            w->activeRenderer->SetKvmMouseSpeedPct(clamped);
+        }
+    }
+}
+
+void ReceiverEngine::SetKvmScrollSpeedPct(uint32_t pct) {
+    uint32_t clamped = KvmInput::ClampSpeedPct(pct);
+    m_kvmScrollSpeedPct.store(clamped);
+    std::lock_guard<std::mutex> wl(m_workersMutex);
+    for (const auto& w : m_workers) {
+        std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+        if (w->activeRenderer) {
+            w->activeRenderer->SetKvmScrollSpeedPct(clamped);
+        }
+    }
 }
 
 bool ReceiverEngine::Start(bool startFullscreen) {
@@ -926,6 +951,8 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     bool lastGlobalKvm = m_kvmEnabled.load();
     renderer.SetKvmEnabled(lastGlobalKvm);
+    renderer.SetKvmMouseSpeedPct(m_kvmMouseSpeedPct.load());
+    renderer.SetKvmScrollSpeedPct(m_kvmScrollSpeedPct.load());
     renderer.SetKvmCallbacks(
         [this](const KvmMouseEvent& ev) { SendKvmMouse(ev); },
         [this](const KvmKeyEvent& ev) { SendKvmKey(ev); },

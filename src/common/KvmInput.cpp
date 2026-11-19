@@ -245,6 +245,51 @@ void KvmInput::StepVirtualDesktopPoint(int32_t curX,
     outDy = static_cast<int32_t>(std::clamp(std::llround(dy), 0LL, 65535LL));
 }
 
+uint32_t KvmInput::ClampSpeedPct(uint32_t pct) {
+    return std::clamp(pct, kMinSpeedPct, kMaxSpeedPct);
+}
+
+void KvmInput::ScaleRelativeDelta(int32_t rawDx,
+                                  int32_t rawDy,
+                                  uint32_t speedPct,
+                                  double& accumX,
+                                  double& accumY,
+                                  int32_t& outDx,
+                                  int32_t& outDy) {
+    if (!std::isfinite(accumX)) accumX = 0.0;
+    if (!std::isfinite(accumY)) accumY = 0.0;
+
+    const double scale = static_cast<double>(ClampSpeedPct(speedPct)) / 100.0;
+    accumX += static_cast<double>(rawDx) * scale;
+    accumY += static_cast<double>(rawDy) * scale;
+
+    double tx = std::trunc(accumX);
+    double ty = std::trunc(accumY);
+    tx = std::clamp(tx, -100000.0, 100000.0);
+    ty = std::clamp(ty, -100000.0, 100000.0);
+
+    outDx = static_cast<int32_t>(tx);
+    outDy = static_cast<int32_t>(ty);
+    accumX -= static_cast<double>(outDx);
+    accumY -= static_cast<double>(outDy);
+}
+
+int32_t KvmInput::ScaleScrollDelta(int32_t rawDelta,
+                                   uint32_t speedPct,
+                                   double& accum) {
+    if (!std::isfinite(accum)) accum = 0.0;
+    if (rawDelta == 0) return 0;
+
+    const double scale = static_cast<double>(ClampSpeedPct(speedPct)) / 100.0;
+    accum += static_cast<double>(rawDelta) * scale;
+
+    double td = std::trunc(accum);
+    td = std::clamp(td, -32768.0, 32768.0);
+    int32_t outDelta = static_cast<int32_t>(td);
+    accum -= static_cast<double>(outDelta);
+    return outDelta;
+}
+
 bool KvmInput::InjectMouse(const KvmMouseEvent& ev, const RECT& targetDesktopRect) {
     if (!std::isfinite(ev.normX) || !std::isfinite(ev.normY)) {
         return false;
