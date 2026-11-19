@@ -387,7 +387,7 @@ LRESULT SurfaceDimOverlay::HandleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(45, 45, 45));
-        const wchar_t* hint = L"Screen2PC — Surface-Display abgedunkelt (Doppelklick oder ESC zum Reaktivieren)";
+        const wchar_t* hint = L"Screen2PC \u2014 Surface-Display abgedunkelt (Doppelklick oder ESC zum Reaktivieren)";
         DrawTextW(hdc, hint, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         EndPaint(hwnd, &ps);
         return 0;

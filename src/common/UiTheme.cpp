@@ -292,7 +292,7 @@ void DrawModernButton(const DRAWITEMSTRUCT* dis, const ThemePalette& pal, Button
         SetTextColor(hdc, textCol);
         RECT textRc = drawRc;
         if (pressed) OffsetRect(&textRc, 0, 1);
-        DrawTextW(hdc, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(hdc, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     if (focused && style != ButtonStyle::TabActive && style != ButtonStyle::TabInactive) {
@@ -356,7 +356,7 @@ void DrawToggleSwitch(const DRAWITEMSTRUCT* dis, const ThemePalette& pal, bool c
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, disabled ? pal.textSecondary : pal.textPrimary);
         RECT textRc{ trackRc.right + DpiScale(10, dpi), rc.top, rc.right - DpiScale(2, dpi), rc.bottom };
-        DrawTextW(hdc, text, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(hdc, text, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     if (focused) {

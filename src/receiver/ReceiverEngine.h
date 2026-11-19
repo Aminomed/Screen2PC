@@ -100,6 +100,8 @@ public:
     void SetClipboardEnabled(bool enabled) { m_clipboardEnabled = enabled; m_clipboard.SetEnabled(enabled); }
     void SetKvmEnabled(bool enabled) { m_kvmEnabled = enabled; }
     bool IsKvmEnabled() const { return m_kvmEnabled.load(); }
+    void SetStreamHudEnabled(bool enabled);
+    bool IsStreamHudEnabled() const { return m_streamHudEnabled.load(); }
     void SetKvmMouseSpeedPct(uint32_t pct);
     uint32_t GetKvmMouseSpeedPct() const { return m_kvmMouseSpeedPct.load(); }
     void SetKvmScrollSpeedPct(uint32_t pct);
@@ -155,6 +157,7 @@ private:
     std::atomic<bool> m_startFullscreen{true};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
+    std::atomic<bool> m_streamHudEnabled{true};
     std::atomic<uint32_t> m_kvmMouseSpeedPct{150};
     std::atomic<uint32_t> m_kvmScrollSpeedPct{200};
 

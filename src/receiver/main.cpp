@@ -79,6 +79,7 @@ constexpr int IDC_HERO_TITLE        = 226;
 constexpr int IDC_LBL_TELEMETRY     = 227;
 constexpr int IDC_DROP_TITLE        = 228;
 constexpr int IDC_DROP_SUB          = 229;
+constexpr int IDC_CHK_STREAM_HUD    = 230;
 
 constexpr int IDC_TAB_OVERVIEW      = 240;
 constexpr int IDC_TAB_TRANSFER      = 241;
@@ -129,7 +130,7 @@ constexpr int IDC_TR_BTN_REFRESH    = 705;
 constexpr int IDC_TR_BTN_CLOSE      = 706;
 
 constexpr int kMainBaseW    = 580;
-constexpr int kMainBaseH    = 660;
+constexpr int kMainBaseH    = 682;
 constexpr int kColorBaseW   = 472;
 constexpr int kColorBaseH   = 422;
 constexpr int kPinPopBaseW  = 430;
@@ -264,6 +265,7 @@ void ApplyReceiverTabVisibility(HWND hwnd) {
 
     vis(IDC_CHK_AUTOSTART, t2);
     vis(IDC_CHK_AUTOUPDATE, t2);
+    vis(IDC_CHK_STREAM_HUD, t2);
     vis(IDC_BTN_COLORS, t2);
     vis(IDC_BTN_TRUSTED, t2);
     vis(IDC_BTN_FIREWALL, t2);
@@ -1264,15 +1266,15 @@ void UpdateUi() {
     }
 
     s2p::ui::StatusTone newTone = st.sessionActive ? s2p::ui::StatusTone::Success : s2p::ui::StatusTone::Neutral;
-    std::wstring heroTitle = st.sessionActive ? L"Session aktiv" : L"Bereit — Warte auf Surface";
+    std::wstring heroTitle = st.sessionActive ? L"Session aktiv" : L"Bereit \u2014 Warte auf Surface";
     if (st.sessionActive && !st.streams.empty()) {
         double totalMbps = 0.0;
         for (const auto& s : st.streams) totalMbps += s.mbps;
         std::wostringstream hs;
         hs << (st.senderName.empty() ? L"Surface" : st.senderName)
-           << L"  •  " << std::fixed << std::setprecision(1) << st.streams[0].fps << L" FPS"
-           << L"  •  " << std::setprecision(1) << st.streams[0].avgDecodeMs << L" ms"
-           << L"  •  " << std::setprecision(1) << totalMbps << L" Mbit/s";
+           << L"  \u2022  " << std::fixed << std::setprecision(1) << st.streams[0].fps << L" FPS"
+           << L"  \u2022  " << std::setprecision(1) << st.streams[0].avgDecodeMs << L" ms"
+           << L"  \u2022  " << std::setprecision(1) << totalMbps << L" Mbit/s";
         heroTitle = hs.str();
     }
     if (newTone != g_heroTone) {
@@ -1365,55 +1367,56 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : g_font), TRUE);
     };
 
-    // Hero Card (16, 12, 548, 122)
+    // Hero Card (16, 12, 548, 142)
     mv(IDC_HERO_TITLE,       46,  20, 504, 22, g_titleFont);
-    mv(IDC_INFO_LABEL,       46,  44, 504, 46);
-    mv(IDC_BTN_DISCONN,      28,  94, 258, 30, g_boldFont);
-    mv(IDC_BTN_SHOW_STREAMS, 294, 94, 258, 30, g_boldFont);
+    mv(IDC_INFO_LABEL,       46,  44, 504, 64);
+    mv(IDC_BTN_DISCONN,      28, 114, 258, 30, g_boldFont);
+    mv(IDC_BTN_SHOW_STREAMS, 294,114, 258, 30, g_boldFont);
 
-    // Segmented Tab Bar (16, 144, 548, 32)
-    mv(IDC_TAB_OVERVIEW,     16, 144, 178, 32, g_boldFont);
-    mv(IDC_TAB_TRANSFER,    201, 144, 178, 32, g_boldFont);
-    mv(IDC_TAB_SETTINGS,    386, 144, 178, 32, g_boldFont);
+    // Segmented Tab Bar (16, 164, 548, 32)
+    mv(IDC_TAB_OVERVIEW,     16, 164, 178, 32, g_boldFont);
+    mv(IDC_TAB_TRANSFER,    201, 164, 178, 32, g_boldFont);
+    mv(IDC_TAB_SETTINGS,    386, 164, 178, 32, g_boldFont);
 
     // Tab 0: Uebersicht
-    // Card 1: Schnellsteuerung (16, 186, 548, 168)
-    mv(IDC_CHK_FULLSCR,      30, 196, 520, 26);
-    mv(IDC_CHK_CLIPBOARD,    30, 225, 520, 26);
-    mv(IDC_CHK_KVM,          30, 254, 520, 26);
-    mv(IDC_LBL_MOUSE_SPEED,  30, 287, 164, 22, g_boldFont);
-    mv(IDC_TB_MOUSE_SPEED,  198, 285, 290, 26);
-    mv(IDC_VAL_MOUSE_SPEED, 492, 287,  58, 22, g_boldFont);
-    mv(IDC_LBL_SCROLL_SPEED, 30, 318, 164, 22, g_boldFont);
-    mv(IDC_TB_SCROLL_SPEED, 198, 316, 290, 26);
-    mv(IDC_VAL_SCROLL_SPEED,492, 318,  58, 22, g_boldFont);
+    // Card 1: Schnellsteuerung (16, 206, 548, 168)
+    mv(IDC_CHK_FULLSCR,      30, 216, 520, 26);
+    mv(IDC_CHK_CLIPBOARD,    30, 245, 520, 26);
+    mv(IDC_CHK_KVM,          30, 274, 520, 26);
+    mv(IDC_LBL_MOUSE_SPEED,  30, 307, 164, 22, g_boldFont);
+    mv(IDC_TB_MOUSE_SPEED,  198, 305, 290, 26);
+    mv(IDC_VAL_MOUSE_SPEED, 492, 307,  58, 22, g_boldFont);
+    mv(IDC_LBL_SCROLL_SPEED, 30, 338, 164, 22, g_boldFont);
+    mv(IDC_TB_SCROLL_SPEED, 198, 336, 290, 26);
+    mv(IDC_VAL_SCROLL_SPEED,492, 338,  58, 22, g_boldFont);
 
-    // Card 2: Live-Stream-Daten (16, 366, 548, 278)
-    mv(IDC_LBL_TELEMETRY,    30, 378, 520, 20, g_boldFont);
-    mv(IDC_STATS_TEXT,       28, 402, 524, 230, g_monoFont);
+    // Card 2: Live-Stream-Daten (16, 386, 548, 280)
+    mv(IDC_LBL_TELEMETRY,    30, 398, 520, 20, g_boldFont);
+    mv(IDC_STATS_TEXT,       28, 422, 524, 232, g_monoFont);
 
     // Tab 1: Dateitransfer
-    // Drop Zone Card (16, 186, 548, 146)
-    mv(IDC_DROP_TITLE,       32, 236, 516, 24, g_titleFont);
-    mv(IDC_DROP_SUB,         32, 264, 516, 20);
-    // Transfer Action Card (16, 344, 548, 134)
-    mv(IDC_BTN_SENDFILE,     30, 360, 168, 32);
-    mv(IDC_BTN_SENDFOLDER,  206, 360, 168, 32);
-    mv(IDC_BTN_OPEN_DL,     382, 360, 168, 32);
-    mv(IDC_FILE_PROGRESS,    30, 406, 412, 22);
-    mv(IDC_BTN_CANCELFILE,  450, 404, 100, 26);
-    mv(IDC_FILE_STATUS,      30, 438, 520, 20);
+    // Drop Zone Card (16, 206, 548, 146)
+    mv(IDC_DROP_TITLE,       32, 256, 516, 24, g_titleFont);
+    mv(IDC_DROP_SUB,         32, 284, 516, 20);
+    // Transfer Action Card (16, 364, 548, 134)
+    mv(IDC_BTN_SENDFILE,     30, 380, 168, 32);
+    mv(IDC_BTN_SENDFOLDER,  206, 380, 168, 32);
+    mv(IDC_BTN_OPEN_DL,     382, 380, 168, 32);
+    mv(IDC_FILE_PROGRESS,    30, 426, 412, 22);
+    mv(IDC_BTN_CANCELFILE,  450, 424, 100, 26);
+    mv(IDC_FILE_STATUS,      30, 458, 520, 20);
 
     // Tab 2: Einstellungen
-    // Card 1: App & Autostart (16, 186, 548, 82)
-    mv(IDC_CHK_AUTOSTART,    30, 200, 520, 26);
-    mv(IDC_CHK_AUTOUPDATE,   30, 230, 520, 26);
+    // Card 1: App & Autostart (16, 206, 548, 112)
+    mv(IDC_CHK_AUTOSTART,    30, 218, 520, 26);
+    mv(IDC_CHK_AUTOUPDATE,   30, 248, 520, 26);
+    mv(IDC_CHK_STREAM_HUD,   30, 278, 520, 26);
 
-    // Card 2: Werkzeuge & Sicherheit (16, 280, 548, 106)
-    mv(IDC_BTN_COLORS,       30, 296, 256, 34);
-    mv(IDC_BTN_TRUSTED,     294, 296, 256, 34);
-    mv(IDC_BTN_FIREWALL,     30, 338, 256, 34);
-    mv(IDC_BTN_UPDATE,      294, 338, 256, 34);
+    // Card 2: Werkzeuge & Sicherheit (16, 330, 548, 106)
+    mv(IDC_BTN_COLORS,       30, 346, 256, 34);
+    mv(IDC_BTN_TRUSTED,     294, 346, 256, 34);
+    mv(IDC_BTN_FIREWALL,     30, 388, 256, 34);
+    mv(IDC_BTN_UPDATE,      294, 388, 256, 34);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -1425,7 +1428,7 @@ void CreateUiControls(HWND hwnd) {
     };
 
     // Hero
-    addCtrl(L"STATIC", L"Bereit — Warte auf Surface", SS_ENDELLIPSIS, IDC_HERO_TITLE);
+    addCtrl(L"STATIC", L"Bereit \u2014 Warte auf Surface", SS_ENDELLIPSIS, IDC_HERO_TITLE);
     addCtrl(L"STATIC", L"Initialisiere...", 0, IDC_INFO_LABEL);
     addCtrl(L"BUTTON", L"Aktive Session trennen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_DISCONN);
     addCtrl(L"BUTTON", L"Streamfenster einblenden", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SHOW_STREAMS);
@@ -1490,6 +1493,11 @@ void CreateUiControls(HWND hwnd) {
     HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start auf GitHub-Updates pruefen", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_AUTOUPDATE);
     SetToggleChecked(hwnd, IDC_CHK_AUTOUPDATE, LoadBoolPref(L"AutoUpdateCheck", 1));
 
+    HWND chkHud = addCtrl(L"BUTTON", L"In-Stream-Overlay (FPS / Latenz / Mbit/s) anzeigen", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_STREAM_HUD);
+    bool hudPref = LoadBoolPref(L"StreamHudEnabled", 1);
+    SetToggleChecked(hwnd, IDC_CHK_STREAM_HUD, hudPref);
+    if (g_engine) g_engine->SetStreamHudEnabled(hudPref);
+
     addCtrl(L"BUTTON", L"Farbe & HDR pro Monitor...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_COLORS);
     addCtrl(L"BUTTON", L"Vertraute Geraete...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_TRUSTED);
     addCtrl(L"BUTTON", L"Firewall-Ports oeffnen (Admin)", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_FIREWALL);
@@ -1499,6 +1507,7 @@ void CreateUiControls(HWND hwnd) {
     s2p::ui::SetControlTooltip(g_tooltip, hwnd, chk, L"Oeffnet Streamfenster direkt im randlosen Vollbild (F11 zum Umschalten).");
     s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkKvm, L"Aktiviert Maus- und Tastatursteuerung des Surface direkt im Streamfenster (Strg+Alt+K).");
     s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkAuto, L"Startet Screen2PC Receiver minimiert im System-Tray (Task-Manager Autostart).");
+    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkHud, L"Zeigt FPS, Latenz, Bitrate und KVM-Status oben im Streamfenster an (Shortcut: Strg+Alt+H).");
 
     LayoutMainControls(hwnd, GetWindowDpiSafe(hwnd));
     ApplyReceiverTheme(hwnd, s2p::ui::IsSystemDarkMode());
@@ -1585,20 +1594,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         };
 
         // Hero Card
-        s2p::ui::DrawCard(hdc, scRect(16, 12, 548, 122), g_theme, g_currentDpi);
+        s2p::ui::DrawCard(hdc, scRect(16, 12, 548, 142), g_theme, g_currentDpi);
         s2p::ui::DrawStatusDot(hdc, DpiScale(31, g_currentDpi), DpiScale(31, g_currentDpi),
                                std::max(4, DpiScale(5, g_currentDpi)),
                                g_theme.ToneColor(g_heroTone), g_theme.bgCard);
 
         if (g_activeTab == 0) {
-            s2p::ui::DrawCard(hdc, scRect(16, 186, 548, 168), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 366, 548, 278), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 206, 548, 168), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 386, 548, 280), g_theme, g_currentDpi);
         } else if (g_activeTab == 1) {
-            s2p::ui::DrawCard(hdc, scRect(16, 186, 548, 146), g_theme, g_currentDpi, true);
-            s2p::ui::DrawCard(hdc, scRect(16, 344, 548, 134), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 206, 548, 146), g_theme, g_currentDpi, true);
+            s2p::ui::DrawCard(hdc, scRect(16, 364, 548, 134), g_theme, g_currentDpi);
         } else if (g_activeTab == 2) {
-            s2p::ui::DrawCard(hdc, scRect(16, 186, 548, 82), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 280, 548, 106), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 206, 548, 112), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 330, 548, 106), g_theme, g_currentDpi);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -1640,7 +1649,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         if (id == IDC_CHK_FULLSCR || id == IDC_CHK_CLIPBOARD || id == IDC_CHK_KVM ||
-            id == IDC_CHK_AUTOSTART || id == IDC_CHK_AUTOUPDATE) {
+            id == IDC_CHK_AUTOSTART || id == IDC_CHK_AUTOUPDATE || id == IDC_CHK_STREAM_HUD) {
             s2p::ui::DrawToggleSwitch(dis, g_theme, IsToggleChecked(hwnd, id), g_currentDpi);
             return TRUE;
         }
@@ -1725,6 +1734,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_CHK_AUTOUPDATE: {
             bool checked = ToggleSwitch(hwnd, IDC_CHK_AUTOUPDATE);
             SaveBoolPref(L"AutoUpdateCheck", checked);
+            return 0;
+        }
+        case IDC_CHK_STREAM_HUD: {
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_STREAM_HUD);
+            if (g_engine) g_engine->SetStreamHudEnabled(checked);
+            SaveBoolPref(L"StreamHudEnabled", checked);
             return 0;
         }
         case IDC_BTN_DISCONN:
@@ -2030,6 +2045,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     engine.SetConfigIniPath(iniPath);
     engine.SetClipboardEnabled(LoadBoolPref(L"ClipboardSync", 1));
     engine.SetKvmEnabled(LoadBoolPref(L"KvmEnabled", 1));
+    engine.SetStreamHudEnabled(LoadBoolPref(L"StreamHudEnabled", 1));
 
     for (uint32_t i = 0; i < s2p::kMaxMonitors; ++i) {
         engine.SetMonitorColorConfig(i, s2p::LoadMonitorColorConfigIni(iniPath, i));

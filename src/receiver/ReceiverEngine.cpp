@@ -261,6 +261,17 @@ void ReceiverEngine::SetKvmScrollSpeedPct(uint32_t pct) {
     }
 }
 
+void ReceiverEngine::SetStreamHudEnabled(bool enabled) {
+    m_streamHudEnabled.store(enabled);
+    std::lock_guard<std::mutex> wl(m_workersMutex);
+    for (const auto& w : m_workers) {
+        std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
+        if (w->activeRenderer) {
+            w->activeRenderer->SetHudVisible(enabled);
+        }
+    }
+}
+
 bool ReceiverEngine::Start(bool startFullscreen) {
     Stop();
     m_stop = false;
@@ -951,6 +962,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     bool lastGlobalKvm = m_kvmEnabled.load();
     renderer.SetKvmEnabled(lastGlobalKvm);
+    renderer.SetHudVisible(m_streamHudEnabled.load());
     renderer.SetKvmMouseSpeedPct(m_kvmMouseSpeedPct.load());
     renderer.SetKvmScrollSpeedPct(m_kvmScrollSpeedPct.load());
     renderer.SetKvmCallbacks(

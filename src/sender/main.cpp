@@ -546,8 +546,8 @@ void UpdateUiFromState() {
             std::wostringstream hs;
             hs << L"Verbunden  (" << st.streams.size() << L" Display"
                << (st.streams.size() > 1 ? L"s" : L"")
-               << L"  •  " << std::fixed << std::setprecision(1) << st.streams[0].fps << L" FPS"
-               << L"  •  " << std::setprecision(1) << totalMbps << L" Mbit/s)";
+               << L"  \u2022  " << std::fixed << std::setprecision(1) << st.streams[0].fps << L" FPS"
+               << L"  \u2022  " << std::setprecision(1) << totalMbps << L" Mbit/s)";
             heroTitle = hs.str();
         }
     } else if (st.connecting || g_reconnectArmed) {
@@ -573,7 +573,7 @@ void UpdateUiFromState() {
     if (g_reconnectArmed && !st.connected && !st.connecting) {
         ULONGLONG now = GetTickCount64();
         long remSec = (g_nextReconnectTick > now) ? static_cast<long>((g_nextReconnectTick - now + 999) / 1000) : 0;
-        statusLine = L"Unterbrochen — Wiederverbindung in " + std::to_wstring(remSec) + L" s...";
+        statusLine = L"Unterbrochen \u2014 Wiederverbindung in " + std::to_wstring(remSec) + L" s...";
     }
     if (!st.lastError.empty()) {
         statusLine += L"  |  " + st.lastError;
