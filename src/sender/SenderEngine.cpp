@@ -1236,7 +1236,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     bool pendingImageUpdate = false;
     bool forceFullDirtyRect = false;
     bool deltaNeedsSettle = false;
-    bool h264NeedsSettle = false;
     bool losslessSettleActive = false;
     int64_t lastMotionQpc = 0;
     uint32_t cpuStride = 0;
@@ -1416,7 +1415,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         settleDirtyRects.clear();
         forceFullDirtyRect = true;
         deltaNeedsSettle = false;
-        h264NeedsSettle = false;
         losslessSettleActive = false;
         sentInitialFrame = false;
         consecutiveH264Fails = 0;
@@ -1474,7 +1472,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
 
         deltaNeedsSettle = false;
-        h264NeedsSettle = false;
         losslessSettleActive = false;
 
         std::lock_guard<std::mutex> sl(w->statsMutex);
@@ -1762,8 +1759,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 }
             }
         } else if (socketReady && sentInitialFrame && !pendingImageUpdate) {
-            // Lossless Settle pass after brief stillness following fast-motion 2x2 or H.264 compression
-            const int64_t settleDelayQpc = (qpcFreq * (activeCodec == CodecType::H264 ? 150 : 120)) / 1000;
+            // Lossless Settle pass after brief stillness following fast-motion 2x2 compression (DeltaLossless)
+            const int64_t settleDelayQpc = (qpcFreq * 120) / 1000;
             const bool dueSettle = (lastMotionQpc > 0 && (nowQpc - lastMotionQpc) >= settleDelayQpc);
 
             if (dueSettle && activeCodec == CodecType::DeltaLossless && deltaNeedsSettle) {
@@ -1783,21 +1780,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 }
                 deltaNeedsSettle = false;
                 settleDirtyRects.clear();
-            } else if (dueSettle && activeCodec == CodecType::H264 && h264NeedsSettle) {
-                if (capture.CopyFrameToCpu(cpuBgra, cpuStride, nullptr)) {
-                    encodedPayload.clear();
-                    bool isKeyframe = false;
-                    if (delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
-                                     cpuStride, {}, /*forceKeyframe=*/true, encodedPayload, isKeyframe,
-                                     {}, /*allowFastMotion=*/false, nullptr) &&
-                        !encodedPayload.empty() &&
-                        encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
-                        queueVideoPacket(CodecType::DeltaLossless, true, encodedPayload);
-                        losslessSettleActive = true;
-                        ++windowFrames;
-                    }
-                }
-                h264NeedsSettle = false;
             }
         }
 
