@@ -523,6 +523,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     std::vector<DisplayOutputInfo> captureOutputs;
     std::wstring vddErr;
     if (!SetupVirtualDisplays(helloResp, cfg, captureOutputs, vddErr)) {
+        Logger::Instance().Error("SND-VDD", vddErr);
         m_connecting = false;
         std::lock_guard<std::mutex> lock(m_stateMutex);
         m_status.connecting = false;
@@ -719,6 +720,23 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
         beforeNames.insert(o.deviceName);
     }
 
+    auto formatOutputs = [](const std::vector<DisplayOutputInfo>& outs) -> std::wstring {
+        if (outs.empty()) return L"<none>";
+        std::wstring s;
+        for (size_t i = 0; i < outs.size(); ++i) {
+            if (i > 0) s += L", ";
+            s += outs[i].deviceName + L"(" + std::to_wstring(outs[i].width) + L"x" +
+                 std::to_wstring(outs[i].height) + L"@" +
+                 std::to_wstring(outs[i].desktopRect.left) + L"," +
+                 std::to_wstring(outs[i].desktopRect.top) +
+                 (outs[i].isPrimary ? L"*" : L"") + L")";
+        }
+        return s;
+    };
+
+    Logger::Instance().Info("VDD-SETUP",
+        L"Requesting " + std::to_wstring(specs.size()) + L" virtual display(s). Before: " + formatOutputs(before));
+
     if (!VirtualDisplayCtl::SetMonitors(specs)) {
         outError = L"VirtualDisplayCtl::SetMonitors fehlgeschlagen (Named Pipe Fehler).";
         return false;
@@ -727,11 +745,20 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
 
     // Poll DXGI outputs until the virtual displays appear in Windows Display Manager
     const auto startPoll = std::chrono::steady_clock::now();
-    const auto deadline = startPoll + std::chrono::milliseconds(6000);
-    bool forcedExtend = false;
+    const auto deadline = startPoll + std::chrono::milliseconds(10000);
+    int extendAttempts = 0;
+    std::chrono::steady_clock::time_point lastExtendAttempt{};
+    size_t lastAfterCount = before.size();
+    std::vector<DisplayOutputInfo> lastAfter = before;
 
     while (std::chrono::steady_clock::now() < deadline && !m_stop) {
         auto after = DxgiCapture::EnumerateOutputs();
+        if (after.size() != lastAfterCount) {
+            lastAfterCount = after.size();
+            Logger::Instance().Info("VDD-SETUP", L"Outputs changed: " + formatOutputs(after));
+        }
+        lastAfter = after;
+
         std::vector<DisplayOutputInfo> candidates;
 
         // First preference: newly appeared outputs
@@ -774,31 +801,39 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
             }
         }
 
-        // Detect Duplicate/Mirror topology: if a newly attached virtual display sits at (0,0)
-        // overlapping an existing primary display, force Windows into Extend mode immediately.
+        // Detect Duplicate/Mirror topology against `after` (NOT `before`):
+        // if a candidate sits at (0,0) AND another active output in `after` is also at (0,0),
+        // Windows is in Duplicate/Clone mode and must be switched to Extend.
         bool hasOverlappingPrimary = false;
-        if (!candidates.empty() && !before.empty()) {
-            for (const auto& c : candidates) {
-                if (c.desktopRect.left == 0 && c.desktopRect.top == 0) {
-                    for (const auto& b : before) {
-                        if (b.isPrimary && b.deviceName != c.deviceName) {
-                            hasOverlappingPrimary = true;
-                            break;
-                        }
+        for (const auto& c : candidates) {
+            if (c.desktopRect.left == 0 && c.desktopRect.top == 0) {
+                for (const auto& o : after) {
+                    if (o.deviceName != c.deviceName &&
+                        o.desktopRect.left == 0 && o.desktopRect.top == 0) {
+                        hasOverlappingPrimary = true;
+                        break;
                     }
                 }
-                if (hasOverlappingPrimary) break;
             }
+            if (hasOverlappingPrimary) break;
         }
 
-        if (!forcedExtend &&
-            (hasOverlappingPrimary ||
-             (candidates.size() < desiredCount &&
-              std::chrono::steady_clock::now() - startPoll > std::chrono::milliseconds(1000)))) {
-            forcedExtend = true;
+        auto now = std::chrono::steady_clock::now();
+        if ((hasOverlappingPrimary ||
+             (candidates.size() < desiredCount && now - startPoll > std::chrono::milliseconds(1000))) &&
+            extendAttempts < 3 &&
+            (lastExtendAttempt.time_since_epoch().count() == 0 ||
+             now - lastExtendAttempt > std::chrono::milliseconds(1500))) {
+            ++extendAttempts;
+            lastExtendAttempt = now;
             // Ensure Windows topology is in Extend mode instead of Duplicate / PC-screen-only
-            SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
-            SleepInterruptible(350, m_stop);
+            LONG sdc = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+            Logger::Instance().Info("VDD-SETUP",
+                L"SetDisplayConfig(SDC_TOPOLOGY_EXTEND) attempt " + std::to_wstring(extendAttempts) +
+                L" returned " + std::to_wstring(sdc) +
+                L" (candidates=" + std::to_wstring(candidates.size()) +
+                L", overlap=" + std::to_wstring(hasOverlappingPrimary ? 1 : 0) + L")");
+            SleepInterruptible(400, m_stop);
             continue;
         }
 
@@ -880,6 +915,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
                         }
                     }
                 }
+                Logger::Instance().Info("VDD-SETUP", L"Selected virtual display(s): " + formatOutputs(outSelectedOutputs));
                 return true;
             }
         }
@@ -887,7 +923,8 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
         SleepInterruptible(200, m_stop);
     }
 
-    outError = L"Virtuelle Monitore wurden unter Windows innerhalb von 5s nicht sichtbar. Pruefe Windows-Anzeigeeinstellungen (Desktop erweitern).";
+    Logger::Instance().Error("VDD-SETUP", L"Timeout waiting for virtual display(s). Final outputs: " + formatOutputs(lastAfter));
+    outError = L"Virtuelle Monitore wurden unter Windows innerhalb von 10s nicht sichtbar. Pruefe Windows-Anzeigeeinstellungen (Desktop erweitern).";
     VirtualDisplayCtl::ClearMonitors();
     m_createdVirtualDisplays = false;
     return false;
