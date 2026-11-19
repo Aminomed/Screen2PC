@@ -130,7 +130,7 @@ constexpr int IDC_TR_BTN_REFRESH    = 705;
 constexpr int IDC_TR_BTN_CLOSE      = 706;
 
 constexpr int kMainBaseW    = 580;
-constexpr int kMainBaseH    = 682;
+constexpr int kMainBaseH    = 698;
 constexpr int kColorBaseW   = 472;
 constexpr int kColorBaseH   = 422;
 constexpr int kPinPopBaseW  = 430;
@@ -1367,56 +1367,56 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : g_font), TRUE);
     };
 
-    // Hero Card (16, 12, 548, 142)
+    // Hero Card (16, 12, 548, 158)
     mv(IDC_HERO_TITLE,       46,  20, 504, 22, g_titleFont);
-    mv(IDC_INFO_LABEL,       46,  44, 504, 64);
-    mv(IDC_BTN_DISCONN,      28, 114, 258, 30, g_boldFont);
-    mv(IDC_BTN_SHOW_STREAMS, 294,114, 258, 30, g_boldFont);
+    mv(IDC_INFO_LABEL,       46,  44, 504, 80);
+    mv(IDC_BTN_DISCONN,      28, 130, 258, 30, g_boldFont);
+    mv(IDC_BTN_SHOW_STREAMS, 294,130, 258, 30, g_boldFont);
 
-    // Segmented Tab Bar (16, 164, 548, 32)
-    mv(IDC_TAB_OVERVIEW,     16, 164, 178, 32, g_boldFont);
-    mv(IDC_TAB_TRANSFER,    201, 164, 178, 32, g_boldFont);
-    mv(IDC_TAB_SETTINGS,    386, 164, 178, 32, g_boldFont);
+    // Segmented Tab Bar (16, 180, 548, 32)
+    mv(IDC_TAB_OVERVIEW,     16, 180, 178, 32, g_boldFont);
+    mv(IDC_TAB_TRANSFER,    201, 180, 178, 32, g_boldFont);
+    mv(IDC_TAB_SETTINGS,    386, 180, 178, 32, g_boldFont);
 
     // Tab 0: Uebersicht
-    // Card 1: Schnellsteuerung (16, 206, 548, 168)
-    mv(IDC_CHK_FULLSCR,      30, 216, 520, 26);
-    mv(IDC_CHK_CLIPBOARD,    30, 245, 520, 26);
-    mv(IDC_CHK_KVM,          30, 274, 520, 26);
-    mv(IDC_LBL_MOUSE_SPEED,  30, 307, 164, 22, g_boldFont);
-    mv(IDC_TB_MOUSE_SPEED,  198, 305, 290, 26);
-    mv(IDC_VAL_MOUSE_SPEED, 492, 307,  58, 22, g_boldFont);
-    mv(IDC_LBL_SCROLL_SPEED, 30, 338, 164, 22, g_boldFont);
-    mv(IDC_TB_SCROLL_SPEED, 198, 336, 290, 26);
-    mv(IDC_VAL_SCROLL_SPEED,492, 338,  58, 22, g_boldFont);
+    // Card 1: Schnellsteuerung (16, 222, 548, 168)
+    mv(IDC_CHK_FULLSCR,      30, 232, 520, 26);
+    mv(IDC_CHK_CLIPBOARD,    30, 261, 520, 26);
+    mv(IDC_CHK_KVM,          30, 290, 520, 26);
+    mv(IDC_LBL_MOUSE_SPEED,  30, 323, 164, 22, g_boldFont);
+    mv(IDC_TB_MOUSE_SPEED,  198, 321, 290, 26);
+    mv(IDC_VAL_MOUSE_SPEED, 492, 323,  58, 22, g_boldFont);
+    mv(IDC_LBL_SCROLL_SPEED, 30, 354, 164, 22, g_boldFont);
+    mv(IDC_TB_SCROLL_SPEED, 198, 352, 290, 26);
+    mv(IDC_VAL_SCROLL_SPEED,492, 354,  58, 22, g_boldFont);
 
-    // Card 2: Live-Stream-Daten (16, 386, 548, 280)
-    mv(IDC_LBL_TELEMETRY,    30, 398, 520, 20, g_boldFont);
-    mv(IDC_STATS_TEXT,       28, 422, 524, 232, g_monoFont);
+    // Card 2: Live-Stream-Daten (16, 402, 548, 280)
+    mv(IDC_LBL_TELEMETRY,    30, 414, 520, 20, g_boldFont);
+    mv(IDC_STATS_TEXT,       28, 438, 524, 232, g_monoFont);
 
     // Tab 1: Dateitransfer
-    // Drop Zone Card (16, 206, 548, 146)
-    mv(IDC_DROP_TITLE,       32, 256, 516, 24, g_titleFont);
-    mv(IDC_DROP_SUB,         32, 284, 516, 20);
-    // Transfer Action Card (16, 364, 548, 134)
-    mv(IDC_BTN_SENDFILE,     30, 380, 168, 32);
-    mv(IDC_BTN_SENDFOLDER,  206, 380, 168, 32);
-    mv(IDC_BTN_OPEN_DL,     382, 380, 168, 32);
-    mv(IDC_FILE_PROGRESS,    30, 426, 412, 22);
-    mv(IDC_BTN_CANCELFILE,  450, 424, 100, 26);
-    mv(IDC_FILE_STATUS,      30, 458, 520, 20);
+    // Drop Zone Card (16, 222, 548, 146)
+    mv(IDC_DROP_TITLE,       32, 272, 516, 24, g_titleFont);
+    mv(IDC_DROP_SUB,         32, 300, 516, 20);
+    // Transfer Action Card (16, 380, 548, 134)
+    mv(IDC_BTN_SENDFILE,     30, 396, 168, 32);
+    mv(IDC_BTN_SENDFOLDER,  206, 396, 168, 32);
+    mv(IDC_BTN_OPEN_DL,     382, 396, 168, 32);
+    mv(IDC_FILE_PROGRESS,    30, 442, 412, 22);
+    mv(IDC_BTN_CANCELFILE,  450, 440, 100, 26);
+    mv(IDC_FILE_STATUS,      30, 474, 520, 20);
 
     // Tab 2: Einstellungen
-    // Card 1: App & Autostart (16, 206, 548, 112)
-    mv(IDC_CHK_AUTOSTART,    30, 218, 520, 26);
-    mv(IDC_CHK_AUTOUPDATE,   30, 248, 520, 26);
-    mv(IDC_CHK_STREAM_HUD,   30, 278, 520, 26);
+    // Card 1: App & Autostart (16, 222, 548, 112)
+    mv(IDC_CHK_AUTOSTART,    30, 234, 520, 26);
+    mv(IDC_CHK_AUTOUPDATE,   30, 264, 520, 26);
+    mv(IDC_CHK_STREAM_HUD,   30, 294, 520, 26);
 
-    // Card 2: Werkzeuge & Sicherheit (16, 330, 548, 106)
-    mv(IDC_BTN_COLORS,       30, 346, 256, 34);
-    mv(IDC_BTN_TRUSTED,     294, 346, 256, 34);
-    mv(IDC_BTN_FIREWALL,     30, 388, 256, 34);
-    mv(IDC_BTN_UPDATE,      294, 388, 256, 34);
+    // Card 2: Werkzeuge & Sicherheit (16, 346, 548, 106)
+    mv(IDC_BTN_COLORS,       30, 362, 256, 34);
+    mv(IDC_BTN_TRUSTED,     294, 362, 256, 34);
+    mv(IDC_BTN_FIREWALL,     30, 404, 256, 34);
+    mv(IDC_BTN_UPDATE,      294, 404, 256, 34);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -1594,20 +1594,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         };
 
         // Hero Card
-        s2p::ui::DrawCard(hdc, scRect(16, 12, 548, 142), g_theme, g_currentDpi);
+        s2p::ui::DrawCard(hdc, scRect(16, 12, 548, 158), g_theme, g_currentDpi);
         s2p::ui::DrawStatusDot(hdc, DpiScale(31, g_currentDpi), DpiScale(31, g_currentDpi),
                                std::max(4, DpiScale(5, g_currentDpi)),
                                g_theme.ToneColor(g_heroTone), g_theme.bgCard);
 
         if (g_activeTab == 0) {
-            s2p::ui::DrawCard(hdc, scRect(16, 206, 548, 168), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 386, 548, 280), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 168), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 402, 548, 280), g_theme, g_currentDpi);
         } else if (g_activeTab == 1) {
-            s2p::ui::DrawCard(hdc, scRect(16, 206, 548, 146), g_theme, g_currentDpi, true);
-            s2p::ui::DrawCard(hdc, scRect(16, 364, 548, 134), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 146), g_theme, g_currentDpi, true);
+            s2p::ui::DrawCard(hdc, scRect(16, 380, 548, 134), g_theme, g_currentDpi);
         } else if (g_activeTab == 2) {
-            s2p::ui::DrawCard(hdc, scRect(16, 206, 548, 112), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 330, 548, 106), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 112), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 346, 548, 106), g_theme, g_currentDpi);
         }
         EndPaint(hwnd, &ps);
         return 0;
