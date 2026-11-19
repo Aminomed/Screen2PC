@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <cstdint>
+#include <string>
 
 namespace s2p::ui {
 
