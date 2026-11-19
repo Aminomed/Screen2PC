@@ -22,6 +22,9 @@ This file is the authoritative instruction & architecture reference for AI codin
 4. **CI & Verification:**
    - Local Linux VM cannot compile Windows MSBuild/WDK targets directly. Every code change MUST be pushed to `main` and verified via `.github/workflows/ci.yml` (`Build Solution (Release|x64)`, `Screen2PC.Tests.exe`, `infverif.exe`, `Inf2Cat.exe`, Release bundle).
    - Documentation-only commits (`MEMORY.md`, `AGENTS.md`, `README.md`) should use `[skip ci]` in the commit message when no code changed.
+5. **Project Memory Continuity (`MEMORY.md`):**
+   - After every major change (new feature, architectural/pipeline change, protocol/config update, or bugfix release), **always update `MEMORY.md`** before concluding the task so future sessions can resume from the current state without reading the entire codebase.
+   - Specifically update `## 0. Current State (Read First!)` (Phase, Status, CI run / release tag, Next Step), any affected module/config sections, and the chronological Changelog; also update `AGENTS.md` if architecture, ports, hotkeys, or repo layout changed.
 
 ---
 
