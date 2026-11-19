@@ -1518,7 +1518,7 @@ void CreateUiControls(HWND hwnd) {
     addCtrl(L"STATIC", (std::to_wstring(scrollPct) + L" %").c_str(), SS_RIGHT | SS_CENTERIMAGE, IDC_VAL_SCROLL_SPEED);
     if (g_engine) g_engine->SetKvmScrollSpeedPct(scrollPct);
 
-    addCtrl(L"STATIC", L"Live-Stream-Daten (FPS, Decode-Latenz, Mbit/s)", 0, IDC_LBL_TELEMETRY);
+    addCtrl(L"STATIC", L"Live-Stream-Daten (FPS, Decode-Latenz, Mbit/s)", SS_NOPREFIX, IDC_LBL_TELEMETRY);
     addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, IDC_STATS_TEXT);
 
     // Tab 1: Dateitransfer

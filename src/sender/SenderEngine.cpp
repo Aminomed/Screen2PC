@@ -759,6 +759,21 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
             }
         }
 
+        // Third preference: any non-primary output (e.g. stale resolution from Windows CCD);
+        // lines below will force ChangeDisplaySettingsExW to the exact target resolution.
+        if (candidates.size() < desiredCount) {
+            for (const auto& o : after) {
+                if (candidates.size() >= desiredCount) break;
+                if (o.isPrimary) continue;
+                bool alreadyPicked = std::any_of(candidates.begin(), candidates.end(), [&](const DisplayOutputInfo& c) {
+                    return c.deviceName == o.deviceName;
+                });
+                if (!alreadyPicked) {
+                    candidates.push_back(o);
+                }
+            }
+        }
+
         // Detect Duplicate/Mirror topology: if a newly attached virtual display sits at (0,0)
         // overlapping an existing primary display, force Windows into Extend mode immediately.
         bool hasOverlappingPrimary = false;

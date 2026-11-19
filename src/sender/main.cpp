@@ -1058,7 +1058,7 @@ void CreateUiControls(HWND hwnd) {
                           : std::clamp(LoadSetting(L"FpsIdx", 0), 0, static_cast<int>(s2p::kFpsPresetCount) - 1);
     SendMessageW(fpsCb, CB_SETCURSEL, savedFpsIdx, 0);
 
-    addCtrl(L"STATIC", L"Live-Telemetrie & Protokoll", 0, IDC_LBL_TELEMETRY);
+    addCtrl(L"STATIC", L"Live-Telemetrie & Protokoll", SS_NOPREFIX, IDC_LBL_TELEMETRY);
     addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, IDC_STATS_TEXT);
 
     // Tab 1: Dateitransfer
