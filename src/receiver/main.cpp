@@ -28,6 +28,7 @@
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
 #include "../common/Pairing.h"
+#include "../common/UiTheme.h"
 #include "../common/Updater.h"
 #include "ReceiverEngine.h"
 
@@ -35,6 +36,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 namespace {
 
@@ -73,6 +75,14 @@ constexpr int IDC_VAL_MOUSE_SPEED   = 222;
 constexpr int IDC_LBL_SCROLL_SPEED  = 223;
 constexpr int IDC_TB_SCROLL_SPEED   = 224;
 constexpr int IDC_VAL_SCROLL_SPEED  = 225;
+constexpr int IDC_HERO_TITLE        = 226;
+constexpr int IDC_LBL_TELEMETRY     = 227;
+constexpr int IDC_DROP_TITLE        = 228;
+constexpr int IDC_DROP_SUB          = 229;
+
+constexpr int IDC_TAB_OVERVIEW      = 240;
+constexpr int IDC_TAB_TRANSFER      = 241;
+constexpr int IDC_TAB_SETTINGS      = 242;
 
 constexpr int IDM_SHOW              = 3001;
 constexpr int IDM_EXIT              = 3002;
@@ -119,7 +129,7 @@ constexpr int IDC_TR_BTN_REFRESH    = 705;
 constexpr int IDC_TR_BTN_CLOSE      = 706;
 
 constexpr int kMainBaseW    = 580;
-constexpr int kMainBaseH    = 684;
+constexpr int kMainBaseH    = 660;
 constexpr int kColorBaseW   = 472;
 constexpr int kColorBaseH   = 422;
 constexpr int kPinPopBaseW  = 430;
@@ -148,13 +158,21 @@ HWND g_hwnd = nullptr;
 HWND g_colorWnd = nullptr;
 HWND g_pinPopupWnd = nullptr;
 HWND g_trustedWnd = nullptr;
+HWND g_tooltip = nullptr;
 
 HFONT g_font = nullptr;
+HFONT g_boldFont = nullptr;
+HFONT g_titleFont = nullptr;
 HFONT g_monoFont = nullptr;
 HFONT g_colorFont = nullptr;
 HFONT g_pinPopFont = nullptr;
 HFONT g_pinPopBigFont = nullptr;
 HFONT g_trustedFont = nullptr;
+UINT g_currentDpi = 96;
+
+s2p::ui::ThemePalette g_theme;
+s2p::ui::StatusTone g_heroTone = s2p::ui::StatusTone::Neutral;
+int g_activeTab = 0; // 0 = Uebersicht, 1 = Dateitransfer, 2 = Einstellungen
 
 NOTIFYICONDATAW g_nid{};
 UINT g_wmShowExisting = 0;
@@ -175,6 +193,97 @@ bool g_colorPopulating = false;
 
 std::shared_ptr<s2p::PinPopupSession> g_activePinSession;
 std::vector<s2p::TrustedDeviceEntry> g_trustedCache;
+
+bool IsToggleChecked(HWND hwnd, int id) {
+    HWND c = GetDlgItem(hwnd, id);
+    return c && (GetWindowLongPtrW(c, GWLP_USERDATA) != 0);
+}
+
+void SetToggleChecked(HWND hwnd, int id, bool checked) {
+    HWND c = GetDlgItem(hwnd, id);
+    if (!c) return;
+    SetWindowLongPtrW(c, GWLP_USERDATA, checked ? 1 : 0);
+    InvalidateRect(c, nullptr, FALSE);
+}
+
+bool ToggleSwitch(HWND hwnd, int id) {
+    bool next = !IsToggleChecked(hwnd, id);
+    SetToggleChecked(hwnd, id, next);
+    return next;
+}
+
+bool IsReceiverCardControlId(int id) {
+    switch (id) {
+    case IDC_HERO_TITLE:
+    case IDC_INFO_LABEL:
+    case IDC_LBL_MOUSE_SPEED:
+    case IDC_VAL_MOUSE_SPEED:
+    case IDC_LBL_SCROLL_SPEED:
+    case IDC_VAL_SCROLL_SPEED:
+    case IDC_TB_MOUSE_SPEED:
+    case IDC_TB_SCROLL_SPEED:
+    case IDC_LBL_TELEMETRY:
+    case IDC_DROP_TITLE:
+    case IDC_DROP_SUB:
+    case IDC_FILE_STATUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void ApplyReceiverTabVisibility(HWND hwnd) {
+    auto vis = [&](int id, bool show) {
+        HWND c = GetDlgItem(hwnd, id);
+        if (c) ShowWindow(c, show ? SW_SHOW : SW_HIDE);
+    };
+    const bool t0 = (g_activeTab == 0);
+    const bool t1 = (g_activeTab == 1);
+    const bool t2 = (g_activeTab == 2);
+
+    vis(IDC_CHK_FULLSCR, t0);
+    vis(IDC_CHK_CLIPBOARD, t0);
+    vis(IDC_CHK_KVM, t0);
+    vis(IDC_LBL_MOUSE_SPEED, t0);
+    vis(IDC_TB_MOUSE_SPEED, t0);
+    vis(IDC_VAL_MOUSE_SPEED, t0);
+    vis(IDC_LBL_SCROLL_SPEED, t0);
+    vis(IDC_TB_SCROLL_SPEED, t0);
+    vis(IDC_VAL_SCROLL_SPEED, t0);
+    vis(IDC_LBL_TELEMETRY, t0);
+    vis(IDC_STATS_TEXT, t0);
+
+    vis(IDC_DROP_TITLE, t1);
+    vis(IDC_DROP_SUB, t1);
+    vis(IDC_BTN_SENDFILE, t1);
+    vis(IDC_BTN_SENDFOLDER, t1);
+    vis(IDC_BTN_OPEN_DL, t1);
+    vis(IDC_FILE_PROGRESS, t1);
+    vis(IDC_BTN_CANCELFILE, t1);
+    vis(IDC_FILE_STATUS, t1);
+
+    vis(IDC_CHK_AUTOSTART, t2);
+    vis(IDC_CHK_AUTOUPDATE, t2);
+    vis(IDC_BTN_COLORS, t2);
+    vis(IDC_BTN_TRUSTED, t2);
+    vis(IDC_BTN_FIREWALL, t2);
+    vis(IDC_BTN_UPDATE, t2);
+
+    InvalidateRect(GetDlgItem(hwnd, IDC_TAB_OVERVIEW), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_TAB_TRANSFER), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_TAB_SETTINGS), nullptr, FALSE);
+    InvalidateRect(hwnd, nullptr, TRUE);
+}
+
+void ApplyReceiverTheme(HWND hwnd, bool dark) {
+    g_theme.Init(dark);
+    s2p::ui::ApplyWindowTheme(hwnd, dark);
+    s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_STATS_TEXT), dark);
+    if (g_colorWnd && IsWindow(g_colorWnd)) s2p::ui::ApplyWindowTheme(g_colorWnd, dark);
+    if (g_pinPopupWnd && IsWindow(g_pinPopupWnd)) s2p::ui::ApplyWindowTheme(g_pinPopupWnd, dark);
+    if (g_trustedWnd && IsWindow(g_trustedWnd)) s2p::ui::ApplyWindowTheme(g_trustedWnd, dark);
+    InvalidateRect(hwnd, nullptr, TRUE);
+}
 
 int DpiScale(int px96, UINT dpi) {
     return MulDiv(px96, static_cast<int>(dpi), 96);
@@ -411,8 +520,26 @@ LRESULT CALLBACK ColorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         addCtrl(L"BUTTON", L"Schliessen", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_CLR_BTN_CLOSE);
 
         LayoutColorControls(hwnd, GetWindowDpiSafe(hwnd));
+        s2p::ui::ApplyWindowTheme(hwnd, g_theme.dark);
+        s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_CLR_MON_COMBO), g_theme.dark, L"DarkMode_CFD");
         return 0;
     }
+
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        if (g_theme.brushWindow) {
+            FillRect(reinterpret_cast<HDC>(wp), &rc, g_theme.brushWindow);
+            return 1;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORDLG:
+        return s2p::ui::HandleCtlColor(msg, wp, g_theme, false);
 
     case WM_DPICHANGED: {
         RECT* suggested = reinterpret_cast<RECT*>(lp);
@@ -610,8 +737,24 @@ LRESULT CALLBACK PinPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         addCtrl(L"BUTTON", L"Ablehnen", BS_PUSHBUTTON | WS_TABSTOP, IDC_PINP_BTN_REJECT);
 
         LayoutPinPopupControls(hwnd, GetWindowDpiSafe(hwnd));
+        s2p::ui::ApplyWindowTheme(hwnd, g_theme.dark);
         return 0;
     }
+
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        if (g_theme.brushWindow) {
+            FillRect(reinterpret_cast<HDC>(wp), &rc, g_theme.brushWindow);
+            return 1;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORDLG:
+        return s2p::ui::HandleCtlColor(msg, wp, g_theme, false);
 
     case WM_DPICHANGED: {
         RECT* suggested = reinterpret_cast<RECT*>(lp);
@@ -816,8 +959,25 @@ LRESULT CALLBACK TrustedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         addCtrl(L"BUTTON", L"Schliessen", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_TR_BTN_CLOSE);
 
         LayoutTrustedControls(hwnd, GetWindowDpiSafe(hwnd));
+        s2p::ui::ApplyWindowTheme(hwnd, g_theme.dark);
+        s2p::ui::ApplyChildTheme(lv, g_theme.dark);
         return 0;
     }
+
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        if (g_theme.brushWindow) {
+            FillRect(reinterpret_cast<HDC>(wp), &rc, g_theme.brushWindow);
+            return 1;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORDLG:
+        return s2p::ui::HandleCtlColor(msg, wp, g_theme, false);
 
     case WM_DPICHANGED: {
         RECT* suggested = reinterpret_cast<RECT*>(lp);
@@ -1084,7 +1244,7 @@ void UpdateUi() {
     auto st = g_engine->GetStatus();
 
     std::wostringstream hdr;
-    hdr << L"Status: " << st.stateText << L"\r\nPC-IPs: ";
+    hdr << st.stateText << L"\r\nPC-IPs: ";
     for (size_t i = 0; i < st.localIps.size(); ++i) {
         if (i > 0) hdr << L", ";
         hdr << s2p::Utf8ToWide(st.localIps[i]);
@@ -1102,9 +1262,31 @@ void UpdateUi() {
         }
         if (st.localMonitors[i].isPrimary) hdr << L" (Primary)";
     }
+
+    s2p::ui::StatusTone newTone = st.sessionActive ? s2p::ui::StatusTone::Success : s2p::ui::StatusTone::Neutral;
+    std::wstring heroTitle = st.sessionActive ? L"Session aktiv" : L"Bereit — Warte auf Surface";
+    if (st.sessionActive && !st.streams.empty()) {
+        double totalMbps = 0.0;
+        for (const auto& s : st.streams) totalMbps += s.mbps;
+        std::wostringstream hs;
+        hs << (st.senderName.empty() ? L"Surface" : st.senderName)
+           << L"  •  " << std::fixed << std::setprecision(1) << st.streams[0].fps << L" FPS"
+           << L"  •  " << std::setprecision(1) << st.streams[0].avgDecodeMs << L" ms"
+           << L"  •  " << std::setprecision(1) << totalMbps << L" Mbit/s";
+        heroTitle = hs.str();
+    }
+    if (newTone != g_heroTone) {
+        g_heroTone = newTone;
+        RECT dotRc{ 0, 0, DpiScale(60, g_currentDpi), DpiScale(132, g_currentDpi) };
+        InvalidateRect(g_hwnd, &dotRc, FALSE);
+    }
+    SetDlgItemTextW(g_hwnd, IDC_HERO_TITLE, heroTitle.c_str());
+
     SetDlgItemTextW(g_hwnd, IDC_INFO_LABEL, hdr.str().c_str());
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_DISCONN), (st.sessionActive && !g_disconnBusy.load()) ? TRUE : FALSE);
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SHOW_STREAMS), st.hasHiddenStreams ? TRUE : FALSE);
+    InvalidateRect(GetDlgItem(g_hwnd, IDC_BTN_DISCONN), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(g_hwnd, IDC_BTN_SHOW_STREAMS), nullptr, FALSE);
 
     BOOL fileReady = st.fileStats.active ? TRUE : FALSE;
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_SENDFILE), fileReady);
@@ -1120,9 +1302,8 @@ void UpdateUi() {
     SetDlgItemTextW(g_hwnd, IDC_FILE_STATUS, FormatFileProgressText(st.fileStats).c_str());
 
     bool kvmOn = g_engine->IsKvmEnabled();
-    LRESULT chkState = SendDlgItemMessageW(g_hwnd, IDC_CHK_KVM, BM_GETCHECK, 0, 0);
-    if ((chkState == BST_CHECKED) != kvmOn) {
-        SendDlgItemMessageW(g_hwnd, IDC_CHK_KVM, BM_SETCHECK, kvmOn ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (IsToggleChecked(g_hwnd, IDC_CHK_KVM) != kvmOn) {
+        SetToggleChecked(g_hwnd, IDC_CHK_KVM, kvmOn);
     }
 
     std::wostringstream body;
@@ -1159,11 +1340,20 @@ void OpenFirewallPortsElevated() {
 }
 
 void LayoutMainControls(HWND hwnd, UINT dpi) {
+    g_currentDpi = dpi;
     if (g_font) DeleteObject(g_font);
+    if (g_boldFont) DeleteObject(g_boldFont);
+    if (g_titleFont) DeleteObject(g_titleFont);
     if (g_monoFont) DeleteObject(g_monoFont);
     g_font = CreateFontW(-DpiScale(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g_boldFont = CreateFontW(-DpiScale(14, dpi), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    g_titleFont = CreateFontW(-DpiScale(16, dpi), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     g_monoFont = CreateFontW(-DpiScale(12, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
@@ -1175,40 +1365,55 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
         SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : g_font), TRUE);
     };
 
-    mv(IDC_INFO_LABEL,       16,  12, 548,  68);
+    // Hero Card (16, 12, 548, 122)
+    mv(IDC_HERO_TITLE,       46,  20, 504, 22, g_titleFont);
+    mv(IDC_INFO_LABEL,       46,  44, 504, 46);
+    mv(IDC_BTN_DISCONN,      28,  94, 258, 30, g_boldFont);
+    mv(IDC_BTN_SHOW_STREAMS, 294, 94, 258, 30, g_boldFont);
 
-    mv(IDC_CHK_FULLSCR,      16,  86, 548,  22);
-    mv(IDC_CHK_CLIPBOARD,    16, 112, 548,  22);
-    mv(IDC_CHK_KVM,          16, 138, 548,  22);
-    mv(IDC_CHK_AUTOSTART,    16, 164, 548,  22);
-    mv(IDC_CHK_AUTOUPDATE,   16, 190, 548,  22);
+    // Segmented Tab Bar (16, 144, 548, 32)
+    mv(IDC_TAB_OVERVIEW,     16, 144, 178, 32, g_boldFont);
+    mv(IDC_TAB_TRANSFER,    201, 144, 178, 32, g_boldFont);
+    mv(IDC_TAB_SETTINGS,    386, 144, 178, 32, g_boldFont);
 
-    mv(IDC_LBL_MOUSE_SPEED,  16, 218, 170,  22);
-    mv(IDC_TB_MOUSE_SPEED,  190, 216, 304,  26);
-    mv(IDC_VAL_MOUSE_SPEED, 500, 218,  64,  22);
+    // Tab 0: Uebersicht
+    // Card 1: Schnellsteuerung (16, 186, 548, 168)
+    mv(IDC_CHK_FULLSCR,      30, 196, 520, 26);
+    mv(IDC_CHK_CLIPBOARD,    30, 225, 520, 26);
+    mv(IDC_CHK_KVM,          30, 254, 520, 26);
+    mv(IDC_LBL_MOUSE_SPEED,  30, 287, 164, 22, g_boldFont);
+    mv(IDC_TB_MOUSE_SPEED,  198, 285, 290, 26);
+    mv(IDC_VAL_MOUSE_SPEED, 492, 287,  58, 22, g_boldFont);
+    mv(IDC_LBL_SCROLL_SPEED, 30, 318, 164, 22, g_boldFont);
+    mv(IDC_TB_SCROLL_SPEED, 198, 316, 290, 26);
+    mv(IDC_VAL_SCROLL_SPEED,492, 318,  58, 22, g_boldFont);
 
-    mv(IDC_LBL_SCROLL_SPEED, 16, 248, 170,  22);
-    mv(IDC_TB_SCROLL_SPEED, 190, 246, 304,  26);
-    mv(IDC_VAL_SCROLL_SPEED,500, 248,  64,  22);
+    // Card 2: Live-Stream-Daten (16, 366, 548, 278)
+    mv(IDC_LBL_TELEMETRY,    30, 378, 520, 20, g_boldFont);
+    mv(IDC_STATS_TEXT,       28, 402, 524, 230, g_monoFont);
 
-    mv(IDC_BTN_DISCONN,      16, 280, 268,  30);
-    mv(IDC_BTN_SHOW_STREAMS, 296,280, 268,  30);
+    // Tab 1: Dateitransfer
+    // Drop Zone Card (16, 186, 548, 146)
+    mv(IDC_DROP_TITLE,       32, 236, 516, 24, g_titleFont);
+    mv(IDC_DROP_SUB,         32, 264, 516, 20);
+    // Transfer Action Card (16, 344, 548, 134)
+    mv(IDC_BTN_SENDFILE,     30, 360, 168, 32);
+    mv(IDC_BTN_SENDFOLDER,  206, 360, 168, 32);
+    mv(IDC_BTN_OPEN_DL,     382, 360, 168, 32);
+    mv(IDC_FILE_PROGRESS,    30, 406, 412, 22);
+    mv(IDC_BTN_CANCELFILE,  450, 404, 100, 26);
+    mv(IDC_FILE_STATUS,      30, 438, 520, 20);
 
-    mv(IDC_BTN_COLORS,       16, 316, 268,  28);
-    mv(IDC_BTN_TRUSTED,      296,316, 268,  28);
+    // Tab 2: Einstellungen
+    // Card 1: App & Autostart (16, 186, 548, 82)
+    mv(IDC_CHK_AUTOSTART,    30, 200, 520, 26);
+    mv(IDC_CHK_AUTOUPDATE,   30, 230, 520, 26);
 
-    mv(IDC_BTN_FIREWALL,     16, 350, 268,  28);
-    mv(IDC_BTN_UPDATE,       296,350, 268,  28);
-
-    mv(IDC_BTN_SENDFILE,     16, 386, 176,  28);
-    mv(IDC_BTN_SENDFOLDER,   202,386, 176,  28);
-    mv(IDC_BTN_OPEN_DL,      388,386, 176,  28);
-
-    mv(IDC_FILE_PROGRESS,    16, 420, 434,  20);
-    mv(IDC_BTN_CANCELFILE,   458,418, 106,  24);
-    mv(IDC_FILE_STATUS,      16, 444, 548,  18);
-
-    mv(IDC_STATS_TEXT,       16, 468, 548, 200, g_monoFont);
+    // Card 2: Werkzeuge & Sicherheit (16, 280, 548, 106)
+    mv(IDC_BTN_COLORS,       30, 296, 256, 34);
+    mv(IDC_BTN_TRUSTED,     294, 296, 256, 34);
+    mv(IDC_BTN_FIREWALL,     30, 338, 256, 34);
+    mv(IDC_BTN_UPDATE,      294, 338, 256, 34);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -1219,31 +1424,30 @@ void CreateUiControls(HWND hwnd) {
                                GetModuleHandleW(nullptr), nullptr);
     };
 
+    // Hero
+    addCtrl(L"STATIC", L"Bereit — Warte auf Surface", SS_ENDELLIPSIS, IDC_HERO_TITLE);
     addCtrl(L"STATIC", L"Initialisiere...", 0, IDC_INFO_LABEL);
+    addCtrl(L"BUTTON", L"Aktive Session trennen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_DISCONN);
+    addCtrl(L"BUTTON", L"Streamfenster einblenden", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SHOW_STREAMS);
 
-    HWND chk = addCtrl(L"BUTTON", L"Streams direkt im randlosen Vollbild auf PC-Monitoren oeffnen (F11 zum Umschalten)",
-                       BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CHK_FULLSCR);
-    SendMessageW(chk, BM_SETCHECK, LoadBoolPref(L"StartFullscreen", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
+    // Tabs
+    addCtrl(L"BUTTON", L"Uebersicht", BS_OWNERDRAW | WS_TABSTOP, IDC_TAB_OVERVIEW);
+    addCtrl(L"BUTTON", L"Dateitransfer", BS_OWNERDRAW | WS_TABSTOP, IDC_TAB_TRANSFER);
+    addCtrl(L"BUTTON", L"Einstellungen", BS_OWNERDRAW | WS_TABSTOP, IDC_TAB_SETTINGS);
 
-    HWND chkClip = addCtrl(L"BUTTON", L"Geteilte Zwischenablage (Text && Bilder zwischen Surface <-> PC)",
-                           BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CHK_CLIPBOARD);
+    // Tab 0: Uebersicht
+    HWND chk = addCtrl(L"BUTTON", L"Streams im randlosen Vollbild starten (F11)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_FULLSCR);
+    SetToggleChecked(hwnd, IDC_CHK_FULLSCR, LoadBoolPref(L"StartFullscreen", 1));
+
+    HWND chkClip = addCtrl(L"BUTTON", L"Geteilte Zwischenablage (Text & Bilder)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_CLIPBOARD);
     bool clipPref = LoadBoolPref(L"ClipboardSync", 1);
-    SendMessageW(chkClip, BM_SETCHECK, clipPref ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetToggleChecked(hwnd, IDC_CHK_CLIPBOARD, clipPref);
     if (g_engine) g_engine->SetClipboardEnabled(clipPref);
 
-    HWND chkKvm = addCtrl(L"BUTTON", L"KVM: Maus && Tastatur ans Surface senden (Strg+Alt+K im Streamfenster)",
-                          BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CHK_KVM);
+    HWND chkKvm = addCtrl(L"BUTTON", L"KVM: Maus & Tastatur ans Surface (Strg+Alt+K)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_KVM);
     bool kvmPref = LoadBoolPref(L"KvmEnabled", 1);
-    SendMessageW(chkKvm, BM_SETCHECK, kvmPref ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetToggleChecked(hwnd, IDC_CHK_KVM, kvmPref);
     if (g_engine) g_engine->SetKvmEnabled(kvmPref);
-
-    HWND chkAuto = addCtrl(L"BUTTON", L"Mit Windows starten (minimiert im System-Tray, Task-Manager Autostart)",
-                           BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CHK_AUTOSTART);
-    SendMessageW(chkAuto, BM_SETCHECK, s2p::IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
-
-    HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start automatisch auf GitHub nach Updates suchen",
-                          BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CHK_AUTOUPDATE);
-    SendMessageW(chkUpd, BM_SETCHECK, LoadBoolPref(L"AutoUpdateCheck", 1) ? BST_CHECKED : BST_UNCHECKED, 0);
 
     addCtrl(L"STATIC", L"Maus-Tempo (KVM):", SS_CENTERIMAGE, IDC_LBL_MOUSE_SPEED);
     HWND tbMouse = addCtrl(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP, IDC_TB_MOUSE_SPEED);
@@ -1265,27 +1469,40 @@ void CreateUiControls(HWND hwnd) {
     addCtrl(L"STATIC", (std::to_wstring(scrollPct) + L" %").c_str(), SS_RIGHT | SS_CENTERIMAGE, IDC_VAL_SCROLL_SPEED);
     if (g_engine) g_engine->SetKvmScrollSpeedPct(scrollPct);
 
-    addCtrl(L"BUTTON", L"Aktive Session trennen", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_DISCONN);
-    addCtrl(L"BUTTON", L"Streamfenster wieder einblenden", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_SHOW_STREAMS);
-
-    addCtrl(L"BUTTON", L"Farbe & HDR pro Monitor...", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_COLORS);
-    addCtrl(L"BUTTON", L"Vertraute Geraete...", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_TRUSTED);
-
-    addCtrl(L"BUTTON", L"Firewall Ports freigeben (Admin)", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_FIREWALL);
-    addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_UPDATE);
-
-    addCtrl(L"BUTTON", L"Datei(en) senden...", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_SENDFILE);
-    addCtrl(L"BUTTON", L"Ordner senden...", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_SENDFOLDER);
-    addCtrl(L"BUTTON", L"Downloads\\Screen2PC", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_OPEN_DL);
-
-    HWND prog = addCtrl(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_FILE_PROGRESS);
-    SendMessageW(prog, PBM_SETRANGE32, 0, 1000);
-    addCtrl(L"BUTTON", L"Abbrechen", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_CANCELFILE);
-    addCtrl(L"STATIC", L"Dateitransfer: Bereit", SS_ENDELLIPSIS, IDC_FILE_STATUS);
-
+    addCtrl(L"STATIC", L"Live-Stream-Daten (FPS, Decode-Latenz, Mbit/s)", 0, IDC_LBL_TELEMETRY);
     addCtrl(L"EDIT", L"", WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL, IDC_STATS_TEXT);
 
+    // Tab 1: Dateitransfer
+    addCtrl(L"STATIC", L"Dateien oder Ordner hierher ziehen", SS_CENTER, IDC_DROP_TITLE);
+    addCtrl(L"STATIC", L"Werden direkt ans verbundene Surface gesendet", SS_CENTER, IDC_DROP_SUB);
+    addCtrl(L"BUTTON", L"Datei(en) senden...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SENDFILE);
+    addCtrl(L"BUTTON", L"Ordner senden...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SENDFOLDER);
+    addCtrl(L"BUTTON", L"Downloads oeffnen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_OPEN_DL);
+    HWND prog = addCtrl(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_FILE_PROGRESS);
+    SendMessageW(prog, PBM_SETRANGE32, 0, 1000);
+    addCtrl(L"BUTTON", L"Abbrechen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_CANCELFILE);
+    addCtrl(L"STATIC", L"Dateitransfer: Bereit", SS_ENDELLIPSIS, IDC_FILE_STATUS);
+
+    // Tab 2: Einstellungen
+    HWND chkAuto = addCtrl(L"BUTTON", L"Mit Windows starten (System-Tray)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_AUTOSTART);
+    SetToggleChecked(hwnd, IDC_CHK_AUTOSTART, s2p::IsAutostartEnabled());
+
+    HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start auf GitHub-Updates pruefen", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_AUTOUPDATE);
+    SetToggleChecked(hwnd, IDC_CHK_AUTOUPDATE, LoadBoolPref(L"AutoUpdateCheck", 1));
+
+    addCtrl(L"BUTTON", L"Farbe & HDR pro Monitor...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_COLORS);
+    addCtrl(L"BUTTON", L"Vertraute Geraete...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_TRUSTED);
+    addCtrl(L"BUTTON", L"Firewall-Ports oeffnen (Admin)", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_FIREWALL);
+    addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_UPDATE);
+
+    g_tooltip = s2p::ui::CreateTooltipWindow(hwnd);
+    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chk, L"Oeffnet Streamfenster direkt im randlosen Vollbild (F11 zum Umschalten).");
+    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkKvm, L"Aktiviert Maus- und Tastatursteuerung des Surface direkt im Streamfenster (Strg+Alt+K).");
+    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkAuto, L"Startet Screen2PC Receiver minimiert im System-Tray (Task-Manager Autostart).");
+
     LayoutMainControls(hwnd, GetWindowDpiSafe(hwnd));
+    ApplyReceiverTheme(hwnd, s2p::ui::IsSystemDarkMode());
+    ApplyReceiverTabVisibility(hwnd);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -1341,10 +1558,95 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_ACTIVATE:
         if (LOWORD(wp) != WA_INACTIVE) {
-            SendDlgItemMessageW(hwnd, IDC_CHK_AUTOSTART, BM_SETCHECK,
-                                s2p::IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+            SetToggleChecked(hwnd, IDC_CHK_AUTOSTART, s2p::IsAutostartEnabled());
         }
         break;
+
+    case WM_SETTINGCHANGE:
+        if (lp && wcscmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
+            ApplyReceiverTheme(hwnd, s2p::ui::IsSystemDarkMode());
+        }
+        break;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT clientRc{};
+        GetClientRect(hwnd, &clientRc);
+        if (g_theme.brushWindow) {
+            FillRect(hdc, &clientRc, g_theme.brushWindow);
+        }
+        auto scRect = [&](int x, int y, int w, int h) -> RECT {
+            return RECT{ DpiScale(x, g_currentDpi), DpiScale(y, g_currentDpi),
+                         DpiScale(x + w, g_currentDpi), DpiScale(y + h, g_currentDpi) };
+        };
+
+        // Hero Card
+        s2p::ui::DrawCard(hdc, scRect(16, 12, 548, 122), g_theme, g_currentDpi);
+        s2p::ui::DrawStatusDot(hdc, DpiScale(31, g_currentDpi), DpiScale(31, g_currentDpi),
+                               std::max(4, DpiScale(5, g_currentDpi)),
+                               g_theme.ToneColor(g_heroTone), g_theme.bgCard);
+
+        if (g_activeTab == 0) {
+            s2p::ui::DrawCard(hdc, scRect(16, 186, 548, 168), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 366, 548, 278), g_theme, g_currentDpi);
+        } else if (g_activeTab == 1) {
+            s2p::ui::DrawCard(hdc, scRect(16, 186, 548, 146), g_theme, g_currentDpi, true);
+            s2p::ui::DrawCard(hdc, scRect(16, 344, 548, 134), g_theme, g_currentDpi);
+        } else if (g_activeTab == 2) {
+            s2p::ui::DrawCard(hdc, scRect(16, 186, 548, 82), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 280, 548, 106), g_theme, g_currentDpi);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLORDLG: {
+        bool inCard = false;
+        if (msg == WM_CTLCOLORSTATIC && lp) {
+            inCard = IsReceiverCardControlId(GetDlgCtrlID(reinterpret_cast<HWND>(lp)));
+        }
+        return s2p::ui::HandleCtlColor(msg, wp, g_theme, inCard);
+    }
+
+    case WM_DRAWITEM: {
+        const auto* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
+        if (!dis || dis->CtlType != ODT_BUTTON) break;
+        const int id = static_cast<int>(dis->CtlID);
+        if (id == IDC_TAB_OVERVIEW || id == IDC_TAB_TRANSFER || id == IDC_TAB_SETTINGS) {
+            bool active = (id == IDC_TAB_OVERVIEW && g_activeTab == 0) ||
+                          (id == IDC_TAB_TRANSFER && g_activeTab == 1) ||
+                          (id == IDC_TAB_SETTINGS && g_activeTab == 2);
+            s2p::ui::DrawModernButton(dis, g_theme,
+                                      active ? s2p::ui::ButtonStyle::TabActive : s2p::ui::ButtonStyle::TabInactive,
+                                      g_currentDpi);
+            return TRUE;
+        }
+        if (id == IDC_BTN_DISCONN) {
+            s2p::ui::DrawModernButton(dis, g_theme, s2p::ui::ButtonStyle::Danger, g_currentDpi);
+            return TRUE;
+        }
+        if (id == IDC_BTN_SHOW_STREAMS) {
+            bool hidden = g_engine && g_engine->HasHiddenStreamWindows();
+            s2p::ui::DrawModernButton(dis, g_theme,
+                                      hidden ? s2p::ui::ButtonStyle::Primary : s2p::ui::ButtonStyle::Secondary,
+                                      g_currentDpi);
+            return TRUE;
+        }
+        if (id == IDC_CHK_FULLSCR || id == IDC_CHK_CLIPBOARD || id == IDC_CHK_KVM ||
+            id == IDC_CHK_AUTOSTART || id == IDC_CHK_AUTOUPDATE) {
+            s2p::ui::DrawToggleSwitch(dis, g_theme, IsToggleChecked(hwnd, id), g_currentDpi);
+            return TRUE;
+        }
+        s2p::ui::DrawModernButton(dis, g_theme, s2p::ui::ButtonStyle::Secondary, g_currentDpi);
+        return TRUE;
+    }
 
     case WM_DISPLAYCHANGE:
         if (g_engine) {
@@ -1381,39 +1683,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDC_CHK_FULLSCR:
-            if (g_engine) {
-                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_FULLSCR, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                g_engine->SetStartFullscreen(checked);
-                SaveBoolPref(L"StartFullscreen", checked);
-            }
+        case IDC_TAB_OVERVIEW:
+            g_activeTab = 0;
+            ApplyReceiverTabVisibility(hwnd);
             return 0;
-        case IDC_CHK_CLIPBOARD:
-            if (g_engine) {
-                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_CLIPBOARD, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                g_engine->SetClipboardEnabled(checked);
-                SaveBoolPref(L"ClipboardSync", checked);
-            }
+        case IDC_TAB_TRANSFER:
+            g_activeTab = 1;
+            ApplyReceiverTabVisibility(hwnd);
             return 0;
-        case IDC_CHK_KVM:
-            if (g_engine) {
-                bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_KVM, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                g_engine->SetKvmEnabled(checked);
-                SaveBoolPref(L"KvmEnabled", checked);
-            }
+        case IDC_TAB_SETTINGS:
+            g_activeTab = 2;
+            ApplyReceiverTabVisibility(hwnd);
             return 0;
+        case IDC_CHK_FULLSCR: {
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_FULLSCR);
+            if (g_engine) g_engine->SetStartFullscreen(checked);
+            SaveBoolPref(L"StartFullscreen", checked);
+            return 0;
+        }
+        case IDC_CHK_CLIPBOARD: {
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_CLIPBOARD);
+            if (g_engine) g_engine->SetClipboardEnabled(checked);
+            SaveBoolPref(L"ClipboardSync", checked);
+            return 0;
+        }
+        case IDC_CHK_KVM: {
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_KVM);
+            if (g_engine) g_engine->SetKvmEnabled(checked);
+            SaveBoolPref(L"KvmEnabled", checked);
+            return 0;
+        }
         case IDC_CHK_AUTOSTART: {
-            bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_AUTOSTART, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_AUTOSTART);
             if (!s2p::SetAutostartEnabled(checked)) {
-                SendDlgItemMessageW(hwnd, IDC_CHK_AUTOSTART, BM_SETCHECK,
-                                    s2p::IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+                SetToggleChecked(hwnd, IDC_CHK_AUTOSTART, s2p::IsAutostartEnabled());
                 MessageBoxW(hwnd, L"Autostart-Eintrag in der Registry konnte nicht geschrieben werden.",
                             L"Screen2PC Receiver", MB_ICONWARNING);
             }
             return 0;
         }
         case IDC_CHK_AUTOUPDATE: {
-            bool checked = SendDlgItemMessageW(hwnd, IDC_CHK_AUTOUPDATE, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_AUTOUPDATE);
             SaveBoolPref(L"AutoUpdateCheck", checked);
             return 0;
         }
@@ -1654,7 +1964,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_disconnThread.joinable()) g_disconnThread.join();
         if (g_updateThread.joinable()) g_updateThread.join();
         if (g_font) { DeleteObject(g_font); g_font = nullptr; }
+        if (g_boldFont) { DeleteObject(g_boldFont); g_boldFont = nullptr; }
+        if (g_titleFont) { DeleteObject(g_titleFont); g_titleFont = nullptr; }
         if (g_monoFont) { DeleteObject(g_monoFont); g_monoFont = nullptr; }
+        g_theme.Destroy();
         PostQuitMessage(0);
         return 0;
     }
@@ -1763,7 +2076,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     wc.hIcon = s2p::LoadAppLargeIcon(hInst);
     wc.hIconSm = s2p::LoadAppSmallIcon(hInst);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = L"Screen2PCReceiverWnd";
     RegisterClassExW(&wc);
 

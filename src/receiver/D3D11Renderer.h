@@ -119,6 +119,10 @@ public:
     bool IsMonitorHdr() const { return m_monitorIsHdr; }
     float OsSdrWhiteScale() const { return m_osSdrWhiteScale; }
 
+    void SetHudStats(double fps, double mbps, double latencyMs, const std::wstring& codecLabel);
+    void SetHudVisible(bool visible);
+    bool IsHudVisible() const { return m_hudVisible.load(std::memory_order_relaxed); }
+
     void ToggleFullscreen();
     void SetFullscreen(bool fullscreen);
     void PumpMessages();
@@ -188,6 +192,7 @@ private:
                              uint32_t pitch,
                              const uint8_t* data,
                              size_t dataSize);
+    void UpdateHudTextureIfNeeded();
 
     uint32_t m_monitorIndex = 0;
     RECT m_targetRect{};
@@ -272,6 +277,27 @@ private:
     uint32_t m_cursorHotY = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_cursorTex;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_cursorSrv;
+
+    // In-Stream Quick-HUD overlay (always-visible FPS/Latency/Bitrate + hover actions)
+    struct HudStats {
+        double fps = 0.0;
+        double mbps = 0.0;
+        double latencyMs = 0.0;
+        std::wstring codecLabel;
+    };
+    std::mutex m_hudMutex;
+    HudStats m_hudStats;
+    std::atomic<bool> m_hudVisible{true};
+    bool m_hudHovered = false;
+    int m_hudHoverBtn = -1;
+    RECT m_hudRect{};
+    RECT m_hudBtnRects[3]{};
+    std::wstring m_hudLastKey;
+    uint32_t m_hudTexW = 0;
+    uint32_t m_hudTexH = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_hudTex;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_hudSrv;
+
     FileDropCallback m_fileDropCb;
     KvmMouseCallback m_kvmMouseCb;
     KvmKeyCallback m_kvmKeyCb;

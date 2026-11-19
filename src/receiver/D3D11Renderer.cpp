@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 
 #pragma comment(lib, "d3d11.lib")
@@ -595,6 +597,9 @@ void D3D11Renderer::Destroy() {
         }
         m_cursorSrv.Reset();
         m_cursorTex.Reset();
+        m_hudSrv.Reset();
+        m_hudTex.Reset();
+        m_hudLastKey.clear();
         m_nv12UvSrv.Reset();
         m_nv12YSrv.Reset();
         m_nv12Tex.Reset();
@@ -1258,6 +1263,234 @@ void D3D11Renderer::UpdateCursorTexture(uint8_t shapeType,
     }
 }
 
+void D3D11Renderer::SetHudStats(double fps, double mbps, double latencyMs, const std::wstring& codecLabel) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(m_hudMutex);
+        if (std::abs(m_hudStats.fps - fps) >= 0.05 ||
+            std::abs(m_hudStats.mbps - mbps) >= 0.05 ||
+            std::abs(m_hudStats.latencyMs - latencyMs) >= 0.05 ||
+            m_hudStats.codecLabel != codecLabel) {
+            m_hudStats.fps = fps;
+            m_hudStats.mbps = mbps;
+            m_hudStats.latencyMs = latencyMs;
+            m_hudStats.codecLabel = codecLabel;
+            changed = true;
+        }
+    }
+    if (changed && m_hudVisible.load(std::memory_order_relaxed)) {
+        m_needRepaint.store(true, std::memory_order_release);
+        SignalWake();
+    }
+}
+
+void D3D11Renderer::SetHudVisible(bool visible) {
+    bool prev = m_hudVisible.exchange(visible, std::memory_order_relaxed);
+    if (prev != visible) {
+        m_needRepaint.store(true, std::memory_order_release);
+        SignalWake();
+    }
+}
+
+void D3D11Renderer::UpdateHudTextureIfNeeded() {
+    if (!m_device || !m_context || !m_hudVisible.load(std::memory_order_relaxed) || m_winWidth < 240 || m_winHeight < 120) {
+        return;
+    }
+
+    HudStats stats{};
+    {
+        std::lock_guard<std::mutex> lock(m_hudMutex);
+        stats = m_hudStats;
+    }
+
+    UINT dpi = m_hwnd ? GetDpiForWindow(m_hwnd) : 96;
+    if (dpi < 72) dpi = 96;
+
+    std::wostringstream ss;
+    ss << std::fixed << std::setprecision(1) << stats.fps << L" FPS  |  "
+       << std::setprecision(1) << stats.latencyMs << L" ms  |  "
+       << std::setprecision(1) << stats.mbps << L" Mbit/s";
+    if (!stats.codecLabel.empty()) {
+        ss << L"  |  " << stats.codecLabel;
+    }
+    ss << L"  |  KVM: " << (!m_kvmEnabled ? L"AUS" : (m_kvmCaptured ? L"AKTIV" : L"BEREIT"));
+
+    const std::wstring text = ss.str();
+    const bool showActions = (m_hudHovered && !m_kvmCaptured);
+
+    std::wostringstream keySs;
+    keySs << text << L"#" << (showActions ? 1 : 0) << L"#" << m_hudHoverBtn
+          << L"#" << (m_fullscreen ? 1 : 0) << L"#" << (m_kvmEnabled ? 1 : 0) << L"#" << dpi;
+    const std::wstring key = keySs.str();
+
+    // Update m_hudRect position even if texture content didn't change
+    auto sc = [&](int px) -> int { return MulDiv(px, static_cast<int>(dpi), 96); };
+
+    if (key == m_hudLastKey && m_hudSrv && m_hudTexW > 0 && m_hudTexH > 0) {
+        int left = (static_cast<int>(m_winWidth) - static_cast<int>(m_hudTexW)) / 2;
+        int top = sc(10);
+        m_hudRect = RECT{ left, top, left + static_cast<int>(m_hudTexW), top + static_cast<int>(m_hudTexH) };
+        return;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    HDC memDc = CreateCompatibleDC(screenDc);
+    HFONT font = CreateFontW(-sc(13), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    HGDIOBJ oldFont = SelectObject(memDc, font);
+
+    SIZE txtSz{};
+    GetTextExtentPoint32W(memDc, text.c_str(), static_cast<int>(text.size()), &txtSz);
+
+    const int padX = sc(14);
+    const int dotArea = sc(16);
+    const int pillH = sc(30);
+    const int btnGap = sc(6);
+    const int btnW[3] = { sc(48), sc(68), sc(84) };
+    const wchar_t* btnLbl[3] = { L"KVM", m_fullscreen ? L"Fenster" : L"Vollbild", L"Ausblenden" };
+
+    int actionsW = 0;
+    if (showActions) {
+        actionsW = sc(10) + btnW[0] + btnGap + btnW[1] + btnGap + btnW[2];
+    }
+
+    int pillW = std::min<int>(static_cast<int>(m_winWidth) - sc(20),
+                              padX + dotArea + txtSz.cx + actionsW + padX);
+    if (pillW < sc(160)) pillW = sc(160);
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = pillW;
+    bmi.bmiHeader.biHeight = -pillH; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(memDc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) {
+        SelectObject(memDc, oldFont);
+        DeleteObject(font);
+        DeleteDC(memDc);
+        ReleaseDC(nullptr, screenDc);
+        return;
+    }
+
+    std::memset(bits, 0, static_cast<size_t>(pillW) * pillH * 4);
+    HGDIOBJ oldBmp = SelectObject(memDc, dib);
+
+    // Draw rounded pill background (non-zero RGB so alpha pass distinguishes inside vs outside)
+    HBRUSH bgBr = CreateSolidBrush(RGB(20, 22, 28));
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(68, 72, 88));
+    HGDIOBJ ob = SelectObject(memDc, bgBr);
+    HGDIOBJ op = SelectObject(memDc, borderPen);
+    RoundRect(memDc, 0, 0, pillW, pillH, pillH, pillH);
+    SelectObject(memDc, op);
+    SelectObject(memDc, ob);
+    DeleteObject(borderPen);
+    DeleteObject(bgBr);
+
+    // Status dot
+    COLORREF dotCol = (stats.fps >= 1.0) ? RGB(34, 197, 94) : RGB(245, 158, 11);
+    int dotR = std::max(3, sc(4));
+    int dotCx = padX + dotR;
+    int dotCy = pillH / 2;
+    HBRUSH dotBr = CreateSolidBrush(dotCol);
+    HPEN dotPen = CreatePen(PS_SOLID, 1, dotCol);
+    ob = SelectObject(memDc, dotBr);
+    op = SelectObject(memDc, dotPen);
+    Ellipse(memDc, dotCx - dotR, dotCy - dotR, dotCx + dotR, dotCy + dotR);
+    SelectObject(memDc, op);
+    SelectObject(memDc, ob);
+    DeleteObject(dotPen);
+    DeleteObject(dotBr);
+
+    // Stats text
+    SetBkMode(memDc, TRANSPARENT);
+    SetTextColor(memDc, RGB(240, 242, 248));
+    RECT txtRc{ padX + dotArea, 0, pillW - padX - actionsW, pillH };
+    DrawTextW(memDc, text.c_str(), -1, &txtRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    int left = (static_cast<int>(m_winWidth) - pillW) / 2;
+    int top = sc(10);
+    m_hudRect = RECT{ left, top, left + pillW, top + pillH };
+    for (int i = 0; i < 3; ++i) m_hudBtnRects[i] = RECT{};
+
+    if (showActions) {
+        int bx = pillW - padX - (btnW[0] + btnGap + btnW[1] + btnGap + btnW[2]);
+        int bh = pillH - sc(8);
+        int by = sc(4);
+        for (int i = 0; i < 3; ++i) {
+            RECT brc{ bx, by, bx + btnW[i], by + bh };
+            COLORREF bFill = (m_hudHoverBtn == i) ? RGB(59, 130, 246) : RGB(44, 48, 60);
+            HBRUSH bBr = CreateSolidBrush(bFill);
+            HPEN bPen = CreatePen(PS_SOLID, 1, RGB(84, 90, 110));
+            ob = SelectObject(memDc, bBr);
+            op = SelectObject(memDc, bPen);
+            RoundRect(memDc, brc.left, brc.top, brc.right, brc.bottom, sc(6), sc(6));
+            SelectObject(memDc, op);
+            SelectObject(memDc, ob);
+            DeleteObject(bPen);
+            DeleteObject(bBr);
+
+            SetTextColor(memDc, RGB(248, 250, 252));
+            DrawTextW(memDc, btnLbl[i], -1, &brc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            m_hudBtnRects[i] = RECT{ left + brc.left, top + brc.top, left + brc.right, top + brc.bottom };
+            bx += btnW[i] + btnGap;
+        }
+    }
+
+    GdiFlush();
+    auto* px = static_cast<uint32_t*>(bits);
+    const size_t totalPx = static_cast<size_t>(pillW) * pillH;
+    for (size_t i = 0; i < totalPx; ++i) {
+        uint32_t c = px[i] & 0x00FFFFFFu;
+        if (c != 0) {
+            // Pill background is RGB(20,22,28); make background semi-transparent (~85%) and text/dots nearly opaque
+            uint32_t r = (c >> 16) & 0xFFu;
+            uint32_t g = (c >> 8) & 0xFFu;
+            uint32_t b = c & 0xFFu;
+            uint32_t alpha = (r <= 24 && g <= 26 && b <= 32) ? 0xD8u : 0xF6u;
+            px[i] = (alpha << 24) | c;
+        }
+    }
+
+    if (!m_hudTex || m_hudTexW != static_cast<uint32_t>(pillW) || m_hudTexH != static_cast<uint32_t>(pillH)) {
+        m_hudSrv.Reset();
+        m_hudTex.Reset();
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = static_cast<UINT>(pillW);
+        td.Height = static_cast<UINT>(pillH);
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{};
+        init.pSysMem = bits;
+        init.SysMemPitch = static_cast<UINT>(pillW * 4);
+        if (SUCCEEDED(m_device->CreateTexture2D(&td, &init, &m_hudTex))) {
+            m_device->CreateShaderResourceView(m_hudTex.Get(), nullptr, &m_hudSrv);
+            m_hudTexW = static_cast<uint32_t>(pillW);
+            m_hudTexH = static_cast<uint32_t>(pillH);
+        }
+    } else {
+        m_context->UpdateSubresource(m_hudTex.Get(), 0, nullptr, bits, static_cast<UINT>(pillW * 4), 0);
+    }
+
+    m_hudLastKey = key;
+
+    SelectObject(memDc, oldBmp);
+    DeleteObject(dib);
+    SelectObject(memDc, oldFont);
+    DeleteObject(font);
+    DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+}
+
 void D3D11Renderer::SetFullscreen(bool fullscreen) {
     if (!m_hwnd || m_fullscreen == fullscreen) return;
     m_fullscreen = fullscreen;
@@ -1460,6 +1693,17 @@ void D3D11Renderer::Present() {
             drawQuad(offX + cx * drawW, offY - cy * drawH, cw * drawW, ch * drawH, m_cursorSrv.Get(), true, true);
         }
 
+        if (m_hudVisible.load(std::memory_order_relaxed) && m_winWidth > 0 && m_winHeight > 0) {
+            UpdateHudTextureIfNeeded();
+            if (m_hudSrv && m_hudTexW > 0 && m_hudTexH > 0) {
+                float hx = -1.0f + (2.0f * static_cast<float>(m_hudRect.left)) / static_cast<float>(m_winWidth);
+                float hy = 1.0f - (2.0f * static_cast<float>(m_hudRect.top)) / static_cast<float>(m_winHeight);
+                float hw = (2.0f * static_cast<float>(m_hudTexW)) / static_cast<float>(m_winWidth);
+                float hh = (2.0f * static_cast<float>(m_hudTexH)) / static_cast<float>(m_winHeight);
+                drawQuad(hx, hy, hw, hh, m_hudSrv.Get(), true, true);
+            }
+        }
+
         scToPresent = m_swapChain;
         if (m_allowTearing && m_useTearingOnPresent) {
             presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
@@ -1502,6 +1746,9 @@ bool D3D11Renderer::RecreateDeviceAndResources() {
     }
     m_cursorSrv.Reset();
     m_cursorTex.Reset();
+    m_hudSrv.Reset();
+    m_hudTex.Reset();
+    m_hudLastKey.clear();
     m_nv12UvSrv.Reset();
     m_nv12YSrv.Reset();
     m_nv12Tex.Reset();
@@ -1695,6 +1942,11 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             }
             return 0;
         }
+        if ((GetKeyState(VK_CONTROL) < 0) && (GetKeyState(VK_MENU) < 0) && wp == 'H' && ((lp & (1 << 30)) == 0)) {
+            m_suppressKeyUpMask = 0x7;
+            SetHudVisible(!m_hudVisible.load(std::memory_order_relaxed));
+            return 0;
+        }
         if (msg == WM_SYSKEYDOWN && wp == VK_F4) {
             break;
         }
@@ -1746,17 +1998,65 @@ LRESULT D3D11Renderer::HandleMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         }
         break;
     }
-    case WM_MOUSEMOVE:
-        EmitMouseEvent(kMouseMove, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+    case WM_MOUSEMOVE: {
+        int mx = static_cast<int16_t>(LOWORD(lp));
+        int my = static_cast<int16_t>(HIWORD(lp));
+        if (!m_kvmCaptured && m_hudVisible.load(std::memory_order_relaxed)) {
+            RECT hitRc = m_hudRect;
+            InflateRect(&hitRc, 8, 8);
+            bool inHud = PtInRect(&hitRc, POINT{ mx, my }) != FALSE;
+            int hoverBtn = -1;
+            if (inHud) {
+                for (int i = 0; i < 3; ++i) {
+                    if (PtInRect(&m_hudBtnRects[i], POINT{ mx, my })) {
+                        hoverBtn = i;
+                        break;
+                    }
+                }
+            }
+            if (inHud != m_hudHovered || hoverBtn != m_hudHoverBtn) {
+                m_hudHovered = inHud;
+                m_hudHoverBtn = hoverBtn;
+                m_needRepaint.store(true);
+                SignalWake();
+            }
+        } else if (m_hudHovered || m_hudHoverBtn != -1) {
+            m_hudHovered = false;
+            m_hudHoverBtn = -1;
+            m_needRepaint.store(true);
+            SignalWake();
+        }
+        EmitMouseEvent(kMouseMove, mx, my);
         break;
-    case WM_LBUTTONDOWN:
+    }
+    case WM_LBUTTONDOWN: {
+        int mx = static_cast<int16_t>(LOWORD(lp));
+        int my = static_cast<int16_t>(HIWORD(lp));
+        if (!m_kvmCaptured && m_hudVisible.load(std::memory_order_relaxed) && m_hudHovered) {
+            for (int i = 0; i < 3; ++i) {
+                if (PtInRect(&m_hudBtnRects[i], POINT{ mx, my })) {
+                    if (i == 0) {
+                        bool enabling = !m_kvmEnabled;
+                        m_escReleasedCapture = false;
+                        SetKvmEnabled(enabling);
+                        if (m_kvmToggleCb) m_kvmToggleCb(enabling);
+                    } else if (i == 1) {
+                        ToggleFullscreen();
+                    } else if (i == 2) {
+                        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    }
+                    return 0;
+                }
+            }
+        }
         if (GetFocus() != hwnd) {
             SetForegroundWindow(hwnd);
             SetFocus(hwnd);
         }
         SetCapture(hwnd);
-        EmitMouseEvent(kMouseLeftDown, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));
+        EmitMouseEvent(kMouseLeftDown, mx, my);
         return 0;
+    }
     case WM_LBUTTONUP:
         if (GetCapture() == hwnd) ReleaseCapture();
         EmitMouseEvent(kMouseLeftUp, static_cast<int16_t>(LOWORD(lp)), static_cast<int16_t>(HIWORD(lp)));

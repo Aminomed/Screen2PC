@@ -75,6 +75,7 @@
     <ClInclude Include="ColorProfile.h" />
     <ClInclude Include="Pairing.h" />
     <ClInclude Include="Updater.h" />
+    <ClInclude Include="UiTheme.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Logger.cpp" />
@@ -88,6 +89,7 @@
     <ClCompile Include="ColorProfile.cpp" />
     <ClCompile Include="Pairing.cpp" />
     <ClCompile Include="Updater.cpp" />
+    <ClCompile Include="UiTheme.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

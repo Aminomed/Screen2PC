@@ -1205,6 +1205,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                             w->stats.hardwareDxva = isDxva;
                             w->stats.directNv12Active = isDirectNv12;
                             w->stats.avgDecodeMs = windowDecodeCount > 0 ? (windowDecodeMsSum / static_cast<double>(windowDecodeCount)) : 0.0;
+                            renderer.SetHudStats(w->stats.fps, w->stats.mbps, w->stats.avgDecodeMs, w->stats.codecName);
                             windowStart = now;
                             windowFrames = 0;
                             windowBytes = 0;
