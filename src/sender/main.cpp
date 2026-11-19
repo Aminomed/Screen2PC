@@ -2139,7 +2139,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     AdjustWindowRectExForDpi(&wr, style, FALSE, 0, sysDpi);
 
     g_hwnd = CreateWindowExW(
-        0, wc.lpszClassName, title.c_str(),
+        WS_EX_COMPOSITED, wc.lpszClassName, title.c_str(),
         style,
         CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
         nullptr, nullptr, hInst, nullptr);

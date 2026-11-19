@@ -72,4 +72,37 @@ void DrawToggleSwitch(const DRAWITEMSTRUCT* dis, const ThemePalette& pal, bool c
 HWND CreateTooltipWindow(HWND owner);
 void SetControlTooltip(HWND tooltipWnd, HWND owner, HWND ctrl, const wchar_t* text);
 
+inline bool SetDlgItemTextIfChanged(HWND hwnd, int ctrlId, const std::wstring& text) {
+    HWND ctrl = GetDlgItem(hwnd, ctrlId);
+    if (!ctrl) return false;
+    int len = GetWindowTextLengthW(ctrl);
+    if (len == static_cast<int>(text.size())) {
+        std::wstring cur(static_cast<size_t>(len) + 1, L'\0');
+        int copied = GetWindowTextW(ctrl, cur.data(), len + 1);
+        cur.resize(static_cast<size_t>(copied));
+        if (cur == text) return false;
+    }
+    SetWindowTextW(ctrl, text.c_str());
+    return true;
+}
+
+inline bool EnableDlgItemIfChanged(HWND hwnd, int ctrlId, bool enabled) {
+    HWND ctrl = GetDlgItem(hwnd, ctrlId);
+    if (!ctrl) return false;
+    BOOL cur = IsWindowEnabled(ctrl);
+    BOOL target = enabled ? TRUE : FALSE;
+    if (cur == target) return false;
+    EnableWindow(ctrl, target);
+    return true;
+}
+
+inline bool SetProgressIfChanged(HWND hwnd, int ctrlId, int pos) {
+    HWND ctrl = GetDlgItem(hwnd, ctrlId);
+    if (!ctrl) return false;
+    LRESULT cur = SendMessageW(ctrl, PBM_GETPOS, 0, 0);
+    if (static_cast<int>(cur) == pos) return false;
+    SendMessageW(ctrl, PBM_SETPOS, static_cast<WPARAM>(pos), 0);
+    return true;
+}
+
 } // namespace s2p::ui
