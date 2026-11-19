@@ -323,7 +323,7 @@ bool SurfaceDimOverlay::Show(const std::vector<RECT>& virtualExcludeRects, Dismi
     EnumDisplayMonitors(nullptr, nullptr, EnumPhysicalMonitorCb, reinterpret_cast<LPARAM>(&params));
 
     if (params.physicalRects.empty()) {
-        Logger::Instance().Warn("PWR-DIM", L"No physical Surface monitor found to dim.");
+        Logger::Instance().Warn("PWR-DIM", L"No physical Laptop monitor found to dim.");
         return false;
     }
 
@@ -333,7 +333,7 @@ bool SurfaceDimOverlay::Show(const std::vector<RECT>& virtualExcludeRects, Dismi
         HWND hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             kDimClassName,
-            L"Screen2PC Surface Dim",
+            L"Screen2PC Laptop Dim",
             WS_POPUP | WS_VISIBLE,
             rc.left, rc.top, w, h,
             nullptr, nullptr, GetModuleHandleW(nullptr), this);
@@ -387,7 +387,7 @@ LRESULT SurfaceDimOverlay::HandleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(45, 45, 45));
-        const wchar_t* hint = L"Screen2PC \u2014 Surface-Display abgedunkelt (Doppelklick oder ESC zum Reaktivieren)";
+        const wchar_t* hint = L"Screen2PC \u2014 Laptop-Display abgedunkelt (Doppelklick oder ESC zum Reaktivieren)";
         DrawTextW(hdc, hint, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         EndPaint(hwnd, &ps);
         return 0;

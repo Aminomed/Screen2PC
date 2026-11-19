@@ -24,7 +24,7 @@ BEGIN
         BLOCK "040704b0"
         BEGIN
             VALUE "CompanyName", "Screen2PC"
-            VALUE "FileDescription", "Screen2PC Sender (Surface)"
+            VALUE "FileDescription", "Screen2PC Sender (Laptop)"
             VALUE "FileVersion", SCREEN2PC_VERSION_RC_STR
             VALUE "InternalName", "Screen2PC.Sender"
             VALUE "OriginalFilename", "Screen2PC.Sender.exe"

@@ -322,7 +322,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         m_status.remoteAppVersion = peerAppVer;
         m_status.stateText = L"Versionskonflikt mit PC";
 
-        std::wstring msg = L"Versionskonflikt: Surface nutzt Protokoll v" + std::to_wstring(kProtocolVersion) +
+        std::wstring msg = L"Versionskonflikt: Laptop nutzt Protokoll v" + std::to_wstring(kProtocolVersion) +
                            L" (App v" + FormatVersionTuple(CurrentAppVersionTuple()) + L")";
         if (peerProtoVer > 0) {
             msg += L", PC meldet Protokoll v" + std::to_wstring(peerProtoVer);
@@ -682,7 +682,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
     if (cfg.mode == DisplayMode::MirrorPrimary) {
         auto outs = DxgiCapture::EnumerateOutputs();
         if (outs.empty()) {
-            outError = L"Kein aktiver DXGI-Bildschirm auf dem Surface gefunden.";
+            outError = L"Kein aktiver DXGI-Bildschirm auf dem Laptop gefunden.";
             return false;
         }
         auto it = std::find_if(outs.begin(), outs.end(), [](const DisplayOutputInfo& o) { return o.isPrimary; });
@@ -691,7 +691,7 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
     }
 
     if (!VirtualDisplayCtl::IsDriverActive()) {
-        outError = L"Screen2PC Virtual Display Treiber ist nicht aktiv. Bitte scripts\\install_driver.ps1 als Admin auf dem Surface ausfuehren oder Modus 'Mirror' waehlen.";
+        outError = L"Screen2PC Virtual Display Treiber ist nicht aktiv. Bitte scripts\\install_driver.ps1 als Admin auf dem Laptop ausfuehren oder Modus 'Mirror' waehlen.";
         return false;
     }
 

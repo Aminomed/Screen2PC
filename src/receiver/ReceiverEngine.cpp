@@ -1354,7 +1354,7 @@ void ReceiverEngine::DisconnectSession() {
     m_status.senderVersion = AppVersionTuple{};
     m_status.streams.clear();
     if (m_running) {
-        m_status.stateText = L"Bereit - Warte auf Verbindung vom Surface (Port " +
+        m_status.stateText = L"Bereit - Warte auf Verbindung vom Laptop (Port " +
                              std::to_wstring(kPortControl) + L")";
     }
 }

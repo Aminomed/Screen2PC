@@ -25,6 +25,7 @@
 #include "../common/Autostart.h"
 #include "../common/ColorProfile.h"
 #include "../common/KvmInput.h"
+#include "../common/Lang.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
 #include "../common/Pairing.h"
@@ -80,6 +81,8 @@ constexpr int IDC_LBL_TELEMETRY     = 227;
 constexpr int IDC_DROP_TITLE        = 228;
 constexpr int IDC_DROP_SUB          = 229;
 constexpr int IDC_CHK_STREAM_HUD    = 230;
+constexpr int IDC_LBL_LANG          = 231;
+constexpr int IDC_LANG_COMBO        = 232;
 
 constexpr int IDC_TAB_OVERVIEW      = 240;
 constexpr int IDC_TAB_TRANSFER      = 241;
@@ -228,6 +231,7 @@ bool IsReceiverCardControlId(int id) {
     case IDC_DROP_TITLE:
     case IDC_DROP_SUB:
     case IDC_FILE_STATUS:
+    case IDC_LBL_LANG:
         return true;
     default:
         return false;
@@ -267,6 +271,8 @@ void ApplyReceiverTabVisibility(HWND hwnd) {
     vis(IDC_CHK_AUTOSTART, t2);
     vis(IDC_CHK_AUTOUPDATE, t2);
     vis(IDC_CHK_STREAM_HUD, t2);
+    vis(IDC_LBL_LANG, t2);
+    vis(IDC_LANG_COMBO, t2);
     vis(IDC_BTN_COLORS, t2);
     vis(IDC_BTN_TRUSTED, t2);
     vis(IDC_BTN_FIREWALL, t2);
@@ -281,6 +287,7 @@ void ApplyReceiverTabVisibility(HWND hwnd) {
 void ApplyReceiverTheme(HWND hwnd, bool dark) {
     g_theme.Init(dark);
     s2p::ui::ApplyWindowTheme(hwnd, dark);
+    s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_LANG_COMBO), dark, L"DarkMode_CFD");
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_STATS_TEXT), dark);
     if (g_colorWnd && IsWindow(g_colorWnd)) s2p::ui::ApplyWindowTheme(g_colorWnd, dark);
     if (g_pinPopupWnd && IsWindow(g_pinPopupWnd)) s2p::ui::ApplyWindowTheme(g_pinPopupWnd, dark);
@@ -701,7 +708,7 @@ void PopulatePinPopupContent() {
     const auto& req = g_activePinSession->req;
 
     std::wostringstream info;
-    info << L"Geraet: " << (req.senderName.empty() ? L"Surface" : req.senderName)
+    info << L"Geraet: " << (req.senderName.empty() ? L"Laptop" : req.senderName)
          << L"  (IP: " << s2p::Utf8ToWide(req.senderIp) << L")\r\n";
     if (!s2p::IsAllZero(req.senderMac, 6)) {
         info << L"MAC-Adresse: " << s2p::FormatMacAddress(req.senderMac) << L"\r\n";
@@ -710,7 +717,7 @@ void PopulatePinPopupContent() {
     } else {
         info << L"MAC-Adresse: Unbekannt\r\n";
     }
-    info << L"Diese einmalige 6-stellige PIN am Surface eingeben:";
+    info << L"Diese einmalige 6-stellige PIN am Laptop eingeben:";
     SetDlgItemTextW(g_pinPopupWnd, IDC_PINP_INFO, info.str().c_str());
 
     std::wstring pinW = s2p::Utf8ToWide(req.pinCode);
@@ -880,7 +887,7 @@ void PopulateTrustedDevicesList() {
 
     for (size_t i = 0; i < g_trustedCache.size(); ++i) {
         const auto& e = g_trustedCache[i];
-        std::wstring name = e.name.empty() ? L"Surface" : e.name;
+        std::wstring name = e.name.empty() ? L"Laptop" : e.name;
         std::wstring mac = !e.macStr.empty() ? e.macStr
                                              : (!e.deviceIdHex.empty() ? (L"ID: " + e.deviceIdHex.substr(0, 12)) : e.key);
         std::wstring ip = e.lastIp.empty() ? L"-" : e.lastIp;
@@ -1091,7 +1098,7 @@ std::vector<std::wstring> PickFilesDialog(HWND owner) {
     ofn.lpstrFilter = L"Alle Dateien (*.*)\0*.*\0\0";
     ofn.lpstrFile = buf.data();
     ofn.nMaxFile = static_cast<DWORD>(buf.size());
-    ofn.lpstrTitle = L"Dateien ans Surface senden";
+    ofn.lpstrTitle = L"Dateien an den Laptop senden";
     ofn.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     std::vector<std::wstring> out;
     if (!GetOpenFileNameW(&ofn)) return out;
@@ -1121,7 +1128,7 @@ std::vector<std::wstring> PickFoldersDialog(HWND owner) {
     if (SUCCEEDED(dlg->GetOptions(&opts))) {
         dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
     }
-    dlg->SetTitle(L"Ordner (inkl. Unterordner) ans Surface senden");
+    dlg->SetTitle(L"Ordner (inkl. Unterordner) an den Laptop senden");
     if (SUCCEEDED(dlg->Show(owner))) {
         IShellItemArray* items = nullptr;
         if (SUCCEEDED(dlg->GetResults(&items)) && items) {
@@ -1286,12 +1293,14 @@ void UpdateUi() {
     }
 
     s2p::ui::StatusTone newTone = st.sessionActive ? s2p::ui::StatusTone::Success : s2p::ui::StatusTone::Neutral;
-    std::wstring heroTitle = st.sessionActive ? L"Session aktiv" : L"Bereit \u2014 Warte auf Surface";
+    std::wstring heroTitle = st.sessionActive
+                                 ? s2p::lang::Tr(L"Session aktiv", L"Session active")
+                                 : s2p::lang::Tr(L"Bereit \u2014 Warte auf Laptop", L"Ready \u2014 Waiting for Laptop");
     if (st.sessionActive && !st.streams.empty()) {
         double totalMbps = 0.0;
         for (const auto& s : st.streams) totalMbps += s.mbps;
         std::wostringstream hs;
-        hs << (st.senderName.empty() ? L"Surface" : st.senderName)
+        hs << (st.senderName.empty() ? L"Laptop" : st.senderName)
            << L"  \u2022  " << std::fixed << std::setprecision(1) << st.streams[0].fps << L" FPS"
            << L"  \u2022  " << std::setprecision(1) << st.streams[0].avgDecodeMs << L" ms"
            << L"  \u2022  " << std::setprecision(1) << totalMbps << L" Mbit/s";
@@ -1358,7 +1367,7 @@ void UpdateUi() {
 
     std::wostringstream body;
     if (!st.sessionActive) {
-        body << L"Keine aktive Session. Starte Screen2PC.Sender.exe auf dem Surface.\r\n"
+        body << L"Keine aktive Session. Starte Screen2PC.Sender.exe auf dem Laptop.\r\n"
              << L"Hinweis: 100 % User-Mode (kein Treiber, kein Test-Signing, Anti-Cheat-sicher).\r\n\r\n"
              << L"Letzte Log-Meldungen:\r\n";
         auto logs = s2p::Logger::Instance().GetRecentLines(5);
@@ -1455,16 +1464,71 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
     mv(IDC_FILE_STATUS,      30, 474, 520, 20);
 
     // Tab 2: Einstellungen
-    // Card 1: App & Autostart (16, 222, 548, 112)
+    // Card 1: App & Autostart (16, 222, 548, 148)
     mv(IDC_CHK_AUTOSTART,    30, 234, 520, 26);
     mv(IDC_CHK_AUTOUPDATE,   30, 264, 520, 26);
     mv(IDC_CHK_STREAM_HUD,   30, 294, 520, 26);
+    mv(IDC_LBL_LANG,         30, 328, 164, 22, g_boldFont);
+    mv(IDC_LANG_COMBO,      198, 325, 352, 140);
 
-    // Card 2: Werkzeuge & Sicherheit (16, 346, 548, 106)
-    mv(IDC_BTN_COLORS,       30, 362, 256, 34);
-    mv(IDC_BTN_TRUSTED,     294, 362, 256, 34);
-    mv(IDC_BTN_FIREWALL,     30, 404, 256, 34);
-    mv(IDC_BTN_UPDATE,      294, 404, 256, 34);
+    // Card 2: Werkzeuge & Sicherheit (16, 382, 548, 106)
+    mv(IDC_BTN_COLORS,       30, 398, 256, 34);
+    mv(IDC_BTN_TRUSTED,     294, 398, 256, 34);
+    mv(IDC_BTN_FIREWALL,     30, 440, 256, 34);
+    mv(IDC_BTN_UPDATE,      294, 440, 256, 34);
+}
+
+void ApplyReceiverLanguage(HWND hwnd) {
+    using s2p::lang::Tr;
+    std::wstring title = L"Screen2PC Receiver v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) +
+                         Tr(L" (PC - Treiberfrei)", L" (PC - Driver-free)");
+    SetWindowTextW(hwnd, title.c_str());
+
+    SetDlgItemTextW(hwnd, IDC_BTN_DISCONN,      Tr(L"Aktive Session trennen", L"Disconnect Session"));
+    SetDlgItemTextW(hwnd, IDC_BTN_SHOW_STREAMS, Tr(L"Streamfenster einblenden", L"Show Stream Windows"));
+
+    SetDlgItemTextW(hwnd, IDC_TAB_OVERVIEW,     Tr(L"Uebersicht", L"Overview"));
+    SetDlgItemTextW(hwnd, IDC_TAB_TRANSFER,     Tr(L"Dateitransfer", L"File Transfer"));
+    SetDlgItemTextW(hwnd, IDC_TAB_SETTINGS,     Tr(L"Einstellungen", L"Settings"));
+
+    SetDlgItemTextW(hwnd, IDC_CHK_FULLSCR,      Tr(L"Streams im randlosen Vollbild starten (F11)", L"Start streams in borderless fullscreen (F11)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_CLIPBOARD,    Tr(L"Geteilte Zwischenablage (Text & Bilder)", L"Shared Clipboard (Text & Images)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_KVM,          Tr(L"KVM: Maus & Tastatur an Laptop (Strg+Alt+K)", L"KVM: Mouse & Keyboard to Laptop (Ctrl+Alt+K)"));
+    SetDlgItemTextW(hwnd, IDC_LBL_MOUSE_SPEED,  Tr(L"Maus-Tempo (KVM):", L"Mouse Speed (KVM):"));
+    SetDlgItemTextW(hwnd, IDC_LBL_SCROLL_SPEED, Tr(L"Scroll-Tempo (KVM):", L"Scroll Speed (KVM):"));
+    SetDlgItemTextW(hwnd, IDC_LBL_TELEMETRY,    Tr(L"Live-Stream-Daten (FPS, Decode-Latenz, Mbit/s)", L"Live Stream Telemetry (FPS, Decode Latency, Mbps)"));
+
+    SetDlgItemTextW(hwnd, IDC_DROP_TITLE,       Tr(L"Dateien oder Ordner hierher ziehen", L"Drop files or folders here"));
+    SetDlgItemTextW(hwnd, IDC_DROP_SUB,         Tr(L"Werden direkt an den verbundenen Laptop gesendet", L"Sent directly to the connected Laptop"));
+    SetDlgItemTextW(hwnd, IDC_BTN_SENDFILE,     Tr(L"Datei(en) senden...", L"Send file(s)..."));
+    SetDlgItemTextW(hwnd, IDC_BTN_SENDFOLDER,   Tr(L"Ordner senden...", L"Send folder..."));
+    SetDlgItemTextW(hwnd, IDC_BTN_OPEN_DL,      Tr(L"Downloads oeffnen", L"Open Downloads"));
+    SetDlgItemTextW(hwnd, IDC_BTN_CANCELFILE,   Tr(L"Abbrechen", L"Cancel"));
+
+    SetDlgItemTextW(hwnd, IDC_CHK_AUTOSTART,    Tr(L"Mit Windows starten (System-Tray)", L"Start with Windows (System Tray)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_AUTOUPDATE,   Tr(L"Beim Start auf GitHub-Updates pruefen", L"Check GitHub updates on startup"));
+    SetDlgItemTextW(hwnd, IDC_CHK_STREAM_HUD,   Tr(L"In-Stream-Overlay (FPS / Latenz / Mbit/s) anzeigen", L"Show In-Stream Overlay (FPS / Latency / Mbps)"));
+    SetDlgItemTextW(hwnd, IDC_LBL_LANG,         Tr(L"Sprache / Language:", L"Language / Sprache:"));
+    SetDlgItemTextW(hwnd, IDC_BTN_COLORS,       Tr(L"Farbe & HDR pro Monitor...", L"Color & HDR per Monitor..."));
+    SetDlgItemTextW(hwnd, IDC_BTN_TRUSTED,      Tr(L"Vertraute Geraete...", L"Trusted Devices..."));
+    SetDlgItemTextW(hwnd, IDC_BTN_FIREWALL,     Tr(L"Firewall-Ports oeffnen (Admin)", L"Open Firewall Ports (Admin)"));
+    SetDlgItemTextW(hwnd, IDC_BTN_UPDATE,       DefaultUpdateButtonText().c_str());
+
+    if (g_tooltip) {
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_FULLSCR),
+            Tr(L"Oeffnet Streamfenster direkt im randlosen Vollbild (F11 zum Umschalten).",
+               L"Opens stream windows directly in borderless fullscreen (F11 to toggle)."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_KVM),
+            Tr(L"Aktiviert Maus- und Tastatursteuerung des Laptops direkt im Streamfenster (Strg+Alt+K).",
+               L"Enables Laptop mouse and keyboard control inside the stream window (Ctrl+Alt+K)."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_AUTOSTART),
+            Tr(L"Startet Screen2PC Receiver minimiert im System-Tray (Task-Manager Autostart).",
+               L"Starts Screen2PC Receiver minimized in the system tray (Task Manager Startup)."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_STREAM_HUD),
+            Tr(L"Zeigt FPS, Latenz, Bitrate und KVM-Status oben im Streamfenster an (Shortcut: Strg+Alt+H).",
+               L"Shows FPS, latency, bitrate, and KVM status at the top of the stream window (Shortcut: Ctrl+Alt+H)."));
+    }
+    InvalidateRect(hwnd, nullptr, TRUE);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -1475,8 +1539,10 @@ void CreateUiControls(HWND hwnd) {
                                GetModuleHandleW(nullptr), nullptr);
     };
 
+    s2p::lang::SetLangMode(static_cast<int>(LoadUintPref(L"LangMode", 0)));
+
     // Hero
-    addCtrl(L"STATIC", L"Bereit \u2014 Warte auf Surface", SS_ENDELLIPSIS, IDC_HERO_TITLE);
+    addCtrl(L"STATIC", L"Bereit \u2014 Warte auf Laptop", SS_ENDELLIPSIS, IDC_HERO_TITLE);
     addCtrl(L"STATIC", L"Initialisiere...", 0, IDC_INFO_LABEL);
     addCtrl(L"BUTTON", L"Aktive Session trennen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_DISCONN);
     addCtrl(L"BUTTON", L"Streamfenster einblenden", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SHOW_STREAMS);
@@ -1495,7 +1561,7 @@ void CreateUiControls(HWND hwnd) {
     SetToggleChecked(hwnd, IDC_CHK_CLIPBOARD, clipPref);
     if (g_engine) g_engine->SetClipboardEnabled(clipPref);
 
-    HWND chkKvm = addCtrl(L"BUTTON", L"KVM: Maus & Tastatur ans Surface (Strg+Alt+K)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_KVM);
+    HWND chkKvm = addCtrl(L"BUTTON", L"KVM: Maus & Tastatur an Laptop (Strg+Alt+K)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_KVM);
     bool kvmPref = LoadBoolPref(L"KvmEnabled", 1);
     SetToggleChecked(hwnd, IDC_CHK_KVM, kvmPref);
     if (g_engine) g_engine->SetKvmEnabled(kvmPref);
@@ -1525,7 +1591,7 @@ void CreateUiControls(HWND hwnd) {
 
     // Tab 1: Dateitransfer
     addCtrl(L"STATIC", L"Dateien oder Ordner hierher ziehen", SS_CENTER, IDC_DROP_TITLE);
-    addCtrl(L"STATIC", L"Werden direkt ans verbundene Surface gesendet", SS_CENTER, IDC_DROP_SUB);
+    addCtrl(L"STATIC", L"Werden direkt an den verbundenen Laptop gesendet", SS_CENTER, IDC_DROP_SUB);
     addCtrl(L"BUTTON", L"Datei(en) senden...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SENDFILE);
     addCtrl(L"BUTTON", L"Ordner senden...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SENDFOLDER);
     addCtrl(L"BUTTON", L"Downloads oeffnen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_OPEN_DL);
@@ -1546,19 +1612,23 @@ void CreateUiControls(HWND hwnd) {
     SetToggleChecked(hwnd, IDC_CHK_STREAM_HUD, hudPref);
     if (g_engine) g_engine->SetStreamHudEnabled(hudPref);
 
+    addCtrl(L"STATIC", L"Sprache / Language:", SS_CENTERIMAGE, IDC_LBL_LANG);
+    HWND langCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_LANG_COMBO);
+    SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto (Windows)"));
+    SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Deutsch"));
+    SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"English"));
+    SendMessageW(langCb, CB_SETCURSEL, s2p::lang::GetLangMode(), 0);
+
     addCtrl(L"BUTTON", L"Farbe & HDR pro Monitor...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_COLORS);
     addCtrl(L"BUTTON", L"Vertraute Geraete...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_TRUSTED);
     addCtrl(L"BUTTON", L"Firewall-Ports oeffnen (Admin)", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_FIREWALL);
     addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_UPDATE);
 
     g_tooltip = s2p::ui::CreateTooltipWindow(hwnd);
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chk, L"Oeffnet Streamfenster direkt im randlosen Vollbild (F11 zum Umschalten).");
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkKvm, L"Aktiviert Maus- und Tastatursteuerung des Surface direkt im Streamfenster (Strg+Alt+K).");
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkAuto, L"Startet Screen2PC Receiver minimiert im System-Tray (Task-Manager Autostart).");
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkHud, L"Zeigt FPS, Latenz, Bitrate und KVM-Status oben im Streamfenster an (Shortcut: Strg+Alt+H).");
 
     LayoutMainControls(hwnd, GetWindowDpiSafe(hwnd));
     ApplyReceiverTheme(hwnd, s2p::ui::IsSystemDarkMode());
+    ApplyReceiverLanguage(hwnd);
     ApplyReceiverTabVisibility(hwnd);
 }
 
@@ -1654,8 +1724,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 146), g_theme, g_currentDpi, true);
             s2p::ui::DrawCard(hdc, scRect(16, 380, 548, 134), g_theme, g_currentDpi);
         } else if (g_activeTab == 2) {
-            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 112), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 346, 548, 106), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 148), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 382, 548, 106), g_theme, g_currentDpi);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -1797,6 +1867,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SaveBoolPref(L"StreamHudEnabled", checked);
             return 0;
         }
+        case IDC_LANG_COMBO:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int lm = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_LANG_COMBO, CB_GETCURSEL, 0, 0));
+                s2p::lang::SetLangMode(lm);
+                SaveUintPref(L"LangMode", static_cast<uint32_t>(lm));
+                ApplyReceiverLanguage(hwnd);
+                UpdateUi();
+            }
+            return 0;
         case IDC_BTN_DISCONN:
             if (g_engine && !g_disconnBusy.exchange(true)) {
                 EnableWindow(GetDlgItem(hwnd, IDC_BTN_DISCONN), FALSE);

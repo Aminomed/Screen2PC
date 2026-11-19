@@ -76,6 +76,7 @@
     <ClInclude Include="Pairing.h" />
     <ClInclude Include="Updater.h" />
     <ClInclude Include="UiTheme.h" />
+    <ClInclude Include="Lang.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Logger.cpp" />

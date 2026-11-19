@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Entfernt den Screen2PC Virtual Display Treiber sauber vom Surface.
+  Entfernt den Screen2PC Virtual Display Treiber sauber vom Laptop.
 #>
 $ErrorActionPreference = "Stop"
 

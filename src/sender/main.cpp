@@ -28,6 +28,7 @@
 #include "../common/AppIcon.h"
 #include "../common/Autostart.h"
 #include "../common/BitratePresets.h"
+#include "../common/Lang.h"
 #include "../common/Logger.h"
 #include "../common/NetSocket.h"
 #include "../common/Pairing.h"
@@ -91,6 +92,8 @@ constexpr int IDC_HERO_TITLE        = 154;
 constexpr int IDC_LBL_TELEMETRY     = 155;
 constexpr int IDC_DROP_TITLE        = 156;
 constexpr int IDC_DROP_SUB          = 157;
+constexpr int IDC_LBL_LANG          = 158;
+constexpr int IDC_LANG_COMBO        = 159;
 
 constexpr int IDC_TAB_CONNECT       = 170;
 constexpr int IDC_TAB_TRANSFER      = 171;
@@ -221,6 +224,7 @@ bool IsSenderCardControlId(int id) {
     case IDC_DROP_TITLE:
     case IDC_DROP_SUB:
     case IDC_FILE_STATUS:
+    case IDC_LBL_LANG:
         return true;
     default:
         return false;
@@ -267,6 +271,8 @@ void ApplySenderTabVisibility(HWND hwnd) {
     vis(IDC_CHK_LID_BYPASS, t2);
     vis(IDC_CHK_DIM_SURFACE, t2);
     vis(IDC_CHK_AUTOUPDATE, t2);
+    vis(IDC_LBL_LANG, t2);
+    vis(IDC_LANG_COMBO, t2);
     vis(IDC_BTN_UPDATE, t2);
 
     InvalidateRect(GetDlgItem(hwnd, IDC_TAB_CONNECT), nullptr, FALSE);
@@ -283,6 +289,7 @@ void ApplySenderTheme(HWND hwnd, bool dark) {
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_CODEC_COMBO), dark, L"DarkMode_CFD");
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_BITRATE_COMBO), dark, L"DarkMode_CFD");
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_FPS_COMBO), dark, L"DarkMode_CFD");
+    s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_LANG_COMBO), dark, L"DarkMode_CFD");
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_IP_EDIT), dark);
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_STATS_TEXT), dark);
     InvalidateRect(hwnd, nullptr, TRUE);
@@ -383,7 +390,7 @@ void AddTrayIcon(HWND hwnd) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = s2p::LoadAppSmallIcon(GetModuleHandleW(nullptr));
-    wcscpy_s(g_nid.szTip, L"Screen2PC Sender (Surface)");
+    wcscpy_s(g_nid.szTip, L"Screen2PC Sender (Laptop)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
@@ -991,8 +998,61 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
     mv(IDC_CHK_DIM_SURFACE,  30, 378, 480, 28);
     mv(IDC_CHK_AUTOUPDATE,   30, 409, 480, 28);
 
-    // Card: Updates (16, 462, 508, 62)
-    mv(IDC_BTN_UPDATE,       30, 477, 480, 32);
+    // Card: Updates & Sprache (16, 462, 508, 98)
+    mv(IDC_LBL_LANG,         30, 476, 150, 22, g_boldFont);
+    mv(IDC_LANG_COMBO,      186, 473, 324, 140);
+    mv(IDC_BTN_UPDATE,       30, 512, 480, 32);
+}
+
+void ApplySenderLanguage(HWND hwnd) {
+    using s2p::lang::Tr;
+    std::wstring title = L"Screen2PC Sender v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L" (Laptop)";
+    SetWindowTextW(hwnd, title.c_str());
+
+    SetDlgItemTextW(hwnd, IDC_TAB_CONNECT,  Tr(L"Verbindung", L"Connection"));
+    SetDlgItemTextW(hwnd, IDC_TAB_TRANSFER, Tr(L"Dateitransfer", L"File Transfer"));
+    SetDlgItemTextW(hwnd, IDC_TAB_SETTINGS, Tr(L"Einstellungen", L"Settings"));
+
+    SetDlgItemTextW(hwnd, IDC_LBL_PEERS,     Tr(L"PC im LAN:", L"PC on LAN:"));
+    SetDlgItemTextW(hwnd, IDC_BTN_SCAN,      g_scanning ? Tr(L"Suche...", L"Scanning...") : Tr(L"Suchen", L"Scan"));
+    SetDlgItemTextW(hwnd, IDC_LBL_IP,        Tr(L"Ziel-IP (manuell):", L"Target IP (manual):"));
+    SetDlgItemTextW(hwnd, IDC_LBL_MODE,      Tr(L"Anzeigemodus:", L"Display Mode:"));
+    SetDlgItemTextW(hwnd, IDC_LBL_STREAM,    Tr(L"Stream (Live):", L"Stream (Live):"));
+    SetDlgItemTextW(hwnd, IDC_LBL_TELEMETRY, Tr(L"Live-Telemetrie & Protokoll", L"Live Telemetry & Log"));
+
+    SetDlgItemTextW(hwnd, IDC_DROP_TITLE,    Tr(L"Dateien oder Ordner hierher ziehen", L"Drop files or folders here"));
+    SetDlgItemTextW(hwnd, IDC_DROP_SUB,      Tr(L"Werden in Downloads\\Screen2PC auf dem Ziel-PC gespeichert", L"Saved to Downloads\\Screen2PC on the target PC"));
+    SetDlgItemTextW(hwnd, IDC_BTN_SENDFILE,  Tr(L"Datei(en) senden...", L"Send file(s)..."));
+    SetDlgItemTextW(hwnd, IDC_BTN_SENDFOLDER,Tr(L"Ordner senden...", L"Send folder..."));
+    SetDlgItemTextW(hwnd, IDC_BTN_OPEN_DL,   Tr(L"Downloads oeffnen", L"Open Downloads"));
+    SetDlgItemTextW(hwnd, IDC_BTN_CANCELFILE,Tr(L"Abbrechen", L"Cancel"));
+
+    SetDlgItemTextW(hwnd, IDC_CHK_CLIPBOARD,     Tr(L"Geteilte Zwischenablage (Text & Bilder)", L"Shared Clipboard (Text & Images)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_KVM,           Tr(L"KVM-Steuerung (Maus & Tastatur vom PC)", L"KVM Control (PC Mouse & Keyboard)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_AUTOSTART,     Tr(L"Mit Windows starten (System-Tray)", L"Start with Windows (System Tray)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_AUTOCONNECT,   Tr(L"Beim Start automatisch verbinden", L"Auto-connect on startup"));
+    SetDlgItemTextW(hwnd, IDC_CHK_AUTORECONNECT, Tr(L"Bei Abbruch automatisch wiederverbinden", L"Auto-reconnect on disconnect"));
+    SetDlgItemTextW(hwnd, IDC_CHK_LID_BYPASS,    Tr(L"Standby beim Zuklappen pausieren", L"Pause sleep on lid close"));
+    SetDlgItemTextW(hwnd, IDC_CHK_DIM_SURFACE,   Tr(L"Laptop-Bildschirm abdunkeln (ESC/Doppelklick)", L"Dim laptop screen (ESC/Double-click)"));
+    SetDlgItemTextW(hwnd, IDC_CHK_AUTOUPDATE,    Tr(L"Beim Start auf GitHub-Updates pruefen", L"Check GitHub updates on startup"));
+    SetDlgItemTextW(hwnd, IDC_LBL_LANG,          Tr(L"Sprache / Language:", L"Language / Sprache:"));
+    SetDlgItemTextW(hwnd, IDC_BTN_UPDATE,        DefaultUpdateButtonText().c_str());
+
+    if (g_tooltip) {
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_AUTOSTART),
+            Tr(L"Startet Screen2PC Sender minimiert im System-Tray (Task-Manager Autostart).",
+               L"Starts Screen2PC Sender minimized in the system tray (Task Manager Startup)."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_AUTOCONNECT),
+            Tr(L"Verbindet beim Start automatisch mit dem zuletzt verwendeten oder gefundenen PC.",
+               L"Automatically connects to the last used or discovered PC on startup."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_LID_BYPASS),
+            Tr(L"Verhindert Laptop-Standby beim Zuklappen, solange externe PC-Displays aktiv sind.",
+               L"Prevents laptop sleep when closing the lid while external PC displays are active."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_DIM_SURFACE),
+            Tr(L"Schaltet die physischen Laptop-Displays schwarz, solange am PC gearbeitet wird.",
+               L"Dims physical laptop displays black while working on the PC."));
+    }
+    InvalidateRect(hwnd, nullptr, TRUE);
 }
 
 void CreateUiControls(HWND hwnd) {
@@ -1003,6 +1063,8 @@ void CreateUiControls(HWND hwnd) {
                                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                GetModuleHandleW(nullptr), nullptr);
     };
+
+    s2p::lang::SetLangMode(LoadSetting(L"LangMode", 0));
 
     // Hero
     addCtrl(L"STATIC", L"Bereit zum Verbinden", SS_ENDELLIPSIS, IDC_HERO_TITLE);
@@ -1028,7 +1090,7 @@ void CreateUiControls(HWND hwnd) {
     SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Erweitern (Alle PC-Monitore, bis zu 2)"));
     SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Erweitern (Nur PC-Monitor 1)"));
     SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Erweitern (Nur PC-Monitor 2)"));
-    SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Surface-Display spiegeln (ohne Treiber)"));
+    SendMessageW(modeCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Laptop-Display spiegeln (ohne Treiber)"));
     int savedMode = std::clamp(LoadSetting(L"ModeIdx", 0), 0, 3);
     SendMessageW(modeCb, CB_SETCURSEL, savedMode, 0);
 
@@ -1097,22 +1159,26 @@ void CreateUiControls(HWND hwnd) {
     HWND chkLid = addCtrl(L"BUTTON", L"Standby beim Zuklappen pausieren", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_LID_BYPASS);
     SetToggleChecked(hwnd, IDC_CHK_LID_BYPASS, LoadSetting(L"LidCloseBypass", 1) != 0);
 
-    HWND chkDim = addCtrl(L"BUTTON", L"Surface-Bildschirm abdunkeln (ESC/Doppelklick)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_DIM_SURFACE);
+    HWND chkDim = addCtrl(L"BUTTON", L"Laptop-Bildschirm abdunkeln (ESC/Doppelklick)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_DIM_SURFACE);
     SetToggleChecked(hwnd, IDC_CHK_DIM_SURFACE, LoadSetting(L"DimSurfaceOnExternal", 0) != 0);
 
     HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start auf GitHub-Updates pruefen", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_AUTOUPDATE);
     SetToggleChecked(hwnd, IDC_CHK_AUTOUPDATE, LoadSetting(L"AutoUpdateCheck", 1) != 0);
 
+    addCtrl(L"STATIC", L"Sprache / Language:", SS_CENTERIMAGE, IDC_LBL_LANG);
+    HWND langCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_LANG_COMBO);
+    SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto (Windows)"));
+    SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Deutsch"));
+    SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"English"));
+    SendMessageW(langCb, CB_SETCURSEL, s2p::lang::GetLangMode(), 0);
+
     addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_UPDATE);
 
     g_tooltip = s2p::ui::CreateTooltipWindow(hwnd);
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkAuto, L"Startet Screen2PC Sender minimiert im System-Tray (Task-Manager Autostart).");
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkAutoConn, L"Verbindet beim Start automatisch mit dem zuletzt verwendeten oder gefundenen PC.");
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkLid, L"Verhindert Surface-Standby beim Zuklappen, solange externe PC-Displays aktiv sind.");
-    s2p::ui::SetControlTooltip(g_tooltip, hwnd, chkDim, L"Schaltet die physischen Surface-Displays schwarz, solange am PC gearbeitet wird.");
 
     LayoutMainControls(hwnd, dpi);
     ApplySenderTheme(hwnd, s2p::ui::IsSystemDarkMode());
+    ApplySenderLanguage(hwnd);
     ApplySenderTabVisibility(hwnd);
 }
 
@@ -1476,7 +1542,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s2p::ui::DrawCard(hdc, scRect(16, 336, 508, 134), g_theme, g_currentDpi);
         } else if (g_activeTab == 2) {
             s2p::ui::DrawCard(hdc, scRect(16, 178, 508, 272), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 462, 508, 62), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 462, 508, 98), g_theme, g_currentDpi);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -1558,6 +1624,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_engine && g_engine->IsConnected() && !g_connectBusy.load()) {
                     SwitchDisplayModeWhileConnected(hwnd);
                 }
+            }
+            return 0;
+        case IDC_LANG_COMBO:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int lm = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_LANG_COMBO, CB_GETCURSEL, 0, 0));
+                s2p::lang::SetLangMode(lm);
+                SaveSetting(L"LangMode", lm);
+                ApplySenderLanguage(hwnd);
             }
             return 0;
         case IDC_CODEC_COMBO:
@@ -2057,7 +2131,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     wc.lpszClassName = L"Screen2PCSenderWnd";
     RegisterClassExW(&wc);
 
-    std::wstring title = L"Screen2PC Sender v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L" (Surface)";
+    std::wstring title = L"Screen2PC Sender v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L" (Laptop)";
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     UINT sysDpi = GetDpiForSystem();
     if (sysDpi < 72) sysDpi = 96;

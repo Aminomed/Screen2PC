@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Installiert den Screen2PC Virtual Display Treiber (UMDF v2 IddCx) auf dem SURFACE.
+  Installiert den Screen2PC Virtual Display Treiber (UMDF v2 IddCx) auf dem LAPTOP.
   NICHT auf dem Gaming-PC ausfuehren! Der PC-Empfaenger arbeitet 100% treiberfrei.
 #>
 $ErrorActionPreference = "Stop"
@@ -146,8 +146,8 @@ if ($FinalPingCode -ne 0 -or -not $PipeOk) {
 
     Write-Host ""
     Write-Host "HINWEIS: Falls Windows den selbstsignierten Treiber weiterhin blockiert (z. B. Problem 52 / Code Integrity):" -ForegroundColor Yellow
-    Write-Host "  1. Auf dem Surface (nur Surface, NICHT PC!): Bei Bedarf Test-Signing aktivieren (erfordert ggf. deaktiviertes Secure Boot): bcdedit /set testsigning on" -ForegroundColor Yellow
-    Write-Host "  2. Oder Screen2PC.Sender.exe im Modus 'Surface-Display spiegeln' komplett treiberfrei nutzen." -ForegroundColor Yellow
+    Write-Host "  1. Auf dem Laptop (nur Laptop, NICHT PC!): Bei Bedarf Test-Signing aktivieren (erfordert ggf. deaktiviertes Secure Boot): bcdedit /set testsigning on" -ForegroundColor Yellow
+    Write-Host "  2. Oder Screen2PC.Sender.exe im Modus 'Laptop-Display spiegeln' komplett treiberfrei nutzen." -ForegroundColor Yellow
 } else {
     Write-Host "Fertig! Screen2PC Virtual Display Treiber ist installiert und aktiv." -ForegroundColor Green
 }
