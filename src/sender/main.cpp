@@ -188,6 +188,7 @@ s2p::LidCloseGuard g_lidGuard;
 s2p::SurfaceDimOverlay g_dimOverlay;
 bool g_dimSuppressAuto = false;
 bool g_dimAttempted = false;
+uint32_t g_lastNotifiedBatchId = 0;
 
 bool IsToggleChecked(HWND hwnd, int id) {
     HWND c = GetDlgItem(hwnd, id);
@@ -483,6 +484,25 @@ void SyncSurfacePowerAndDim(const s2p::SenderStatus& st) {
 std::wstring FormatFileProgressText(const s2p::FileTransferStats& fs) {
     if (fs.transferring) {
         std::wostringstream ss;
+        if (fs.isSending && fs.batchTotalFiles > 0) {
+            uint64_t doneBytes = fs.batchCompletedBytes + fs.currentFileBytes;
+            uint64_t totalBytes = std::max<uint64_t>(doneBytes, fs.batchTotalBytes);
+            double pct = (totalBytes > 0)
+                             ? std::min(100.0, (100.0 * static_cast<double>(doneBytes)) / static_cast<double>(totalBytes))
+                             : (100.0 * static_cast<double>(fs.batchCompletedFiles) / static_cast<double>(fs.batchTotalFiles));
+            double doneMb = static_cast<double>(doneBytes) / (1024.0 * 1024.0);
+            double totalMb = static_cast<double>(totalBytes) / (1024.0 * 1024.0);
+            double remMb = std::max(0.0, totalMb - doneMb);
+            uint32_t curFileNum = std::min(fs.batchTotalFiles, fs.batchCompletedFiles + 1);
+
+            ss << L"Sende (" << curFileNum << L"/" << fs.batchTotalFiles << L"): "
+               << std::fixed << std::setprecision(0) << pct << L" %  |  "
+               << std::setprecision(1) << doneMb << L" / " << totalMb << L" MB (noch " << remMb << L" MB)";
+            if (fs.currentSpeedMBps > 0.05) {
+                ss << L"  |  " << std::setprecision(1) << fs.currentSpeedMBps << L" MB/s";
+            }
+            return ss.str();
+        }
         ss << (fs.isSending ? L"Sende: " : L"Empfange: ");
         ss << (fs.currentFileName.empty() ? L"Datei..." : fs.currentFileName);
         if (fs.currentFileTotal > 0) {
@@ -625,12 +645,38 @@ void UpdateUiFromState() {
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_CANCELFILE), st.fileStats.transferring ? TRUE : FALSE);
 
     int progVal = 0;
-    if (st.fileStats.transferring && st.fileStats.currentFileTotal > 0) {
-        progVal = static_cast<int>(std::clamp<uint64_t>(
-            (st.fileStats.currentFileBytes * 1000ULL) / st.fileStats.currentFileTotal, 0ULL, 1000ULL));
+    if (st.fileStats.transferring) {
+        if (st.fileStats.isSending && st.fileStats.batchTotalBytes > 0) {
+            uint64_t doneBytes = st.fileStats.batchCompletedBytes + st.fileStats.currentFileBytes;
+            progVal = static_cast<int>(std::clamp<uint64_t>(
+                (doneBytes * 1000ULL) / st.fileStats.batchTotalBytes, 0ULL, 1000ULL));
+        } else if (st.fileStats.isSending && st.fileStats.batchTotalFiles > 0) {
+            progVal = static_cast<int>(std::clamp<uint64_t>(
+                (static_cast<uint64_t>(st.fileStats.batchCompletedFiles) * 1000ULL) / st.fileStats.batchTotalFiles, 0ULL, 1000ULL));
+        } else if (st.fileStats.currentFileTotal > 0) {
+            progVal = static_cast<int>(std::clamp<uint64_t>(
+                (st.fileStats.currentFileBytes * 1000ULL) / st.fileStats.currentFileTotal, 0ULL, 1000ULL));
+        }
+    } else if (st.fileStats.batchCompleted) {
+        progVal = 1000;
     }
     SendDlgItemMessageW(g_hwnd, IDC_FILE_PROGRESS, PBM_SETPOS, progVal, 0);
     SetDlgItemTextW(g_hwnd, IDC_FILE_STATUS, FormatFileProgressText(st.fileStats).c_str());
+
+    if (st.fileStats.batchCompleted && st.fileStats.batchId != 0 &&
+        st.fileStats.batchId != g_lastNotifiedBatchId && !g_closing.load()) {
+        g_lastNotifiedBatchId = st.fileStats.batchId;
+        if (IsWindowVisible(g_hwnd)) {
+            MessageBoxW(g_hwnd, st.fileStats.lastEvent.c_str(), L"Dateitransfer abgeschlossen", MB_OK | MB_ICONINFORMATION);
+        } else {
+            g_nid.uFlags = NIF_INFO;
+            g_nid.dwInfoFlags = NIIF_INFO;
+            wcscpy_s(g_nid.szInfoTitle, L"Dateitransfer abgeschlossen");
+            wcsncpy_s(g_nid.szInfo, st.fileStats.lastEvent.c_str(), _TRUNCATE);
+            Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+            g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        }
+    }
 }
 
 std::vector<std::wstring> PickFilesDialog(HWND owner) {
@@ -1440,7 +1486,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORDLG: {
         bool inCard = false;
         if (msg == WM_CTLCOLORSTATIC && lp) {
-            inCard = IsSenderCardControlId(GetDlgCtrlID(reinterpret_cast<HWND>(lp)));
+            int ctrlId = GetDlgCtrlID(reinterpret_cast<HWND>(lp));
+            if (ctrlId == IDC_DROP_TITLE || ctrlId == IDC_DROP_SUB) {
+                HDC hdc = reinterpret_cast<HDC>(wp);
+                SetTextColor(hdc, (ctrlId == IDC_DROP_TITLE) ? g_theme.textPrimary : g_theme.textSecondary);
+                SetBkColor(hdc, g_theme.bgDropZone);
+                return reinterpret_cast<LRESULT>(g_theme.brushDropZone);
+            }
+            inCard = IsSenderCardControlId(ctrlId);
         }
         return s2p::ui::HandleCtlColor(msg, wp, g_theme, inCard);
     }

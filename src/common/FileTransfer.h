@@ -29,6 +29,12 @@ struct FileTransferStats {
     uint64_t currentFileBytes = 0;
     uint64_t currentFileTotal = 0;
     uint32_t queuedFiles = 0;
+    uint32_t batchTotalFiles = 0;
+    uint32_t batchCompletedFiles = 0;
+    uint64_t batchTotalBytes = 0;
+    uint64_t batchCompletedBytes = 0;
+    bool batchCompleted = false;
+    uint32_t batchId = 0;
     double currentSpeedMBps = 0.0;
     std::wstring currentFileName;
     std::wstring lastEvent;
@@ -38,6 +44,7 @@ struct FileTransferStats {
 struct SendQueueItem {
     std::wstring fullPath;
     std::wstring relSubdir;
+    uint64_t fileSize = 0;
 };
 
 class FileTransfer {

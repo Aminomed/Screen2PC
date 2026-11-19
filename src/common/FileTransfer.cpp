@@ -115,7 +115,12 @@ void CollectItemsRecursive(const std::wstring& path,
     if (attr & FILE_ATTRIBUTE_REPARSE_POINT) return; // Skip junctions/symlinks to prevent loops
 
     if ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        outItems.push_back({ cleanPath, FileTransfer::SanitizeRelativePath(relSubdir) });
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        uint64_t fsize = 0;
+        if (GetFileAttributesExW(cleanPath.c_str(), GetFileExInfoStandard, &fad)) {
+            fsize = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        }
+        outItems.push_back({ cleanPath, FileTransfer::SanitizeRelativePath(relSubdir), fsize });
         return;
     }
 
@@ -153,7 +158,8 @@ void CollectItemsRecursive(const std::wstring& path,
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             CollectItemsRecursive(child, nextRel, outItems, depth + 1);
         } else {
-            outItems.push_back({ child, nextRel });
+            uint64_t fsize = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            outItems.push_back({ child, nextRel, fsize });
         }
     } while (FindNextFileW(hFind, &fd) && outItems.size() < 10000);
 
@@ -351,9 +357,16 @@ size_t FileTransfer::QueuePaths(const std::vector<std::wstring>& paths) {
     }
     if (collected.empty()) return 0;
 
+    uint64_t addedBytes = 0;
+    for (const auto& item : collected) {
+        addedBytes += item.fileSize;
+    }
+
     size_t totalQueued = 0;
+    bool wasQueueEmpty = false;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
+        wasQueueEmpty = m_sendQueue.empty() && (m_activeSendId.load() == 0);
         for (auto& item : collected) {
             m_sendQueue.push_back(std::move(item));
         }
@@ -361,6 +374,16 @@ size_t FileTransfer::QueuePaths(const std::vector<std::wstring>& paths) {
     }
     {
         std::lock_guard<std::mutex> sLock(m_statsMutex);
+        if (wasQueueEmpty) {
+            m_stats.batchTotalFiles = 0;
+            m_stats.batchCompletedFiles = 0;
+            m_stats.batchTotalBytes = 0;
+            m_stats.batchCompletedBytes = 0;
+            m_stats.batchCompleted = false;
+            m_stats.batchId++;
+        }
+        m_stats.batchTotalFiles += static_cast<uint32_t>(collected.size());
+        m_stats.batchTotalBytes += addedBytes;
         m_stats.queuedFiles = static_cast<uint32_t>(totalQueued);
     }
     m_queueCv.notify_one();
@@ -384,6 +407,11 @@ void FileTransfer::CancelCurrent() {
     {
         std::lock_guard<std::mutex> sLock(m_statsMutex);
         m_stats.queuedFiles = 0;
+        m_stats.batchTotalFiles = 0;
+        m_stats.batchCompletedFiles = 0;
+        m_stats.batchTotalBytes = 0;
+        m_stats.batchCompletedBytes = 0;
+        m_stats.batchCompleted = false;
         m_stats.lastEvent = L"Uebertragung abgebrochen";
     }
 
@@ -423,13 +451,30 @@ void FileTransfer::SendWorker() {
             std::lock_guard<std::mutex> sLock(m_statsMutex);
             m_stats.queuedFiles = static_cast<uint32_t>(m_sendQueue.size());
         }
-        if (!SendSingleFile(nextItem)) {
-            if (!m_cancelCurrentSend.load() && !m_stop) {
-                Logger::Instance().Warn("FILE-TX", L"Failed sending file: " + nextItem.fullPath);
-            }
+        bool ok = SendSingleFile(nextItem);
+        if (!ok && !m_cancelCurrentSend.load() && !m_stop) {
+            Logger::Instance().Warn("FILE-TX", L"Failed sending file: " + nextItem.fullPath);
         }
+        bool wasCanceled = m_cancelCurrentSend.load();
         m_activeSendId = 0;
         m_cancelCurrentSend = false;
+
+        bool queueEmptyNow = false;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            queueEmptyNow = m_sendQueue.empty();
+        }
+        if (queueEmptyNow && !wasCanceled && !m_stop && m_connected.load()) {
+            std::lock_guard<std::mutex> sLock(m_statsMutex);
+            if (m_stats.batchTotalFiles > 0) {
+                m_stats.batchCompleted = true;
+                double totalMb = static_cast<double>(m_stats.batchCompletedBytes) / (1024.0 * 1024.0);
+                wchar_t mbBuf[64]{};
+                swprintf_s(mbBuf, L"%.1f MB", totalMb);
+                m_stats.lastEvent = L"Fertig! " + std::to_wstring(m_stats.batchCompletedFiles) +
+                                    L" Datei(en) (" + mbBuf + L") erfolgreich gesendet.";
+            }
+        }
     }
 }
 
@@ -595,6 +640,8 @@ bool FileTransfer::SendSingleFile(const SendQueueItem& item) {
         m_stats.currentFileName.clear();
         if (done.ok) {
             m_stats.filesSent++;
+            m_stats.batchCompletedFiles++;
+            m_stats.batchCompletedBytes += offset;
             m_stats.lastEvent = L"Gesendet: " + displayName;
             Logger::Instance().Info("FILE-TX", L"Sent file '" + displayName + L"' (" + std::to_wstring(fileSize) + L" bytes)");
         } else if (canceled) {
