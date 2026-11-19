@@ -727,16 +727,10 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
 
     // Poll DXGI outputs until the virtual displays appear in Windows Display Manager
     const auto startPoll = std::chrono::steady_clock::now();
-    const auto deadline = startPoll + std::chrono::milliseconds(5500);
+    const auto deadline = startPoll + std::chrono::milliseconds(6000);
     bool forcedExtend = false;
 
     while (std::chrono::steady_clock::now() < deadline && !m_stop) {
-        if (!forcedExtend && std::chrono::steady_clock::now() - startPoll > std::chrono::milliseconds(1600)) {
-            forcedExtend = true;
-            // Ensure Windows topology is in Extend mode instead of Duplicate / PC-screen-only
-            SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
-        }
-
         auto after = DxgiCapture::EnumerateOutputs();
         std::vector<DisplayOutputInfo> candidates;
 
@@ -765,7 +759,35 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
             }
         }
 
-        if (candidates.size() >= desiredCount) {
+        // Detect Duplicate/Mirror topology: if a newly attached virtual display sits at (0,0)
+        // overlapping an existing primary display, force Windows into Extend mode immediately.
+        bool hasOverlappingPrimary = false;
+        if (!candidates.empty() && !before.empty()) {
+            for (const auto& c : candidates) {
+                if (c.desktopRect.left == 0 && c.desktopRect.top == 0) {
+                    for (const auto& b : before) {
+                        if (b.isPrimary && b.deviceName != c.deviceName) {
+                            hasOverlappingPrimary = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasOverlappingPrimary) break;
+            }
+        }
+
+        if (!forcedExtend &&
+            (hasOverlappingPrimary ||
+             (candidates.size() < desiredCount &&
+              std::chrono::steady_clock::now() - startPoll > std::chrono::milliseconds(1000)))) {
+            forcedExtend = true;
+            // Ensure Windows topology is in Extend mode instead of Duplicate / PC-screen-only
+            SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+            SleepInterruptible(350, m_stop);
+            continue;
+        }
+
+        if (candidates.size() >= desiredCount && !hasOverlappingPrimary) {
             outSelectedOutputs.clear();
             for (const auto& s : specs) {
                 auto it = std::find_if(candidates.begin(), candidates.end(), [&](const DisplayOutputInfo& c) {
@@ -786,6 +808,63 @@ bool SenderEngine::SetupVirtualDisplays(const HelloReceiverPayload& hello,
                 if (!used) outSelectedOutputs.push_back(c);
             }
             if (outSelectedOutputs.size() == desiredCount) {
+                // Force exact target resolution & refresh rate in case Windows CCD restored
+                // a stale cached resolution for this virtual monitor GUID.
+                bool changedAnyMode = false;
+                for (uint32_t i = 0; i < desiredCount; ++i) {
+                    const auto& spec = specs[i];
+                    auto& out = outSelectedOutputs[i];
+                    DEVMODEW curDm{};
+                    curDm.dmSize = sizeof(curDm);
+                    bool hasCur = (EnumDisplaySettingsW(out.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &curDm) != FALSE);
+                    if (out.width == spec.width && out.height == spec.height &&
+                        (!hasCur || curDm.dmDisplayFrequency == spec.refreshHz)) {
+                        continue;
+                    }
+
+                    DEVMODEW dm{};
+                    dm.dmSize = sizeof(dm);
+                    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+                    dm.dmPelsWidth = spec.width;
+                    dm.dmPelsHeight = spec.height;
+                    dm.dmDisplayFrequency = spec.refreshHz;
+
+                    LONG cds = ChangeDisplaySettingsExW(out.deviceName.c_str(), &dm, nullptr,
+                                                        CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+                    if (cds != DISP_CHANGE_SUCCESSFUL && spec.refreshHz != 60) {
+                        dm.dmDisplayFrequency = 60;
+                        cds = ChangeDisplaySettingsExW(out.deviceName.c_str(), &dm, nullptr,
+                                                       CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+                    }
+                    if (cds != DISP_CHANGE_SUCCESSFUL) {
+                        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+                        cds = ChangeDisplaySettingsExW(out.deviceName.c_str(), &dm, nullptr,
+                                                       CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+                    }
+                    if (cds == DISP_CHANGE_SUCCESSFUL) {
+                        changedAnyMode = true;
+                        Logger::Instance().Info("VDD-MODE",
+                            L"Forced virtual display " + out.deviceName + L" to " +
+                            std::to_wstring(dm.dmPelsWidth) + L"x" + std::to_wstring(dm.dmPelsHeight) +
+                            L"@" + std::to_wstring(dm.dmDisplayFrequency) + L"Hz");
+                    } else {
+                        Logger::Instance().Warn("VDD-MODE",
+                            L"ChangeDisplaySettingsExW failed (" + std::to_wstring(cds) + L") for " + out.deviceName);
+                    }
+                }
+                if (changedAnyMode) {
+                    ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+                    SleepInterruptible(250, m_stop);
+                    auto refreshed = DxgiCapture::EnumerateOutputs();
+                    for (auto& out : outSelectedOutputs) {
+                        for (const auto& r : refreshed) {
+                            if (r.deviceName == out.deviceName) {
+                                out = r;
+                                break;
+                            }
+                        }
+                    }
+                }
                 return true;
             }
         }
@@ -1224,9 +1303,31 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     auto handleDynamicResizeIfNeeded = [&]() {
         uint32_t cw = capture.Width();
         uint32_t ch = capture.Height();
+        RECT curRect = capture.DesktopRect();
         ID3D11Device* curDev = capture.Device();
-        if (cw == 0 || ch == 0 || !curDev ||
-            (cw == w->width && ch == w->height && curDev == activeD3dDevice)) {
+        if (cw == 0 || ch == 0 || !curDev) {
+            return;
+        }
+        bool rectChanged = (curRect.left != w->desktopRect.left || curRect.top != w->desktopRect.top ||
+                            curRect.right != w->desktopRect.right || curRect.bottom != w->desktopRect.bottom);
+        if (rectChanged) {
+            w->desktopRect = curRect;
+            if (m_usingExternalDisplays.load()) {
+                std::vector<RECT> updatedRects;
+                {
+                    std::lock_guard<std::mutex> wl(m_workersMutex);
+                    for (const auto& wk : m_workers) {
+                        if (wk->desktopRect.right > wk->desktopRect.left &&
+                            wk->desktopRect.bottom > wk->desktopRect.top) {
+                            updatedRects.push_back(wk->desktopRect);
+                        }
+                    }
+                }
+                std::lock_guard<std::mutex> vl(m_virtualRectsMutex);
+                m_virtualOutputRects = std::move(updatedRects);
+            }
+        }
+        if (cw == w->width && ch == w->height && curDev == activeD3dDevice) {
             return;
         }
         Logger::Instance().Info("SND-WRK", L"Capture reset/resize: " +

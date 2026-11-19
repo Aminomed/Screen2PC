@@ -62,6 +62,7 @@ void DxgiCapture::Shutdown() {
     m_metaBuf.clear();
     m_width = 0;
     m_height = 0;
+    m_desktopRect = RECT{};
     m_initialized = false;
 }
 
@@ -88,6 +89,7 @@ bool DxgiCapture::Init(uint32_t adapterIndex, uint32_t outputIndex) {
         od.DesktopCoordinates.bottom <= od.DesktopCoordinates.top) {
         return false;
     }
+    m_desktopRect = od.DesktopCoordinates;
     m_width = static_cast<uint32_t>(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
     m_height = static_cast<uint32_t>(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
     if (m_width == 0 || m_height == 0) return false;

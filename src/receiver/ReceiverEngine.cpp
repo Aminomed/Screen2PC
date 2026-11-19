@@ -49,8 +49,14 @@ BOOL CALLBACK MonitorEnumCb(HMONITOR hMon, HDC, LPRECT, LPARAM data) {
 
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
-    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency >= 24) {
-        md.refreshHz = dm.dmDisplayFrequency;
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+        if (dm.dmPelsWidth > 0 && dm.dmPelsHeight > 0) {
+            md.width = dm.dmPelsWidth;
+            md.height = dm.dmPelsHeight;
+        }
+        if (dm.dmDisplayFrequency >= 24) {
+            md.refreshHz = dm.dmDisplayFrequency;
+        }
     }
 
     wcsncpy_s(md.friendlyName, _countof(md.friendlyName), mi.szDevice, _TRUNCATE);

@@ -65,6 +65,7 @@ public:
     ID3D11Texture2D* FrameTexture() const { return m_frameTex.Get(); }
     uint32_t Width() const { return m_width; }
     uint32_t Height() const { return m_height; }
+    RECT DesktopRect() const { return m_desktopRect; }
     bool IsInitialized() const { return m_initialized; }
 
     bool CopyFrameToCpu(std::vector<uint8_t>& outBgra,
@@ -78,6 +79,7 @@ private:
     uint32_t m_outputIndex = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    RECT m_desktopRect{};
     bool m_initialized = false;
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;

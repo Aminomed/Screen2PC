@@ -31,8 +31,9 @@ BOOL CALLBACK CollectMonitorRectsProc(HMONITOR, HDC, LPRECT lprc, LPARAM dwData)
     return TRUE;
 }
 
-const std::vector<RECT>& GetCachedMonitorRectsLocked(std::chrono::steady_clock::time_point now) {
-    if (g_cachedMonitorRects.empty() ||
+const std::vector<RECT>& GetCachedMonitorRectsLocked(std::chrono::steady_clock::time_point now, bool forceRefresh) {
+    if (forceRefresh ||
+        g_cachedMonitorRects.empty() ||
         g_cachedVWidth <= 0 || g_cachedVHeight <= 0 ||
         (now - g_lastMonitorEnumTick) > std::chrono::milliseconds(500)) {
         g_cachedMonitorRects.clear();
@@ -299,7 +300,14 @@ bool KvmInput::InjectMouse(const KvmMouseEvent& ev, const RECT& targetDesktopRec
     {
         std::lock_guard<std::mutex> lock(g_cursorStateMutex);
         auto now = std::chrono::steady_clock::now();
-        const auto& mons = GetCachedMonitorRectsLocked(now);
+        bool outOfCachedBounds = (targetDesktopRect.right > targetDesktopRect.left &&
+                                  targetDesktopRect.bottom > targetDesktopRect.top &&
+                                  g_cachedVWidth > 0 && g_cachedVHeight > 0) &&
+                                 (targetDesktopRect.left < g_cachedVLeft ||
+                                  targetDesktopRect.top < g_cachedVTop ||
+                                  targetDesktopRect.right > g_cachedVLeft + g_cachedVWidth ||
+                                  targetDesktopRect.bottom > g_cachedVTop + g_cachedVHeight);
+        const auto& mons = GetCachedMonitorRectsLocked(now, outOfCachedBounds);
         const int32_t vLeft = g_cachedVLeft;
         const int32_t vTop = g_cachedVTop;
         const int32_t vWidth = g_cachedVWidth;

@@ -50,6 +50,97 @@ bool IsStartupApprovedDisabled(const wchar_t* valueName) {
     return false;
 }
 
+bool IsSenderTaskMode(const wchar_t* valueName) {
+    return valueName && _wcsicmp(valueName, kAutostartSenderValueName) == 0;
+}
+
+bool RunSchtasks(const std::wstring& args, std::wstring* outStdout = nullptr) {
+    std::wstring cmd = L"schtasks.exe " + args;
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
+    HANDLE hRead = nullptr;
+    HANDLE hWrite = nullptr;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    if (outStdout) {
+        CreatePipe(&hRead, &hWrite, &sa, 0);
+        if (hRead) SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (outStdout && hWrite) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdOutput = hWrite;
+        si.hStdError = hWrite;
+    }
+
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr,
+                             (outStdout && hWrite) ? TRUE : FALSE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (hWrite) CloseHandle(hWrite);
+
+    if (!ok) {
+        if (hRead) CloseHandle(hRead);
+        return false;
+    }
+
+    if (outStdout && hRead) {
+        std::string raw;
+        char buf[1024];
+        DWORD bytesRead = 0;
+        while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
+            raw.append(buf, bytesRead);
+        }
+        if (!raw.empty()) {
+            int wlen = MultiByteToWideChar(CP_OEMCP, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
+            if (wlen > 0) {
+                outStdout->resize(wlen);
+                MultiByteToWideChar(CP_OEMCP, 0, raw.data(), static_cast<int>(raw.size()), outStdout->data(), wlen);
+            }
+        }
+    }
+    if (hRead) CloseHandle(hRead);
+
+    WaitForSingleObject(pi.hProcess, 5000);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return exitCode == 0;
+}
+
+std::wstring EscapeForCmdArg(const std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size() + 8);
+    for (wchar_t ch : s) {
+        if (ch == L'"') {
+            out += L"\\\"";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
+void DeleteLegacyRunEntries(const wchar_t* valueName) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hKey, valueName);
+        RegCloseKey(hKey);
+    }
+    HKEY hAppKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kStartupApprovedKey, 0, KEY_WRITE, &hAppKey) == ERROR_SUCCESS) {
+        RegDeleteValueW(hAppKey, valueName);
+        RegCloseKey(hAppKey);
+    }
+}
+
 } // namespace
 
 bool HasCliFlag(const wchar_t* cmdLine, const wchar_t* flag) {
@@ -112,6 +203,10 @@ std::wstring ExtractExePathFromCommand(const std::wstring& cmd) {
 
 bool IsAutostartEnabled(const wchar_t* valueName) {
     if (!valueName || !*valueName) return false;
+    if (IsSenderTaskMode(valueName)) {
+        return RunSchtasks(L"/Query /TN \"Screen2PC Sender\"");
+    }
+
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         return false;
@@ -132,6 +227,21 @@ bool IsAutostartEnabled(const wchar_t* valueName) {
 
 bool SetAutostartEnabled(bool enabled, const wchar_t* valueName) {
     if (!valueName || !*valueName) return false;
+
+    if (IsSenderTaskMode(valueName)) {
+        DeleteLegacyRunEntries(valueName);
+        if (enabled) {
+            std::wstring exe = CurrentExePath();
+            std::wstring cmd = BuildAutostartCommand(exe);
+            if (cmd.empty()) return false;
+            std::wstring args = L"/Create /TN \"Screen2PC Sender\" /TR \"" +
+                                EscapeForCmdArg(cmd) + L"\" /SC ONLOGON /RL HIGHEST /F";
+            return RunSchtasks(args);
+        } else {
+            RunSchtasks(L"/Delete /TN \"Screen2PC Sender\" /F");
+            return true;
+        }
+    }
 
     if (enabled) {
         std::wstring exe = CurrentExePath();
@@ -156,21 +266,24 @@ bool SetAutostartEnabled(bool enabled, const wchar_t* valueName) {
         }
         return true;
     } else {
-        HKEY hKey = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
-            RegDeleteValueW(hKey, valueName);
-            RegCloseKey(hKey);
-        }
-        HKEY hAppKey = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, kStartupApprovedKey, 0, KEY_WRITE, &hAppKey) == ERROR_SUCCESS) {
-            RegDeleteValueW(hAppKey, valueName);
-            RegCloseKey(hAppKey);
-        }
+        DeleteLegacyRunEntries(valueName);
         return true;
     }
 }
 
 void RefreshAutostartPathIfNeeded(const wchar_t* valueName) {
+    if (IsSenderTaskMode(valueName)) {
+        if (!IsAutostartEnabled(valueName)) return;
+        std::wstring xml;
+        if (RunSchtasks(L"/Query /TN \"Screen2PC Sender\" /XML", &xml)) {
+            std::wstring exe = CurrentExePath();
+            if (!exe.empty() && ToLowerCopy(xml).find(ToLowerCopy(exe)) == std::wstring::npos) {
+                SetAutostartEnabled(true, valueName);
+            }
+        }
+        return;
+    }
+
     if (!IsAutostartEnabled(valueName)) return;
 
     HKEY hKey = nullptr;
