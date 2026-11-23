@@ -206,8 +206,9 @@ bool AmfEncoder::Initialize(ID3D11Device* device,
         res = enc->pVtbl->Init(enc, AMF_SURFACE_NV12, w, h);
     }
     if (res != AMF_OK) {
-        Logger::Instance().Log(L"AmfEncoder: encoder->Init failed (codec=%d res=%d).",
-                               static_cast<int>(codec), static_cast<int>(res));
+        Logger::Instance().Warn("AMF-INIT",
+            L"encoder->Init failed (codec=" + std::to_wstring(static_cast<int>(codec)) +
+            L", res=" + std::to_wstring(static_cast<int>(res)) + L")");
         Shutdown();
         return false;
     }
@@ -323,10 +324,10 @@ bool AmfEncoder::Initialize(ID3D11Device* device,
     }
 
     m_initialized = true;
-    Logger::Instance().Log(L"AmfEncoder: initialized %s %ux%u@%uHz (bitrate=%llu Mbps, directVP=%d).",
-                           BackendName().c_str(), width, height, m_fps,
-                           static_cast<unsigned long long>(m_bitrateBps / 1000000ULL),
-                           m_directVpWrite ? 1 : 0);
+    Logger::Instance().Info("AMF-INIT",
+        BackendName() + L" initialized " + std::to_wstring(width) + L"x" + std::to_wstring(height) +
+        L"@" + std::to_wstring(m_fps) + L"Hz (" + std::to_wstring(m_bitrateBps / 1000000ULL) +
+        L" Mbps, directVP=" + (m_directVpWrite ? L"1" : L"0") + L")");
     return true;
 }
 

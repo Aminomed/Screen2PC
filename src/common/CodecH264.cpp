@@ -650,8 +650,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
 
         m_mft = candidate;
         m_isHardware = tryHardware;
-        m_isAmf = tryHardware && (ProbeAmfRuntimePresent() ||
-                                  candidateName.find(L"AMD") != std::wstring::npos ||
+        m_isAmf = tryHardware && (candidateName.find(L"AMD") != std::wstring::npos ||
                                   candidateName.find(L"AMF") != std::wstring::npos);
         if (m_isAmf && candidateName.find(L"AMF") == std::wstring::npos) {
             m_friendlyName = candidateName + L" (AMF Ultra-Low-Latency)";
