@@ -1366,7 +1366,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 size_t wireBytes = 0;
 
                 if (videoUdpReady && pktOpt->payload.size() <= kUdpVideoMaxPayloadBytes) {
-                    uint32_t parityCnt = 0;
+                    size_t parityCnt = 0;
                     if (udpFecSender.BuildPackets(w->streamIndex,
                                                   pktOpt->header.frameIndex,
                                                   pktOpt->isKeyframe,

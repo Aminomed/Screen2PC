@@ -1654,7 +1654,7 @@ void TestUdpVideoFec() {
     vh.dataSize = static_cast<uint32_t>(keyBytes.size());
 
     std::vector<std::vector<uint8_t>> pkts;
-    uint32_t parityCnt = 0;
+    size_t parityCnt = 0;
     CHECK(sender.BuildPackets(0, vh.frameIndex, true, vh, keyBytes.data(), keyBytes.size(), pkts, &parityCnt),
           "UdpVideoFecSender::BuildPackets failed on keyframe");
     CHECK(pkts.size() > 20 && parityCnt >= 2, "Expected multi-group FEC packets on 48KB keyframe");
