@@ -356,7 +356,9 @@ void ReadStreamSettingsFromUi(HWND hwnd,
                               int& outBrIdx,
                               int& outFpsIdx) {
     outCodecIdx = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_CODEC_COMBO, CB_GETCURSEL, 0, 0));
-    outCodec = (outCodecIdx == 1) ? s2p::CodecType::DeltaLossless : s2p::CodecType::H264;
+    if (outCodecIdx == 1) outCodec = s2p::CodecType::HEVC;
+    else if (outCodecIdx == 2) outCodec = s2p::CodecType::DeltaLossless;
+    else outCodec = s2p::CodecType::H264;
 
     outBrIdx = static_cast<int>(SendDlgItemMessageW(hwnd, IDC_BITRATE_COMBO, CB_GETCURSEL, 0, 0));
     outBitrateMbps = s2p::BitrateFromPresetIndex(outBrIdx);
@@ -1097,8 +1099,9 @@ void CreateUiControls(HWND hwnd) {
     addCtrl(L"STATIC", L"Stream (Live):", SS_CENTERIMAGE, IDC_LBL_STREAM);
     HWND codecCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_CODEC_COMBO);
     SendMessageW(codecCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"H.264 Low-Latency"));
+    SendMessageW(codecCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"HEVC (H.265) Low-Latency"));
     SendMessageW(codecCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Delta Lossless (4:4:4)"));
-    int savedCodec = std::clamp(LoadSetting(L"CodecIdx", 0), 0, 1);
+    int savedCodec = std::clamp(LoadSetting(L"CodecIdx", 0), 0, 2);
     SendMessageW(codecCb, CB_SETCURSEL, savedCodec, 0);
 
     HWND brCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_BITRATE_COMBO);

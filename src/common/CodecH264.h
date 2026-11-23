@@ -2,10 +2,12 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include "Protocol.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <memory>
 #include <vector>
 #include <string>
 
@@ -15,6 +17,8 @@ struct IMFDXGIDeviceManager;
 struct ICodecAPI;
 
 namespace s2p {
+
+class AmfEncoder;
 
 class H264Encoder {
 public:
@@ -31,12 +35,14 @@ public:
               uint32_t height,
               uint32_t fps,
               uint32_t bitrateMbps,
-              bool allowHardware = true);
+              bool allowHardware = true,
+              CodecType codec = CodecType::H264);
 
     void Shutdown();
     bool IsInitialized() const { return m_initialized; }
     bool IsHardware() const { return m_isHardware; }
     bool IsAmfActive() const { return m_isAmf; }
+    CodecType ActiveCodec() const { return m_codec; }
     bool WasLastCallWarmup() const { return m_lastWasWarmup; }
     std::wstring FriendlyName() const { return m_friendlyName; }
 
@@ -74,6 +80,7 @@ private:
     uint32_t m_height = 0;
     uint32_t m_fps = 60;
     uint32_t m_bitrateBps = 25000000;
+    CodecType m_codec = CodecType::H264;
     bool m_initialized = false;
     bool m_mfStarted = false;
     bool m_isHardware = false;
@@ -89,6 +96,8 @@ private:
     DWORD m_outputBufferSize = 0;
     uint64_t m_frameCounter = 0;
     std::wstring m_friendlyName;
+
+    std::unique_ptr<AmfEncoder> m_amf;
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
@@ -126,13 +135,15 @@ public:
               uint32_t width,
               uint32_t height,
               bool allowHardware = true,
-              uint32_t fps = 60);
+              uint32_t fps = 60,
+              CodecType codec = CodecType::H264);
     void Shutdown();
     bool IsInitialized() const { return m_initialized; }
     bool IsHardwareDxva() const { return m_dxvaEnabled; }
+    CodecType ActiveCodec() const { return m_codec; }
     bool WasLastCallNeedMoreInput() const { return m_lastNeedMoreInput; }
 
-    // Decodes Annex-B H.264 frame into outBgraTexture (if provided and GPU path active)
+    // Decodes Annex-B H.264/HEVC frame into outBgraTexture (if provided and GPU path active)
     // and/or outBgraCpu (if provided), OR directly into outNv12Texture (zero-VP direct NV12 shader path!).
     bool Decode(const uint8_t* annexBData,
                 size_t dataSize,
@@ -169,6 +180,7 @@ private:
     uint32_t m_codedWidth = 0;
     uint32_t m_codedHeight = 0;
     uint32_t m_decodedStride = 0;
+    CodecType m_codec = CodecType::H264;
     bool m_initialized = false;
     bool m_mfStarted = false;
     bool m_dxvaEnabled = false;

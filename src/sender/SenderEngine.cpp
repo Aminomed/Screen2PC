@@ -1,8 +1,10 @@
 #include "SenderEngine.h"
+#include "GpuDeltaAnalyzer.h"
 #include "VirtualDisplayCtl.h"
 #include "../common/BitratePresets.h"
 #include "../common/KvmInput.h"
 #include "../common/Logger.h"
+#include "../common/UdpVideoFec.h"
 
 #include <objbase.h>
 #include <algorithm>
@@ -1234,20 +1236,36 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     uint32_t configBitrateMbps = w->desiredBitrateMbps.load();
     uint32_t liveBitrateMbps = configBitrateMbps;
 
+    auto isVideoCodec = [](CodecType c) {
+        return c == CodecType::H264 || c == CodecType::HEVC;
+    };
+
     H264Encoder h264;
-    if (activeCodec == CodecType::H264) {
-        if (!h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps)) {
-            Logger::Instance().Warn("SND-WRK", L"H264Encoder init failed; falling back to DeltaLossless.");
-            activeCodec = CodecType::DeltaLossless;
+    if (isVideoCodec(activeCodec)) {
+        if (!h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, true, activeCodec)) {
+            if (activeCodec == CodecType::HEVC &&
+                h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, true, CodecType::H264)) {
+                Logger::Instance().Warn("SND-WRK", L"HEVC encoder init failed; falling back to H.264.");
+                activeCodec = CodecType::H264;
+            } else {
+                Logger::Instance().Warn("SND-WRK", L"Video encoder init failed; falling back to DeltaLossless.");
+                activeCodec = CodecType::DeltaLossless;
+            }
         }
     }
 
     auto h264Label = [&]() -> std::wstring {
-        if (h264.IsAmfActive()) return L"H.264 (AMF ULL)";
+        if (h264.IsAmfActive()) {
+            return (activeCodec == CodecType::HEVC) ? L"HEVC (AMF Direct)" : L"H.264 (AMF Direct)";
+        }
+        if (activeCodec == CodecType::HEVC) {
+            return h264.IsHardware() ? L"HEVC (GPU)" : L"HEVC (CPU)";
+        }
         return h264.IsHardware() ? L"H.264 (GPU)" : L"H.264 (CPU)";
     };
 
     DeltaEncoder delta;
+    GpuDeltaAnalyzer gpuDelta;
     std::vector<uint8_t> encodedPayload;
     std::vector<uint8_t> cpuBgra;
     std::vector<DeltaRect> pendingDirtyRects;
@@ -1269,7 +1287,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         w->stats.configuredBitrateMbps = configBitrateMbps;
         w->stats.liveBitrateMbps = liveBitrateMbps;
         w->stats.targetFps = effFps;
-        if (activeCodec == CodecType::H264) {
+        if (isVideoCodec(activeCodec)) {
             w->stats.codecName = h264Label();
             w->stats.hardwareAccelerated = h264.IsHardware();
         } else {
@@ -1278,11 +1296,19 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
     }
 
-    // Decoupled 1-slot Latest-Frame-Wins TCP sender thread + priority cursor-shape queue
-    // so capture/encode NEVER blocks on TCP SendAll or sockSendMutex.
+    UdpSocket videoUdpSock;
+    const bool videoUdpReady = videoUdpSock.Bind(0);
+    if (videoUdpReady) {
+        videoUdpSock.SetBufferSizes(8 * 1024 * 1024, 256 * 1024);
+    }
+    const uint16_t peerVideoUdpPort = static_cast<uint16_t>(kPortVideoUdpBase + w->streamIndex);
+    UdpVideoFecSender udpFecSender;
+
+    // Decoupled 1-slot Latest-Frame-Wins sender thread (UDP+RS-FEC for <=256KB frames, TCP fallback)
+    // + priority cursor-shape queue so capture/encode NEVER blocks on socket sends.
     struct PendingVideoPacket {
-        std::vector<uint8_t> bytes;
-        CodecType codec = CodecType::H264;
+        VideoFrameHeader header{};
+        std::vector<uint8_t> payload;
         bool isKeyframe = false;
     };
     std::mutex sockSendMutex;
@@ -1299,6 +1325,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
     std::thread asyncSendThread([&]() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        std::vector<std::vector<uint8_t>> udpShards;
+        std::vector<uint8_t> tcpFrameBuf;
         while (true) {
             std::vector<std::vector<uint8_t>> cursorsToSend;
             std::optional<PendingVideoPacket> pktOpt;
@@ -1334,11 +1362,46 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             if (pktOpt.has_value()) {
                 LARGE_INTEGER s0{}, s1{};
                 QueryPerformanceCounter(&s0);
-                bool ok = false;
-                {
-                    std::lock_guard<std::mutex> sl(sockSendMutex);
-                    ok = sock.SendPacket(MsgType::VideoFrame, pktOpt->bytes.data(), static_cast<uint32_t>(pktOpt->bytes.size()));
+                bool sentOverUdp = false;
+                size_t wireBytes = 0;
+
+                if (videoUdpReady && pktOpt->payload.size() <= kUdpVideoMaxPayloadBytes) {
+                    uint32_t parityCnt = 0;
+                    if (udpFecSender.BuildPackets(w->streamIndex,
+                                                  pktOpt->header.frameIndex,
+                                                  pktOpt->isKeyframe,
+                                                  pktOpt->header,
+                                                  pktOpt->payload.data(),
+                                                  pktOpt->payload.size(),
+                                                  udpShards,
+                                                  &parityCnt)) {
+                        sentOverUdp = true;
+                        for (const auto& shard : udpShards) {
+                            if (!videoUdpSock.SendTo(w->peerIp, peerVideoUdpPort, shard.data(), shard.size())) {
+                                sentOverUdp = false;
+                                break;
+                            }
+                            wireBytes += shard.size();
+                        }
+                    }
                 }
+
+                bool ok = sentOverUdp;
+                if (!ok) {
+                    tcpFrameBuf.resize(sizeof(VideoFrameHeader) + pktOpt->payload.size());
+                    std::memcpy(tcpFrameBuf.data(), &pktOpt->header, sizeof(VideoFrameHeader));
+                    if (!pktOpt->payload.empty()) {
+                        std::memcpy(tcpFrameBuf.data() + sizeof(VideoFrameHeader),
+                                    pktOpt->payload.data(),
+                                    pktOpt->payload.size());
+                    }
+                    {
+                        std::lock_guard<std::mutex> sl(sockSendMutex);
+                        ok = sock.SendPacket(MsgType::VideoFrame, tcpFrameBuf.data(), static_cast<uint32_t>(tcpFrameBuf.size()));
+                    }
+                    wireBytes = tcpFrameBuf.size() + sizeof(PacketHeader);
+                }
+
                 QueryPerformanceCounter(&s1);
                 if (!ok) {
                     sendFailed.store(true);
@@ -1347,7 +1410,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 double ms = static_cast<double>(s1.QuadPart - s0.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
                 latestSendMs.store(ms, std::memory_order_relaxed);
                 sendMsUpdated.store(true, std::memory_order_release);
-                sentPacketBytes.fetch_add(pktOpt->bytes.size() + sizeof(PacketHeader), std::memory_order_relaxed);
+                sentPacketBytes.fetch_add(wireBytes, std::memory_order_relaxed);
             }
         }
     });
@@ -1365,22 +1428,16 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
     auto queueVideoPacket = [&](CodecType pktCodec, bool isKeyframe, const std::vector<uint8_t>& payloadBytes) {
         PendingVideoPacket pkt;
-        pkt.codec = pktCodec;
         pkt.isKeyframe = isKeyframe;
-        pkt.bytes.resize(sizeof(VideoFrameHeader) + payloadBytes.size());
-
-        VideoFrameHeader vh{};
-        vh.monitorIndex = w->targetPcMonitor;
-        vh.frameIndex = ++frameIndex;
-        vh.timestampUs = NowUs();
-        vh.width = capture.Width();
-        vh.height = capture.Height();
-        vh.codec = static_cast<uint8_t>(pktCodec);
-        vh.flags = (isKeyframe ? kFrameFlagKeyframe : kFrameFlagNone);
-        vh.dataSize = static_cast<uint32_t>(payloadBytes.size());
-
-        std::memcpy(pkt.bytes.data(), &vh, sizeof(VideoFrameHeader));
-        std::memcpy(pkt.bytes.data() + sizeof(VideoFrameHeader), payloadBytes.data(), payloadBytes.size());
+        pkt.header.monitorIndex = w->targetPcMonitor;
+        pkt.header.frameIndex = ++frameIndex;
+        pkt.header.timestampUs = NowUs();
+        pkt.header.width = capture.Width();
+        pkt.header.height = capture.Height();
+        pkt.header.codec = static_cast<uint8_t>(pktCodec);
+        pkt.header.flags = (isKeyframe ? kFrameFlagKeyframe : kFrameFlagNone);
+        pkt.header.dataSize = static_cast<uint32_t>(payloadBytes.size());
+        pkt.payload = payloadBytes;
 
         {
             std::lock_guard<std::mutex> ql(sendQueueMutex);
@@ -1445,9 +1502,10 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         w->height = ch;
         activeD3dDevice = curDev;
         delta.Reset();
-        if (activeCodec == CodecType::H264) {
-            if (!h264.Init(capture.Device(), capture.Context(), cw, ch, effFps, liveBitrateMbps)) {
-                Logger::Instance().Warn("SND-WRK", L"H264Encoder re-init failed after reset/resize; switching to DeltaLossless.");
+        gpuDelta.Shutdown();
+        if (isVideoCodec(activeCodec)) {
+            if (!h264.Init(capture.Device(), capture.Context(), cw, ch, effFps, liveBitrateMbps, true, activeCodec)) {
+                Logger::Instance().Warn("SND-WRK", L"Video encoder re-init failed after reset/resize; switching to DeltaLossless.");
                 h264.Shutdown();
                 activeCodec = CodecType::DeltaLossless;
             }
@@ -1459,7 +1517,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             w->stats.configuredBitrateMbps = configBitrateMbps;
             w->stats.liveBitrateMbps = liveBitrateMbps;
             w->stats.targetFps = effFps;
-            if (activeCodec == CodecType::H264) {
+            if (isVideoCodec(activeCodec)) {
                 w->stats.codecName = h264Label();
                 w->stats.hardwareAccelerated = h264.IsHardware();
             } else {
@@ -1507,6 +1565,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             if (newCodec == CodecType::DeltaLossless) {
                 h264.Shutdown();
                 delta.Reset();
+                gpuDelta.Shutdown();
                 activeCodec = CodecType::DeltaLossless;
                 sentInitialFrame = false;
                 pendingDirtyRects.clear();
@@ -1514,17 +1573,22 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 forceFullDirtyRect = true;
             } else {
                 delta.Reset();
-                if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps)) {
+                gpuDelta.Shutdown();
+                if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, true, newCodec)) {
+                    activeCodec = newCodec;
+                } else if (newCodec == CodecType::HEVC &&
+                           h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, true, CodecType::H264)) {
+                    Logger::Instance().Warn("SND-WRK", L"Live switch to HEVC failed; using H.264.");
                     activeCodec = CodecType::H264;
                 } else {
-                    Logger::Instance().Warn("SND-WRK", L"Live switch to H.264 failed; keeping Delta Lossless.");
+                    Logger::Instance().Warn("SND-WRK", L"Live switch to video codec failed; keeping Delta Lossless.");
                     activeCodec = CodecType::DeltaLossless;
                 }
                 sentInitialFrame = false;
             }
-        } else if (activeCodec == CodecType::H264) {
+        } else if (isVideoCodec(activeCodec)) {
             if (fpsChanged) {
-                if (!h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps)) {
+                if (!h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, true, activeCodec)) {
                     h264.Shutdown();
                     activeCodec = CodecType::DeltaLossless;
                 }
@@ -1544,7 +1608,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         w->stats.configuredBitrateMbps = configBitrateMbps;
         w->stats.liveBitrateMbps = liveBitrateMbps;
         w->stats.targetFps = effFps;
-        if (activeCodec == CodecType::H264) {
+        if (isVideoCodec(activeCodec)) {
             w->stats.codecName = h264Label();
             w->stats.hardwareAccelerated = h264.IsHardware();
         } else {
@@ -1663,7 +1727,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             ++windowSendCount;
             smoothedSendMs = (smoothedSendMs <= 0.0) ? sendMs : (smoothedSendMs * 0.75 + sendMs * 0.25);
 
-            if (activeCodec == CodecType::H264) {
+            if (isVideoCodec(activeCodec)) {
                 const double stallThreshMs = std::max<double>(10.0, 900.0 / static_cast<double>(effFps));
                 if (sendMs > stallThreshMs) {
                     cleanSendStreak = 0;
@@ -1676,7 +1740,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                             w->stats.liveBitrateMbps = liveBitrateMbps;
                             Logger::Instance().Warn("SND-ABR",
                                 L"Send stall (" + std::to_wstring(static_cast<int>(sendMs)) +
-                                L" ms) -> reduced H.264 bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                                L" ms) -> reduced bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
                         }
                     }
                 } else {
@@ -1691,7 +1755,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                                 std::lock_guard<std::mutex> sl(w->statsMutex);
                                 w->stats.liveBitrateMbps = liveBitrateMbps;
                                 Logger::Instance().Info("SND-ABR",
-                                    L"Network recovered -> raised H.264 bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                                    L"Network recovered -> raised bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
                             }
                         }
                     } else if (sendMs >= 6.0) {
@@ -1711,19 +1775,27 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             encodedPayload.clear();
             bool isKeyframe = false;
             bool encodeOk = false;
+            bool gpuReportedIdle = false;
             CodecType encodedCodec = activeCodec;
 
             LARGE_INTEGER encStartLi{}, encEndLi{};
             QueryPerformanceCounter(&encStartLi);
 
-            if (activeCodec == CodecType::H264) {
+            if (isVideoCodec(activeCodec)) {
                 if (needKey) h264.RequestKeyframe();
                 encodeOk = h264.EncodeTexture(capture.FrameTexture(), NowUs(), encodedPayload, isKeyframe);
                 if (!encodeOk && !sentInitialFrame && !h264.WasLastCallWarmup()) {
                     if (++consecutiveH264Fails >= 4) {
                         if (h264.IsHardware()) {
-                            Logger::Instance().Warn("SND-WRK", L"GPU H.264 encode failed at runtime; switching to CPU H.264.");
-                            if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, false)) {
+                            Logger::Instance().Warn("SND-WRK", L"GPU video encode failed at runtime; trying fallback encoder.");
+                            if (activeCodec == CodecType::HEVC &&
+                                h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, true, CodecType::H264)) {
+                                activeCodec = CodecType::H264;
+                                std::lock_guard<std::mutex> sl(w->statsMutex);
+                                w->stats.codecName = h264Label();
+                                w->stats.hardwareAccelerated = h264.IsHardware();
+                                consecutiveH264Fails = 0;
+                            } else if (h264.Init(capture.Device(), capture.Context(), w->width, w->height, effFps, liveBitrateMbps, false, activeCodec)) {
                                 std::lock_guard<std::mutex> sl(w->statsMutex);
                                 w->stats.codecName = h264Label();
                                 w->stats.hardwareAccelerated = false;
@@ -1735,7 +1807,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                                 w->stats.hardwareAccelerated = false;
                             }
                         } else {
-                            Logger::Instance().Warn("SND-WRK", L"H.264 encode failed at runtime; switching to Delta Lossless.");
+                            Logger::Instance().Warn("SND-WRK", L"Video encode failed at runtime; switching to Delta Lossless.");
                             activeCodec = CodecType::DeltaLossless;
                             std::lock_guard<std::mutex> sl(w->statsMutex);
                             w->stats.codecName = L"Delta Lossless";
@@ -1749,82 +1821,142 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
             if (activeCodec == CodecType::DeltaLossless) {
                 encodedCodec = CodecType::DeltaLossless;
-                std::vector<DeltaRect> mergedHints;
-                std::vector<DeltaRect> copyRegions;
-                uint64_t approxHintArea = 0;
-                const uint64_t totalScreenArea = static_cast<uint64_t>(capture.Width()) * capture.Height();
-
-                if (!forceFullDirtyRect && !needKey && (!pendingDirtyRects.empty() || !pendingMoveRects.empty())) {
-                    mergedHints = DeltaEncoder::MergeAndBoundRects(
-                        pendingDirtyRects, capture.Width(), capture.Height(), 32);
-                    copyRegions = mergedHints;
-                    for (const auto& r : mergedHints) {
-                        approxHintArea += static_cast<uint64_t>(r.w) * r.h;
-                    }
-                    for (const auto& m : pendingMoveRects) {
-                        copyRegions.push_back(DeltaRect{m.dstX, m.dstY, m.w, m.h});
-                        approxHintArea += static_cast<uint64_t>(m.w) * m.h;
-                    }
-                } else {
-                    approxHintArea = totalScreenArea;
+                if (capture.Device() && capture.Context() &&
+                    (!gpuDelta.IsInitialized() || gpuDelta.Width() != capture.Width() || gpuDelta.Height() != capture.Height())) {
+                    gpuDelta.Init(capture.Device(), capture.Context(), capture.Width(), capture.Height());
                 }
 
-                // Only engage 2x2 fast-motion on *sustained* large-area motion (>= 2 consecutive large frames
-                // within 150ms) so single tab/window switches render 100% razor-sharp immediately!
-                const int64_t fastWindowQpc = (qpcFreq * 150) / 1000;
-                const bool isLargeFrame = (totalScreenArea > 0) && (approxHintArea * 100ULL >= totalScreenArea * 35ULL);
-                if (isLargeFrame) {
-                    if (lastLargeDeltaQpc > 0 && (nowQpc - lastLargeDeltaQpc) <= fastWindowQpc) {
-                        ++consecutiveLargeDeltaFrames;
+                std::vector<DeltaRect> gpuDirtyRects;
+                bool usedGpuAnalyzer = false;
+                if (!forceFullDirtyRect && !needKey && pendingMoveRects.empty() &&
+                    gpuDelta.IsInitialized() && capture.FrameTexture()) {
+                    usedGpuAnalyzer = gpuDelta.AnalyzeDirty(capture.FrameTexture(), false, gpuDirtyRects, cpuBgra, cpuStride);
+                }
+
+                if (usedGpuAnalyzer) {
+                    if (gpuDirtyRects.empty()) {
+                        gpuReportedIdle = true;
+                        pendingImageUpdate = false;
+                        pendingDirtyRects.clear();
+                        pendingMoveRects.clear();
+                        forceFullDirtyRect = false;
                     } else {
-                        consecutiveLargeDeltaFrames = 1;
+                        const uint64_t totalScreenArea = static_cast<uint64_t>(capture.Width()) * capture.Height();
+                        uint64_t approxHintArea = 0;
+                        for (const auto& r : gpuDirtyRects) {
+                            approxHintArea += static_cast<uint64_t>(r.w) * r.h;
+                        }
+                        const int64_t fastWindowQpc = (qpcFreq * 150) / 1000;
+                        const bool isLargeFrame = (totalScreenArea > 0) && (approxHintArea * 100ULL >= totalScreenArea * 35ULL);
+                        if (isLargeFrame) {
+                            if (lastLargeDeltaQpc > 0 && (nowQpc - lastLargeDeltaQpc) <= fastWindowQpc) {
+                                ++consecutiveLargeDeltaFrames;
+                            } else {
+                                consecutiveLargeDeltaFrames = 1;
+                            }
+                            lastLargeDeltaQpc = nowQpc;
+                        } else {
+                            consecutiveLargeDeltaFrames = 0;
+                        }
+                        const bool allowFastMotion = (consecutiveLargeDeltaFrames >= 2);
+                        bool usedFastMotion = false;
+                        encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
+                                                cpuStride, gpuDirtyRects, false, encodedPayload, isKeyframe,
+                                                {}, allowFastMotion, &usedFastMotion);
+                        if (encodeOk && usedFastMotion) {
+                            deltaNeedsSettle = true;
+                            if (!deltaSettleFull) {
+                                settleDirtyRects.insert(settleDirtyRects.end(), gpuDirtyRects.begin(), gpuDirtyRects.end());
+                                if (settleDirtyRects.size() > 32) {
+                                    settleDirtyRects = DeltaEncoder::MergeAndBoundRects(
+                                        settleDirtyRects, capture.Width(), capture.Height(), 32);
+                                }
+                            }
+                        }
                     }
-                    lastLargeDeltaQpc = nowQpc;
                 } else {
-                    consecutiveLargeDeltaFrames = 0;
-                }
-                const bool allowFastMotion = (consecutiveLargeDeltaFrames >= 2);
+                    std::vector<DeltaRect> mergedHints;
+                    std::vector<DeltaRect> copyRegions;
+                    uint64_t approxHintArea = 0;
+                    const uint64_t totalScreenArea = static_cast<uint64_t>(capture.Width()) * capture.Height();
 
-                const bool copied = (!forceFullDirtyRect && !needKey && !copyRegions.empty())
-                                        ? capture.CopyFrameToCpuRegions(cpuBgra, cpuStride, copyRegions)
-                                        : capture.CopyFrameToCpu(cpuBgra, cpuStride, nullptr);
+                    if (!forceFullDirtyRect && !needKey && (!pendingDirtyRects.empty() || !pendingMoveRects.empty())) {
+                        mergedHints = DeltaEncoder::MergeAndBoundRects(
+                            pendingDirtyRects, capture.Width(), capture.Height(), 32);
+                        copyRegions = mergedHints;
+                        for (const auto& r : mergedHints) {
+                            approxHintArea += static_cast<uint64_t>(r.w) * r.h;
+                        }
+                        for (const auto& m : pendingMoveRects) {
+                            copyRegions.push_back(DeltaRect{m.dstX, m.dstY, m.w, m.h});
+                            approxHintArea += static_cast<uint64_t>(m.w) * m.h;
+                        }
+                    } else {
+                        approxHintArea = totalScreenArea;
+                    }
 
-                if (copied) {
-                    const std::vector<DeltaRect> emptyHints;
-                    const auto& hints = (forceFullDirtyRect || needKey) ? emptyHints : mergedHints;
-                    bool usedFastMotion = false;
-                    encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
-                                            cpuStride, hints, needKey, encodedPayload, isKeyframe,
-                                            (forceFullDirtyRect || needKey) ? std::vector<DeltaMoveRect>{} : pendingMoveRects,
-                                            allowFastMotion, &usedFastMotion);
-                    if (encodeOk && usedFastMotion) {
-                        // Arm settle and accumulate affected regions; NEVER clear on later small non-fast-motion frames!
-                        deltaNeedsSettle = true;
-                        if (forceFullDirtyRect || needKey || mergedHints.empty()) {
-                            deltaSettleFull = true;
-                            settleDirtyRects.clear();
-                        } else if (!deltaSettleFull) {
-                            settleDirtyRects.insert(settleDirtyRects.end(), mergedHints.begin(), mergedHints.end());
-                            if (settleDirtyRects.size() > 32) {
-                                settleDirtyRects = DeltaEncoder::MergeAndBoundRects(
-                                    settleDirtyRects, capture.Width(), capture.Height(), 32);
+                    // Only engage 2x2 fast-motion on *sustained* large-area motion (>= 2 consecutive large frames
+                    // within 150ms) so single tab/window switches render 100% razor-sharp immediately!
+                    const int64_t fastWindowQpc = (qpcFreq * 150) / 1000;
+                    const bool isLargeFrame = (totalScreenArea > 0) && (approxHintArea * 100ULL >= totalScreenArea * 35ULL);
+                    if (isLargeFrame) {
+                        if (lastLargeDeltaQpc > 0 && (nowQpc - lastLargeDeltaQpc) <= fastWindowQpc) {
+                            ++consecutiveLargeDeltaFrames;
+                        } else {
+                            consecutiveLargeDeltaFrames = 1;
+                        }
+                        lastLargeDeltaQpc = nowQpc;
+                    } else {
+                        consecutiveLargeDeltaFrames = 0;
+                    }
+                    const bool allowFastMotion = (consecutiveLargeDeltaFrames >= 2);
+
+                    const bool copied = (!forceFullDirtyRect && !needKey && !copyRegions.empty())
+                                            ? capture.CopyFrameToCpuRegions(cpuBgra, cpuStride, copyRegions)
+                                            : capture.CopyFrameToCpu(cpuBgra, cpuStride, nullptr);
+
+                    if (copied) {
+                        if (gpuDelta.IsInitialized() && capture.FrameTexture()) {
+                            gpuDelta.SyncPrevTexture(capture.FrameTexture());
+                        }
+                        const std::vector<DeltaRect> emptyHints;
+                        const auto& hints = (forceFullDirtyRect || needKey) ? emptyHints : mergedHints;
+                        bool usedFastMotion = false;
+                        encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
+                                                cpuStride, hints, needKey, encodedPayload, isKeyframe,
+                                                (forceFullDirtyRect || needKey) ? std::vector<DeltaMoveRect>{} : pendingMoveRects,
+                                                allowFastMotion, &usedFastMotion);
+                        if (encodeOk && usedFastMotion) {
+                            // Arm settle and accumulate affected regions; NEVER clear on later small non-fast-motion frames!
+                            deltaNeedsSettle = true;
+                            if (forceFullDirtyRect || needKey || mergedHints.empty()) {
+                                deltaSettleFull = true;
+                                settleDirtyRects.clear();
+                            } else if (!deltaSettleFull) {
+                                settleDirtyRects.insert(settleDirtyRects.end(), mergedHints.begin(), mergedHints.end());
+                                if (settleDirtyRects.size() > 32) {
+                                    settleDirtyRects = DeltaEncoder::MergeAndBoundRects(
+                                        settleDirtyRects, capture.Width(), capture.Height(), 32);
+                                }
                             }
                         }
                     }
                 }
             }
 
-            QueryPerformanceCounter(&encEndLi);
-            double encMs = static_cast<double>(encEndLi.QuadPart - encStartLi.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
-            windowEncodeMsSum += encMs;
-            ++windowEncodeCount;
-            smoothedEncMs = (smoothedEncMs <= 0.0) ? encMs : (smoothedEncMs * 0.75 + encMs * 0.25);
+            if (!gpuReportedIdle) {
+                QueryPerformanceCounter(&encEndLi);
+                double encMs = static_cast<double>(encEndLi.QuadPart - encStartLi.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
+                windowEncodeMsSum += encMs;
+                ++windowEncodeCount;
+                smoothedEncMs = (smoothedEncMs <= 0.0) ? encMs : (smoothedEncMs * 0.75 + encMs * 0.25);
 
-            // Adaptive pacing: never run faster than the Surface iGPU/CPU + Wi-Fi can drain without queuing
-            const int64_t intervalQpc = std::max<int64_t>(1, (qpcFreq * 9) / (static_cast<int64_t>(effFps) * 10));
-            const double pacingMs = std::max(smoothedEncMs, smoothedSendMs) * 1.05;
-            const int64_t workPaceQpc = static_cast<int64_t>((pacingMs * static_cast<double>(qpcFreq)) / 1000.0);
-            nextEncodeQpc = nowQpc + std::max(intervalQpc, workPaceQpc);
+                // Adaptive pacing: never run faster than the Surface iGPU/CPU + Wi-Fi can drain without queuing
+                const int64_t intervalQpc = std::max<int64_t>(1, (qpcFreq * 9) / (static_cast<int64_t>(effFps) * 10));
+                const double pacingMs = std::max(smoothedEncMs, smoothedSendMs) * 1.05;
+                const int64_t workPaceQpc = static_cast<int64_t>((pacingMs * static_cast<double>(qpcFreq)) / 1000.0);
+                nextEncodeQpc = nowQpc + std::max(intervalQpc, workPaceQpc);
+            }
 
             if (encodeOk && !encodedPayload.empty()) {
                 if (encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
@@ -1839,6 +1971,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                     w->forceKeyframe.store(true);
                     if (encodedCodec == CodecType::DeltaLossless) {
                         delta.Reset();
+                        gpuDelta.Shutdown();
                     }
                 }
             }
@@ -1912,6 +2045,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         sock.SendPacket(MsgType::StreamEnd, nullptr, 0);
         sock.Close();
     }
+    videoUdpSock.Close();
+    gpuDelta.Shutdown();
     capture.Shutdown();
     h264.Shutdown();
 }

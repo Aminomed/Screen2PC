@@ -8,6 +8,7 @@ namespace {
 
 constexpr uint32_t kDeltaMagicV1 = 0x444C5431; // "DLT1" (legacy RLE)
 constexpr uint32_t kDeltaMagicV2 = 0x444C5432; // "DLT2" (LZ4 + XOR + MoveRects + FastMotion)
+constexpr uint32_t kDeltaMagicV3 = 0x444C5433; // "DLT3" (Hybrid QOI + LZ4 + XOR + MoveRects)
 constexpr uint32_t kTileSize     = 64;
 
 enum DeltaRectFlags : uint8_t {
@@ -15,6 +16,7 @@ enum DeltaRectFlags : uint8_t {
     kRectEncodingXorLz4      = 1, // XOR against m_prevFrame compressed with LZ4
     kRectEncodingSub2x2Lz4   = 2, // 2x2 subsampled BGRA compressed with LZ4 (fast motion burst)
     kRectEncodingRawUncomp   = 3, // Raw BGRA uncompressed fallback
+    kRectEncodingQoi         = 4, // Lossless QOI (Quite OK Image) encoded BGRA
 };
 
 #pragma pack(push, 1)
@@ -65,6 +67,164 @@ struct DeltaRectHeaderV2 {
     uint32_t compressedBytes;
 };
 #pragma pack(pop)
+
+// ============================================================================
+// Pure C++20 QOI (Quite OK Image) Lossless BGRA Rect Codec
+// ============================================================================
+
+struct QoiRgba {
+    uint8_t b;
+    uint8_t g;
+    uint8_t r;
+    uint8_t a;
+};
+
+inline uint32_t QoiColorHash(const QoiRgba& px) {
+    return (static_cast<uint32_t>(px.r) * 3u +
+            static_cast<uint32_t>(px.g) * 5u +
+            static_cast<uint32_t>(px.b) * 7u +
+            static_cast<uint32_t>(px.a) * 11u) & 63u;
+}
+
+void EncodeQoiRectBgra(const uint8_t* srcBase,
+                       uint32_t srcStride,
+                       uint8_t* prevBase,
+                       uint32_t prevFrameWidth,
+                       uint32_t rx,
+                       uint32_t ry,
+                       uint32_t rw,
+                       uint32_t rh,
+                       std::vector<uint8_t>& outQoi) {
+    const size_t totalPixels = static_cast<size_t>(rw) * rh;
+    outQoi.clear();
+    outQoi.reserve(totalPixels * 2 + 16);
+
+    QoiRgba index[64]{};
+    QoiRgba prev{ 0, 0, 0, 255 };
+    uint32_t run = 0;
+    size_t pxPos = 0;
+
+    for (uint32_t row = 0; row < rh; ++row) {
+        const uint8_t* srcRow = srcBase + static_cast<size_t>(ry + row) * srcStride + static_cast<size_t>(rx) * 4u;
+        uint8_t* prevRow = prevBase + (static_cast<size_t>(ry + row) * prevFrameWidth + rx) * 4u;
+        std::memcpy(prevRow, srcRow, static_cast<size_t>(rw) * 4u);
+
+        for (uint32_t col = 0; col < rw; ++col) {
+            const uint8_t* p = srcRow + static_cast<size_t>(col) * 4u;
+            const QoiRgba px{ p[0], p[1], p[2], p[3] };
+            ++pxPos;
+
+            if (px.b == prev.b && px.g == prev.g && px.r == prev.r && px.a == prev.a) {
+                ++run;
+                if (run == 62 || pxPos == totalPixels) {
+                    outQoi.push_back(static_cast<uint8_t>(0xC0u | (run - 1u)));
+                    run = 0;
+                }
+            } else {
+                if (run > 0) {
+                    outQoi.push_back(static_cast<uint8_t>(0xC0u | (run - 1u)));
+                    run = 0;
+                }
+                const uint32_t hash = QoiColorHash(px);
+                const QoiRgba& idxPx = index[hash];
+                if (idxPx.b == px.b && idxPx.g == px.g && idxPx.r == px.r && idxPx.a == px.a) {
+                    outQoi.push_back(static_cast<uint8_t>(hash));
+                } else {
+                    index[hash] = px;
+                    if (px.a == prev.a) {
+                        const int dr = static_cast<int>(static_cast<int8_t>(px.r - prev.r));
+                        const int dg = static_cast<int>(static_cast<int8_t>(px.g - prev.g));
+                        const int db = static_cast<int>(static_cast<int8_t>(px.b - prev.b));
+                        const int vg_r = dr - dg;
+                        const int vg_b = db - dg;
+
+                        if (dr >= -2 && dr <= 1 && dg >= -2 && dg <= 1 && db >= -2 && db <= 1) {
+                            outQoi.push_back(static_cast<uint8_t>(
+                                0x40u | ((dr + 2) << 4) | ((dg + 2) << 2) | (db + 2)));
+                        } else if (dg >= -32 && dg <= 31 &&
+                                   vg_r >= -8 && vg_r <= 7 &&
+                                   vg_b >= -8 && vg_b <= 7) {
+                            outQoi.push_back(static_cast<uint8_t>(0x80u | (dg + 32)));
+                            outQoi.push_back(static_cast<uint8_t>(((vg_r + 8) << 4) | (vg_b + 8)));
+                        } else {
+                            outQoi.push_back(0xFEu);
+                            outQoi.push_back(px.b);
+                            outQoi.push_back(px.g);
+                            outQoi.push_back(px.r);
+                        }
+                    } else {
+                        outQoi.push_back(0xFFu);
+                        outQoi.push_back(px.b);
+                        outQoi.push_back(px.g);
+                        outQoi.push_back(px.r);
+                        outQoi.push_back(px.a);
+                    }
+                }
+                prev = px;
+            }
+        }
+    }
+}
+
+bool DecodeQoiRectBgra(const uint8_t* data,
+                       size_t dataBytes,
+                       uint8_t* dstBase,
+                       uint32_t dstFrameWidth,
+                       uint32_t rx,
+                       uint32_t ry,
+                       uint32_t rw,
+                       uint32_t rh) {
+    QoiRgba index[64]{};
+    QoiRgba px{ 0, 0, 0, 255 };
+    size_t pos = 0;
+    uint32_t run = 0;
+
+    for (uint32_t row = 0; row < rh; ++row) {
+        uint8_t* dstRow = dstBase + (static_cast<size_t>(ry + row) * dstFrameWidth + rx) * 4u;
+        for (uint32_t col = 0; col < rw; ++col) {
+            if (run > 0) {
+                --run;
+            } else {
+                if (pos >= dataBytes) return false;
+                const uint8_t b1 = data[pos++];
+                if (b1 == 0xFEu) {
+                    if (pos + 3 > dataBytes) return false;
+                    px.b = data[pos++];
+                    px.g = data[pos++];
+                    px.r = data[pos++];
+                } else if (b1 == 0xFFu) {
+                    if (pos + 4 > dataBytes) return false;
+                    px.b = data[pos++];
+                    px.g = data[pos++];
+                    px.r = data[pos++];
+                    px.a = data[pos++];
+                } else if ((b1 & 0xC0u) == 0x00u) {
+                    px = index[b1];
+                } else if ((b1 & 0xC0u) == 0x40u) {
+                    px.r = static_cast<uint8_t>(static_cast<int>(px.r) + ((b1 >> 4) & 0x03) - 2);
+                    px.g = static_cast<uint8_t>(static_cast<int>(px.g) + ((b1 >> 2) & 0x03) - 2);
+                    px.b = static_cast<uint8_t>(static_cast<int>(px.b) + (b1 & 0x03) - 2);
+                } else if ((b1 & 0xC0u) == 0x80u) {
+                    if (pos >= dataBytes) return false;
+                    const uint8_t b2 = data[pos++];
+                    const int vg = static_cast<int>(b1 & 0x3F) - 32;
+                    px.r = static_cast<uint8_t>(static_cast<int>(px.r) + vg - 8 + ((b2 >> 4) & 0x0F));
+                    px.g = static_cast<uint8_t>(static_cast<int>(px.g) + vg);
+                    px.b = static_cast<uint8_t>(static_cast<int>(px.b) + vg - 8 + (b2 & 0x0F));
+                } else {
+                    run = (b1 & 0x3Fu); // remaining copies after writing this pixel
+                }
+                index[QoiColorHash(px)] = px;
+            }
+            uint8_t* dstPx = dstRow + static_cast<size_t>(col) * 4u;
+            dstPx[0] = px.b;
+            dstPx[1] = px.g;
+            dstPx[2] = px.r;
+            dstPx[3] = px.a;
+        }
+    }
+    return run == 0 && pos == dataBytes;
+}
 
 // ============================================================================
 // Self-contained Fast LZ4 Block Compressor & Decompressor (bounds-checked)
@@ -542,6 +702,10 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
                                 totalArea > 0 && (dirtyArea * 100ULL >= totalArea * 35ULL));
     if (outUsedFastMotion) *outUsedFastMotion = useFastMotion;
 
+    const bool preferQoi = (outIsKeyframe ||
+                           (!useFastMotion && totalArea > 0 && (dirtyArea * 100ULL >= totalArea * 20ULL)));
+    bool usedAnyQoi = false;
+
     outPayload.clear();
     outPayload.resize(sizeof(DeltaBlobHeaderV2) + validMoves.size() * sizeof(DeltaMoveRectWire));
 
@@ -560,6 +724,8 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
         const size_t fullBytes = static_cast<size_t>(r.w) * r.h * 4;
         DeltaRectFlags encoding = outIsKeyframe ? kRectEncodingRawLz4 : kRectEncodingXorLz4;
         size_t uncompBytes = fullBytes;
+        const uint8_t* payloadData = nullptr;
+        size_t payloadLen = 0;
 
         if (useFastMotion && r.w >= 4 && r.h >= 4) {
             encoding = kRectEncodingSub2x2Lz4;
@@ -588,47 +754,69 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
                     dstPrev[col] = subRow[col / 2];
                 }
             }
-        } else if (encoding == kRectEncodingXorLz4) {
-            m_scratchRaw.resize(fullBytes);
-            for (uint32_t row = 0; row < r.h; ++row) {
-                const uint8_t* srcRow = bgraFrame + static_cast<size_t>(r.y + row) * strideBytes + static_cast<size_t>(r.x) * 4;
-                uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(r.y + row) * width + r.x) * 4;
-                uint8_t* xorRow = m_scratchRaw.data() + static_cast<size_t>(row) * r.w * 4;
-
-                size_t rowBytes = static_cast<size_t>(r.w) * 4;
-                size_t b = 0;
-                for (; b + 8 <= rowBytes; b += 8) {
-                    uint64_t sv, pv;
-                    std::memcpy(&sv, srcRow + b, 8);
-                    std::memcpy(&pv, prevRow + b, 8);
-                    uint64_t xv = sv ^ pv;
-                    std::memcpy(xorRow + b, &xv, 8);
-                    std::memcpy(prevRow + b, &sv, 8);
+            CompressLz4Block(m_scratchRaw.data(), uncompBytes, m_scratchCompressed, m_lz4Hash);
+            payloadData = m_scratchCompressed.data();
+            payloadLen = m_scratchCompressed.size();
+        } else if (preferQoi && fullBytes >= 64) {
+            EncodeQoiRectBgra(bgraFrame, strideBytes, m_prevFrame.data(), width, r.x, r.y, r.w, r.h, m_scratchCompressed);
+            if (m_scratchCompressed.size() < fullBytes) {
+                encoding = kRectEncodingQoi;
+                payloadData = m_scratchCompressed.data();
+                payloadLen = m_scratchCompressed.size();
+                usedAnyQoi = true;
+            } else {
+                encoding = kRectEncodingRawUncomp;
+                m_scratchRaw.resize(fullBytes);
+                for (uint32_t row = 0; row < r.h; ++row) {
+                    const uint8_t* srcRow = bgraFrame + static_cast<size_t>(r.y + row) * strideBytes + static_cast<size_t>(r.x) * 4;
+                    std::memcpy(m_scratchRaw.data() + static_cast<size_t>(row) * r.w * 4, srcRow, static_cast<size_t>(r.w) * 4);
                 }
-                for (; b < rowBytes; ++b) {
-                    xorRow[b] = srcRow[b] ^ prevRow[b];
-                    prevRow[b] = srcRow[b];
-                }
+                payloadData = m_scratchRaw.data();
+                payloadLen = fullBytes;
             }
         } else {
-            m_scratchRaw.resize(fullBytes);
-            for (uint32_t row = 0; row < r.h; ++row) {
-                const uint8_t* srcRow = bgraFrame + static_cast<size_t>(r.y + row) * strideBytes + static_cast<size_t>(r.x) * 4;
-                uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(r.y + row) * width + r.x) * 4;
-                uint8_t* rawRow = m_scratchRaw.data() + static_cast<size_t>(row) * r.w * 4;
-                std::memcpy(prevRow, srcRow, static_cast<size_t>(r.w) * 4);
-                std::memcpy(rawRow, srcRow, static_cast<size_t>(r.w) * 4);
+            if (encoding == kRectEncodingXorLz4) {
+                m_scratchRaw.resize(fullBytes);
+                for (uint32_t row = 0; row < r.h; ++row) {
+                    const uint8_t* srcRow = bgraFrame + static_cast<size_t>(r.y + row) * strideBytes + static_cast<size_t>(r.x) * 4;
+                    uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(r.y + row) * width + r.x) * 4;
+                    uint8_t* xorRow = m_scratchRaw.data() + static_cast<size_t>(row) * r.w * 4;
+
+                    size_t rowBytes = static_cast<size_t>(r.w) * 4;
+                    size_t b = 0;
+                    for (; b + 8 <= rowBytes; b += 8) {
+                        uint64_t sv, pv;
+                        std::memcpy(&sv, srcRow + b, 8);
+                        std::memcpy(&pv, prevRow + b, 8);
+                        uint64_t xv = sv ^ pv;
+                        std::memcpy(xorRow + b, &xv, 8);
+                        std::memcpy(prevRow + b, &sv, 8);
+                    }
+                    for (; b < rowBytes; ++b) {
+                        xorRow[b] = srcRow[b] ^ prevRow[b];
+                        prevRow[b] = srcRow[b];
+                    }
+                }
+            } else {
+                m_scratchRaw.resize(fullBytes);
+                for (uint32_t row = 0; row < r.h; ++row) {
+                    const uint8_t* srcRow = bgraFrame + static_cast<size_t>(r.y + row) * strideBytes + static_cast<size_t>(r.x) * 4;
+                    uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(r.y + row) * width + r.x) * 4;
+                    uint8_t* rawRow = m_scratchRaw.data() + static_cast<size_t>(row) * r.w * 4;
+                    std::memcpy(prevRow, srcRow, static_cast<size_t>(r.w) * 4);
+                    std::memcpy(rawRow, srcRow, static_cast<size_t>(r.w) * 4);
+                }
             }
-        }
 
-        CompressLz4Block(m_scratchRaw.data(), uncompBytes, m_scratchCompressed, m_lz4Hash);
-        const uint8_t* payloadData = m_scratchCompressed.data();
-        size_t payloadLen = m_scratchCompressed.size();
+            CompressLz4Block(m_scratchRaw.data(), uncompBytes, m_scratchCompressed, m_lz4Hash);
+            payloadData = m_scratchCompressed.data();
+            payloadLen = m_scratchCompressed.size();
 
-        if (payloadLen >= uncompBytes && encoding == kRectEncodingRawLz4) {
-            encoding = kRectEncodingRawUncomp;
-            payloadData = m_scratchRaw.data();
-            payloadLen = uncompBytes;
+            if (payloadLen >= uncompBytes && encoding == kRectEncodingRawLz4) {
+                encoding = kRectEncodingRawUncomp;
+                payloadData = m_scratchRaw.data();
+                payloadLen = uncompBytes;
+            }
         }
 
         DeltaRectHeaderV2 rh{};
@@ -643,13 +831,13 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
         size_t offset = outPayload.size();
         outPayload.resize(offset + sizeof(DeltaRectHeaderV2) + payloadLen);
         std::memcpy(outPayload.data() + offset, &rh, sizeof(rh));
-        if (payloadLen > 0) {
+        if (payloadLen > 0 && payloadData) {
             std::memcpy(outPayload.data() + offset + sizeof(rh), payloadData, payloadLen);
         }
     }
 
     DeltaBlobHeaderV2 bh{};
-    bh.magic = kDeltaMagicV2;
+    bh.magic = usedAnyQoi ? kDeltaMagicV3 : kDeltaMagicV2;
     bh.width = width;
     bh.height = height;
     bh.rectCount = static_cast<uint32_t>(rects.size());
@@ -735,7 +923,7 @@ bool DeltaDecoder::Decode(const uint8_t* payload,
         return pos == payloadSize;
     }
 
-    if (magic != kDeltaMagicV2 || payloadSize < sizeof(DeltaBlobHeaderV2)) {
+    if ((magic != kDeltaMagicV2 && magic != kDeltaMagicV3) || payloadSize < sizeof(DeltaBlobHeaderV2)) {
         return false;
     }
 
@@ -853,6 +1041,18 @@ bool DeltaDecoder::Decode(const uint8_t* payload,
                 for (uint32_t col = 0; col < rh.w; ++col) {
                     dstRow[col] = subRow[col / 2];
                 }
+            }
+        } else if (rh.encoding == kRectEncodingQoi) {
+            if (rh.uncompressedBytes != fullRectBytes) return false;
+            if (!DecodeQoiRectBgra(compPtr,
+                                   rh.compressedBytes,
+                                   m_frame.data(),
+                                   m_width,
+                                   rh.x,
+                                   rh.y,
+                                   rh.w,
+                                   rh.h)) {
+                return false;
             }
         } else {
             return false;

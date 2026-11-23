@@ -7,14 +7,17 @@
 
 namespace s2p {
 
-constexpr uint32_t kProtocolMagic   = 0x53325031; // "S2P1"
-constexpr uint16_t kProtocolVersion = 2;
+constexpr uint32_t kProtocolMagic    = 0x53325031; // "S2P1"
+constexpr uint16_t kProtocolVersion  = 3;
 
 constexpr uint16_t kPortDiscovery    = 48210; // UDP Broadcast discovery
 constexpr uint16_t kPortControl      = 48211; // TCP Control & Handshake
 constexpr uint16_t kPortStreamBase   = 48212; // TCP Stream per monitor (48212 + monitorIndex)
 constexpr uint16_t kPortFileTransfer = 48214; // Dedicated bidirectional TCP File Transfer
 constexpr uint16_t kPortRealtimeUdp  = 48215; // Ultra-low-latency bidirectional UDP for KvmMouse & CursorUpdate
+constexpr uint16_t kPortVideoUdpBase = 48216; // UDP Video + RS-FEC stream per monitor (48216 + monitorIndex)
+
+constexpr uint32_t kVideoUdpFecMagic = 0x53325646; // "S2VF"
 
 constexpr size_t   kMaxMonitors     = 2;
 constexpr size_t   kMaxFrameBytes   = 64 * 1024 * 1024; // 64 MB safety cap
@@ -22,7 +25,8 @@ constexpr size_t   kMaxFrameBytes   = 64 * 1024 * 1024; // 64 MB safety cap
 enum class CodecType : uint8_t {
     Auto          = 0,
     H264          = 1,
-    DeltaLossless = 2
+    DeltaLossless = 2,
+    HEVC          = 3
 };
 
 enum class MsgType : uint16_t {
@@ -225,6 +229,22 @@ struct VideoFrameHeader {
     uint8_t  pad[3];
     uint32_t flags;   // FrameFlags
     uint32_t dataSize;
+};
+
+constexpr size_t kUdpVideoMaxPayloadBytes = 256 * 1024; // Large frames (>256 KB) fall back to reliable TCP
+constexpr size_t kUdpVideoShardSize       = 1360;       // Fits comfortably inside 1500B LAN/Wi-Fi MTU
+
+struct UdpVideoShardHeader {
+    uint32_t magic;        // kVideoUdpFecMagic ("S2VF")
+    uint32_t monitorIndex;
+    uint64_t frameIndex;
+    uint32_t frameBytes;   // Total serialized [VideoFrameHeader + encoded video bytes]
+    uint16_t groupIndex;   // FEC block index within frame (0..)
+    uint8_t  groupDataK;   // Data shards K in this block (1..12)
+    uint8_t  groupParM;    // RS-FEC parity shards M in this block (0..4)
+    uint8_t  shardInGroup; // 0..K-1 = data shard, K..K+M-1 = parity shard
+    uint8_t  flags;        // bit 0 = keyframe
+    uint16_t shardBytes;   // Exact payload bytes following this header (padded to kUdpVideoShardSize inside FEC math)
 };
 
 struct CursorUpdateHeader {

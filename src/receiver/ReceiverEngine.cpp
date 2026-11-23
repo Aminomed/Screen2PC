@@ -4,6 +4,7 @@
 #include "../common/CodecDelta.h"
 #include "../common/KvmInput.h"
 #include "../common/Logger.h"
+#include "../common/UdpVideoFec.h"
 
 #include <bcrypt.h>
 #include <objbase.h>
@@ -736,6 +737,12 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
             allListening = false;
             break;
         }
+        const uint16_t udpVideoPort = static_cast<uint16_t>(kPortVideoUdpBase + i);
+        if (w->videoUdpSock.Bind(udpVideoPort)) {
+            w->videoUdpSock.SetBufferSizes(256 * 1024, 8 * 1024 * 1024);
+        } else {
+            Logger::Instance().Warn("RCV-STRM", L"Could not bind video UDP port " + std::to_wstring(udpVideoPort));
+        }
 
         StreamReceiverWorker* raw = w.get();
         w->thread = std::thread([this, raw]() { RunStreamWorker(raw); });
@@ -1003,7 +1010,13 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         uint32_t needMoreInputStreak = 0;
         auto lastKeyframeReq = std::chrono::steady_clock::time_point{};
         DeltaDecoder delta;
+        UdpVideoFecReceiver udpFecRecv;
         std::vector<uint8_t> cpuBgra;
+        std::vector<uint8_t> udpDecompPayload;
+        uint8_t udpBuf[2048]{};
+        std::string udpPeerIp;
+        uint16_t udpPeerPort = 0;
+        uint64_t lastDecodedFrameIdx = 0;
 
         auto maybeRequestKeyframe = [&]() {
             auto now = std::chrono::steady_clock::now();
@@ -1022,13 +1035,36 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         uint64_t totalFrames = 0;
 
         while (!m_stop && !m_sessionStop && !w->stop && !recvStop && !streamEnded) {
-            int wr = sock.WaitReadable(50);
-            if (wr < 0) {
+            WSAPOLLFD fds[2]{};
+            ULONG nfds = 0;
+            if (sock.IsValid()) {
+                fds[nfds].fd = sock.Handle();
+                fds[nfds].events = POLLRDNORM;
+                ++nfds;
+            }
+            if (w->videoUdpSock.IsValid()) {
+                fds[nfds].fd = w->videoUdpSock.Handle();
+                fds[nfds].events = POLLRDNORM;
+                ++nfds;
+            }
+            if (nfds == 0) {
                 streamEnded.store(true);
                 break;
             }
-            if (wr == 0) {
+            int pr = WSAPoll(fds, nfds, 16);
+            if (pr < 0) {
+                streamEnded.store(true);
+                break;
+            }
+            if (pr == 0) {
+                if (w->videoUdpSock.IsValid() && udpFecRecv.PruneExpired(GetTickCount64(), 25)) {
+                    maybeRequestKeyframe();
+                }
                 continue;
+            }
+            if (sock.IsValid() && (fds[0].revents & (POLLERR | POLLHUP)) && !(fds[0].revents & POLLRDNORM)) {
+                streamEnded.store(true);
+                break;
             }
 
             // Drain burst of queued packets so we always render the freshest cursor & video frame
@@ -1070,7 +1106,234 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                 }
             };
 
-            for (int drained = 0; drained < 8 && wr > 0 && !recvStop && !m_stop && !m_sessionStop && !w->stop; ++drained) {
+            auto processVideoFrame = [&](const VideoFrameHeader& vh, const uint8_t* frameData, size_t wireBytes) {
+                if (vh.frameIndex > 0 && lastDecodedFrameIdx > 0 && vh.frameIndex <= lastDecodedFrameIdx) {
+                    return;
+                }
+                bool decodedOk = false;
+                std::wstring codecLabel;
+                bool isDxva = false;
+                bool isDirectNv12 = false;
+                bool needKeyframeNow = false;
+                bool needKeyframeThrottled = false;
+
+                LARGE_INTEGER decStartLi{}, decEndLi{};
+                QueryPerformanceCounter(&decStartLi);
+
+                const CodecType frameCodec = static_cast<CodecType>(vh.codec);
+                if (frameCodec == CodecType::H264 || frameCodec == CodecType::HEVC) {
+                    if (pendingDeltaCommit) {
+                        flushPendingBurstFrames();
+                    }
+                    const wchar_t* cname = (frameCodec == CodecType::HEVC) ? L"HEVC" : L"H.264";
+                    uint32_t outW = vh.width, outH = vh.height;
+                    bool pushCpuFrame = false;
+                    bool pushGpuFrame = false;
+                    bool decodedToNv12 = false;
+
+                    {
+                        std::unique_lock<std::mutex> gpuLock(renderer.GpuMutex());
+                        uint64_t curGen = renderer.DeviceGeneration();
+                        if (curGen != h264DeviceGen) {
+                            h264.Shutdown();
+                            h264DeviceGen = curGen;
+                            h264W = 0;
+                            h264H = 0;
+                            h264InitFailed = false;
+                            decodedAnyH264 = false;
+                            consecutiveH264Fails = 0;
+                            needMoreInputStreak = 0;
+                            delta.Reset();
+                        }
+
+                        if (!renderer.Device() || !renderer.Context()) {
+                            needKeyframeThrottled = true;
+                        } else {
+                            if (h264W != vh.width || h264H != vh.height ||
+                                (h264.IsInitialized() && h264.ActiveCodec() != frameCodec)) {
+                                h264.Shutdown();
+                                h264W = vh.width;
+                                h264H = vh.height;
+                                h264InitFailed = false;
+                                decodedAnyH264 = false;
+                                consecutiveH264Fails = 0;
+                                needMoreInputStreak = 0;
+                            }
+
+                            if (!h264.IsInitialized() && !h264InitFailed) {
+                                uint32_t fpsHint = w->desiredTargetFps.load();
+                                bool initOk = h264.Init(renderer.Device(), renderer.Context(),
+                                                        vh.width, vh.height, true, fpsHint, frameCodec);
+                                if (!initOk) {
+                                    initOk = h264.Init(renderer.Device(), renderer.Context(),
+                                                       vh.width, vh.height, false, fpsHint, frameCodec);
+                                }
+                                if (!initOk) {
+                                    h264InitFailed = true;
+                                } else {
+                                    renderer.EnsureFrameTexture(vh.width, vh.height);
+                                }
+                            }
+
+                            if (h264.IsInitialized()) {
+                                if (h264.IsHardwareDxva()) {
+                                    if (renderer.EnsureFrameTexture(vh.width, vh.height)) {
+                                        ID3D11Texture2D* nv12Target = renderer.HasNv12Pipeline() ? renderer.Nv12Texture() : nullptr;
+                                        decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
+                                                                nv12Target ? nullptr : renderer.FrameTexture(),
+                                                                nullptr, &outW, &outH,
+                                                                nv12Target, &decodedToNv12);
+                                        if (decodedOk) {
+                                            pushGpuFrame = true;
+                                        }
+                                    }
+                                    codecLabel = std::wstring(cname) + (decodedToNv12 ? L" (NVDEC Direct)" : L" (NVDEC/DXVA)");
+                                    isDxva = true;
+                                    isDirectNv12 = decodedToNv12;
+                                } else {
+                                    decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
+                                                            nullptr, &cpuBgra, &outW, &outH);
+                                    if (decodedOk && !cpuBgra.empty()) {
+                                        pushCpuFrame = true;
+                                    }
+                                    codecLabel = std::wstring(cname) + L" (CPU)";
+                                }
+
+                                if (decodedOk) {
+                                    decodedAnyH264 = true;
+                                    consecutiveH264Fails = 0;
+                                    needMoreInputStreak = 0;
+                                } else if (h264.WasLastCallNeedMoreInput() && ++needMoreInputStreak <= 25) {
+                                    // Normal DPB warmup on initial frames; do not trigger DXVA->CPU fallback
+                                } else {
+                                    ++consecutiveH264Fails;
+                                    if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
+                                        Logger::Instance().Warn("RCV-DEC",
+                                            L"DXVA decode failed at runtime; falling back to CPU decoder.");
+                                        uint32_t fpsHint = w->desiredTargetFps.load();
+                                        if (!h264.Init(renderer.Device(), renderer.Context(),
+                                                       vh.width, vh.height, false, fpsHint, frameCodec)) {
+                                            h264InitFailed = true;
+                                        }
+                                        consecutiveH264Fails = 0;
+                                        needMoreInputStreak = 0;
+                                        needKeyframeNow = true;
+                                    } else if (consecutiveH264Fails >= 2) {
+                                        needKeyframeThrottled = true;
+                                    }
+                                }
+                            } else {
+                                needKeyframeThrottled = true;
+                            }
+                        }
+                    } // Unlock m_gpuMutex before queuing/waking/network I/O
+
+                    if (pushGpuFrame) {
+                        pendingGpuCommit = true;
+                        pendingGpuIsNv12 = decodedToNv12;
+                        pendingCpuH264Commit = false;
+                    } else if (pushCpuFrame) {
+                        pendingCpuH264Commit = true;
+                        cpuH264W = outW;
+                        cpuH264H = outH;
+                        pendingGpuCommit = false;
+                    }
+                    if (needKeyframeNow) {
+                        RequestKeyframe(w->monitorIndex);
+                        lastKeyframeReq = std::chrono::steady_clock::now();
+                    } else if (needKeyframeThrottled) {
+                        maybeRequestKeyframe();
+                    }
+                } else if (frameCodec == CodecType::DeltaLossless) {
+                    if (pendingGpuCommit || pendingCpuH264Commit) {
+                        flushPendingBurstFrames();
+                    }
+                    if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
+                        const DeltaRect& bounds = delta.LastBoundingRect();
+                        if (!pendingDeltaCommit || delta.Width() != deltaLastW || delta.Height() != deltaLastH) {
+                            deltaLastW = delta.Width();
+                            deltaLastH = delta.Height();
+                            deltaUnionFull = (bounds.w == 0 || bounds.h == 0);
+                            deltaUx0 = bounds.x;
+                            deltaUy0 = bounds.y;
+                            deltaUx1 = std::min(deltaLastW, bounds.x + bounds.w);
+                            deltaUy1 = std::min(deltaLastH, bounds.y + bounds.h);
+                        } else if (bounds.w == 0 || bounds.h == 0) {
+                            deltaUnionFull = true;
+                        } else if (!deltaUnionFull) {
+                            deltaUx0 = std::min(deltaUx0, bounds.x);
+                            deltaUy0 = std::min(deltaUy0, bounds.y);
+                            deltaUx1 = std::max(deltaUx1, std::min(deltaLastW, bounds.x + bounds.w));
+                            deltaUy1 = std::max(deltaUy1, std::min(deltaLastH, bounds.y + bounds.h));
+                        }
+                        pendingDeltaCommit = true;
+                        decodedOk = true;
+                        codecLabel = delta.LastDecodeUsedFastMotion() ? L"Delta Fast-Motion" : L"Delta Lossless";
+                    } else {
+                        maybeRequestKeyframe();
+                    }
+                }
+
+                QueryPerformanceCounter(&decEndLi);
+
+                if (decodedOk) {
+                    if (vh.frameIndex > 0) lastDecodedFrameIdx = vh.frameIndex;
+                    double decMs = static_cast<double>(decEndLi.QuadPart - decStartLi.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
+                    windowDecodeMsSum += decMs;
+                    ++windowDecodeCount;
+                    ++totalFrames;
+                    ++windowFrames;
+                    windowBytes += wireBytes;
+
+                    auto now = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - windowStart).count();
+                    if (elapsed >= 0.5) {
+                        std::lock_guard<std::mutex> sl(w->statsMutex);
+                        w->stats.width = vh.width;
+                        w->stats.height = vh.height;
+                        w->stats.fps = static_cast<double>(windowFrames) / elapsed;
+                        w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsed * 1000000.0);
+                        w->stats.framesReceived = totalFrames;
+                        w->stats.codecName = codecLabel;
+                        w->stats.hardwareDxva = isDxva;
+                        w->stats.directNv12Active = isDirectNv12;
+                        w->stats.avgDecodeMs = windowDecodeCount > 0 ? (windowDecodeMsSum / static_cast<double>(windowDecodeCount)) : 0.0;
+                        renderer.SetHudStats(w->stats.fps, w->stats.mbps, w->stats.avgDecodeMs, w->stats.codecName);
+                        windowStart = now;
+                        windowFrames = 0;
+                        windowBytes = 0;
+                        windowDecodeMsSum = 0.0;
+                        windowDecodeCount = 0;
+                    }
+                }
+            };
+
+            if (w->videoUdpSock.IsValid()) {
+                for (int u = 0; u < 64 && !recvStop && !m_stop && !m_sessionStop && !w->stop; ++u) {
+                    if (w->videoUdpSock.WaitReadable(0) <= 0) break;
+                    int n = w->videoUdpSock.RecvFrom(udpBuf, sizeof(udpBuf), udpPeerIp, udpPeerPort, 0);
+                    if (n <= 0) break;
+                    VideoFrameHeader uvh{};
+                    bool uNeedKey = false;
+                    if (udpFecRecv.OnPacket(udpBuf, static_cast<size_t>(n), GetTickCount64(), uvh, udpDecompPayload, uNeedKey)) {
+                        if (uvh.dataSize > 0 && udpDecompPayload.size() == uvh.dataSize) {
+                            processVideoFrame(uvh, udpDecompPayload.data(), uvh.dataSize + sizeof(VideoFrameHeader));
+                        }
+                    }
+                    if (uNeedKey) {
+                        maybeRequestKeyframe();
+                    }
+                }
+                if (udpFecRecv.PruneExpired(GetTickCount64(), 25)) {
+                    maybeRequestKeyframe();
+                }
+            }
+
+            int wr = sock.WaitReadable(0);
+            if (wr < 0) {
+                streamEnded.store(true);
+            }
+            for (int drained = 0; drained < 8 && wr > 0 && !recvStop && !m_stop && !m_sessionStop && !w->stop && !streamEnded; ++drained) {
                 PacketHeader hdr{};
                 std::vector<uint8_t> payload;
                 if (!sock.RecvPacket(hdr, payload)) {
@@ -1095,203 +1358,8 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                            payload.size() >= sizeof(VideoFrameHeader)) {
                     VideoFrameHeader vh{};
                     std::memcpy(&vh, payload.data(), sizeof(vh));
-                    if (payload.size() < sizeof(vh) + vh.dataSize) {
-                        wr = sock.WaitReadable(0);
-                        continue;
-                    }
-                    const uint8_t* frameData = payload.data() + sizeof(vh);
-
-                    bool decodedOk = false;
-                    std::wstring codecLabel;
-                    bool isDxva = false;
-                    bool isDirectNv12 = false;
-                    bool needKeyframeNow = false;
-                    bool needKeyframeThrottled = false;
-
-                    LARGE_INTEGER decStartLi{}, decEndLi{};
-                    QueryPerformanceCounter(&decStartLi);
-
-                    if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
-                        if (pendingDeltaCommit) {
-                            flushPendingBurstFrames();
-                        }
-                        uint32_t outW = vh.width, outH = vh.height;
-                        bool pushCpuFrame = false;
-                        bool pushGpuFrame = false;
-                        bool decodedToNv12 = false;
-
-                        {
-                            std::unique_lock<std::mutex> gpuLock(renderer.GpuMutex());
-                            uint64_t curGen = renderer.DeviceGeneration();
-                            if (curGen != h264DeviceGen) {
-                                h264.Shutdown();
-                                h264DeviceGen = curGen;
-                                h264W = 0;
-                                h264H = 0;
-                                h264InitFailed = false;
-                                decodedAnyH264 = false;
-                                consecutiveH264Fails = 0;
-                                needMoreInputStreak = 0;
-                                delta.Reset();
-                            }
-
-                            if (!renderer.Device() || !renderer.Context()) {
-                                needKeyframeThrottled = true;
-                            } else {
-                                if (h264W != vh.width || h264H != vh.height) {
-                                    h264.Shutdown();
-                                    h264W = vh.width;
-                                    h264H = vh.height;
-                                    h264InitFailed = false;
-                                    decodedAnyH264 = false;
-                                    consecutiveH264Fails = 0;
-                                    needMoreInputStreak = 0;
-                                }
-
-                                if (!h264.IsInitialized() && !h264InitFailed) {
-                                    uint32_t fpsHint = w->desiredTargetFps.load();
-                                    bool initOk = h264.Init(renderer.Device(), renderer.Context(),
-                                                            vh.width, vh.height, true, fpsHint);
-                                    if (!initOk) {
-                                        initOk = h264.Init(renderer.Device(), renderer.Context(),
-                                                           vh.width, vh.height, false, fpsHint);
-                                    }
-                                    if (!initOk) {
-                                        h264InitFailed = true;
-                                    } else {
-                                        renderer.EnsureFrameTexture(vh.width, vh.height);
-                                    }
-                                }
-
-                                if (h264.IsInitialized()) {
-                                    if (h264.IsHardwareDxva()) {
-                                        if (renderer.EnsureFrameTexture(vh.width, vh.height)) {
-                                            ID3D11Texture2D* nv12Target = renderer.HasNv12Pipeline() ? renderer.Nv12Texture() : nullptr;
-                                            decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
-                                                                    nv12Target ? nullptr : renderer.FrameTexture(),
-                                                                    nullptr, &outW, &outH,
-                                                                    nv12Target, &decodedToNv12);
-                                            if (decodedOk) {
-                                                pushGpuFrame = true;
-                                            }
-                                        }
-                                        codecLabel = decodedToNv12 ? L"H.264 (NVDEC Direct)" : L"H.264 (NVDEC/DXVA)";
-                                        isDxva = true;
-                                        isDirectNv12 = decodedToNv12;
-                                    } else {
-                                        decodedOk = h264.Decode(frameData, vh.dataSize, vh.timestampUs,
-                                                                nullptr, &cpuBgra, &outW, &outH);
-                                        if (decodedOk && !cpuBgra.empty()) {
-                                            pushCpuFrame = true;
-                                        }
-                                        codecLabel = L"H.264 (CPU)";
-                                    }
-
-                                    if (decodedOk) {
-                                        decodedAnyH264 = true;
-                                        consecutiveH264Fails = 0;
-                                        needMoreInputStreak = 0;
-                                    } else if (h264.WasLastCallNeedMoreInput() && ++needMoreInputStreak <= 25) {
-                                        // Normal DPB warmup on initial frames; do not trigger DXVA->CPU fallback
-                                    } else {
-                                        ++consecutiveH264Fails;
-                                        if (!decodedAnyH264 && h264.IsHardwareDxva() && consecutiveH264Fails >= 4) {
-                                            Logger::Instance().Warn("RCV-DEC",
-                                                L"DXVA H.264 decode failed at runtime; falling back to CPU H.264 decoder.");
-                                            uint32_t fpsHint = w->desiredTargetFps.load();
-                                            if (!h264.Init(renderer.Device(), renderer.Context(),
-                                                           vh.width, vh.height, false, fpsHint)) {
-                                                h264InitFailed = true;
-                                            }
-                                            consecutiveH264Fails = 0;
-                                            needMoreInputStreak = 0;
-                                            needKeyframeNow = true;
-                                        } else if (consecutiveH264Fails >= 2) {
-                                            needKeyframeThrottled = true;
-                                        }
-                                    }
-                                } else {
-                                    needKeyframeThrottled = true;
-                                }
-                            }
-                        } // Unlock m_gpuMutex before queuing/waking/network I/O
-
-                        if (pushGpuFrame) {
-                            pendingGpuCommit = true;
-                            pendingGpuIsNv12 = decodedToNv12;
-                            pendingCpuH264Commit = false;
-                        } else if (pushCpuFrame) {
-                            pendingCpuH264Commit = true;
-                            cpuH264W = outW;
-                            cpuH264H = outH;
-                            pendingGpuCommit = false;
-                        }
-                        if (needKeyframeNow) {
-                            RequestKeyframe(w->monitorIndex);
-                            lastKeyframeReq = std::chrono::steady_clock::now();
-                        } else if (needKeyframeThrottled) {
-                            maybeRequestKeyframe();
-                        }
-                    } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
-                        if (pendingGpuCommit || pendingCpuH264Commit) {
-                            flushPendingBurstFrames();
-                        }
-                        if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
-                            const DeltaRect& bounds = delta.LastBoundingRect();
-                            if (!pendingDeltaCommit || delta.Width() != deltaLastW || delta.Height() != deltaLastH) {
-                                deltaLastW = delta.Width();
-                                deltaLastH = delta.Height();
-                                deltaUnionFull = (bounds.w == 0 || bounds.h == 0);
-                                deltaUx0 = bounds.x;
-                                deltaUy0 = bounds.y;
-                                deltaUx1 = std::min(deltaLastW, bounds.x + bounds.w);
-                                deltaUy1 = std::min(deltaLastH, bounds.y + bounds.h);
-                            } else if (bounds.w == 0 || bounds.h == 0) {
-                                deltaUnionFull = true;
-                            } else if (!deltaUnionFull) {
-                                deltaUx0 = std::min(deltaUx0, bounds.x);
-                                deltaUy0 = std::min(deltaUy0, bounds.y);
-                                deltaUx1 = std::max(deltaUx1, std::min(deltaLastW, bounds.x + bounds.w));
-                                deltaUy1 = std::max(deltaUy1, std::min(deltaLastH, bounds.y + bounds.h));
-                            }
-                            pendingDeltaCommit = true;
-                            decodedOk = true;
-                            codecLabel = delta.LastDecodeUsedFastMotion() ? L"Delta Fast-Motion" : L"Delta Lossless";
-                        } else {
-                            maybeRequestKeyframe();
-                        }
-                    }
-
-                    QueryPerformanceCounter(&decEndLi);
-
-                    if (decodedOk) {
-                        double decMs = static_cast<double>(decEndLi.QuadPart - decStartLi.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
-                        windowDecodeMsSum += decMs;
-                        ++windowDecodeCount;
-                        ++totalFrames;
-                        ++windowFrames;
-                        windowBytes += payload.size() + sizeof(PacketHeader);
-
-                        auto now = std::chrono::steady_clock::now();
-                        double elapsed = std::chrono::duration<double>(now - windowStart).count();
-                        if (elapsed >= 0.5) {
-                            std::lock_guard<std::mutex> sl(w->statsMutex);
-                            w->stats.width = vh.width;
-                            w->stats.height = vh.height;
-                            w->stats.fps = static_cast<double>(windowFrames) / elapsed;
-                            w->stats.mbps = (static_cast<double>(windowBytes) * 8.0) / (elapsed * 1000000.0);
-                            w->stats.framesReceived = totalFrames;
-                            w->stats.codecName = codecLabel;
-                            w->stats.hardwareDxva = isDxva;
-                            w->stats.directNv12Active = isDirectNv12;
-                            w->stats.avgDecodeMs = windowDecodeCount > 0 ? (windowDecodeMsSum / static_cast<double>(windowDecodeCount)) : 0.0;
-                            renderer.SetHudStats(w->stats.fps, w->stats.mbps, w->stats.avgDecodeMs, w->stats.codecName);
-                            windowStart = now;
-                            windowFrames = 0;
-                            windowBytes = 0;
-                            windowDecodeMsSum = 0.0;
-                            windowDecodeCount = 0;
-                        }
+                    if (payload.size() >= sizeof(vh) + vh.dataSize) {
+                        processVideoFrame(vh, payload.data() + sizeof(vh), payload.size() + sizeof(PacketHeader));
                     }
                 }
 
@@ -1358,6 +1426,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     recvStop.store(true);
     sock.Close();
+    w->videoUdpSock.Close();
     if (recvDecodeThread.joinable()) {
         recvDecodeThread.join();
     }
@@ -1377,6 +1446,7 @@ void ReceiverEngine::StopStreamWorkers() {
         for (auto& w : m_workers) {
             w->stop = true;
             w->listenSock.Close();
+            w->videoUdpSock.Close();
             std::lock_guard<std::mutex> rl(w->rendererPtrMutex);
             if (w->activeRenderer) {
                 w->activeRenderer->SignalWake();

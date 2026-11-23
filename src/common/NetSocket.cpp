@@ -397,6 +397,42 @@ bool UdpSocket::CreateForBroadcast() {
     return true;
 }
 
+bool UdpSocket::SetBufferSizes(int sndBufBytes, int rcvBufBytes) {
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return false;
+    bool ok = true;
+    if (sndBufBytes > 0) {
+        if (setsockopt(s, SOL_SOCKET, SO_SNDBUF,
+                       reinterpret_cast<const char*>(&sndBufBytes), sizeof(sndBufBytes)) != 0) {
+            ok = false;
+        }
+    }
+    if (rcvBufBytes > 0) {
+        if (setsockopt(s, SOL_SOCKET, SO_RCVBUF,
+                       reinterpret_cast<const char*>(&rcvBufBytes), sizeof(rcvBufBytes)) != 0) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+int UdpSocket::WaitReadable(int timeoutMs) {
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return -1;
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(s, &readSet);
+    timeval tv{};
+    if (timeoutMs >= 0) {
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+    }
+    int sel = select(0, &readSet, nullptr, nullptr, (timeoutMs >= 0) ? &tv : nullptr);
+    if (sel == 0) return 0;
+    if (sel < 0) return -1;
+    return 1;
+}
+
 bool UdpSocket::SendTo(const std::string& ip, uint16_t port, const void* data, size_t len) {
     SOCKET s = m_sock.load();
     if (s == INVALID_SOCKET) return false;
@@ -440,7 +476,13 @@ int UdpSocket::RecvFrom(void* buf, size_t bufCap, std::string& outSenderIp, uint
     int fromLen = sizeof(from);
     int n = recvfrom(s, static_cast<char*>(buf), cap, 0,
                      reinterpret_cast<sockaddr*>(&from), &fromLen);
-    if (n <= 0) return -1;
+    if (n <= 0) {
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK || err == WSAECONNRESET || err == WSAEMSGSIZE) {
+            return 0;
+        }
+        return -1;
+    }
 
     char ipBuf[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET, &from.sin_addr, ipBuf, sizeof(ipBuf));

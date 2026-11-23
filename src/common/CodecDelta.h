@@ -31,9 +31,9 @@ public:
                                                      uint32_t frameH,
                                                      size_t maxRects = 32);
 
-    // Encodes changed regions of bgraFrame (width x height, stride in bytes) using
-    // XOR-delta + fast LZ4 block compression + optional MoveRects and optional
-    // 2x2 fast-motion subsampling when allowFastMotion && dirty coverage > 35%.
+    // Encodes changed regions of bgraFrame (width x height, stride in bytes) using DLT3 hybrid:
+    // QOI lossless compression on keyframes / large changes (>= 20% dirty), XOR-delta + LZ4 on
+    // incremental UI updates, MoveRects (0 pixel bytes), and optional 2x2 fast-motion subsampling.
     bool Encode(const uint8_t* bgraFrame,
                 uint32_t width,
                 uint32_t height,
@@ -62,7 +62,7 @@ public:
     void Reset();
 
     // Decodes payload into internal persistent BGRA framebuffer (tight width*height*4).
-    // Supports both legacy DLT1 (RLE) and DLT2 (LZ4 + XOR + MoveRects + FastMotion).
+    // Supports legacy DLT1 (RLE), DLT2 (LZ4+XOR+MoveRects), and DLT3 (QOI+LZ4 hybrid).
     bool Decode(const uint8_t* payload,
                 size_t payloadSize,
                 uint32_t expectedWidth,

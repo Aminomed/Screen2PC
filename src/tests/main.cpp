@@ -29,6 +29,8 @@
 #include "../common/NetSocket.h"
 #include "../common/CodecDelta.h"
 #include "../common/CodecH264.h"
+#include "../common/AmfEncoder.h"
+#include "../common/UdpVideoFec.h"
 #include "../common/ClipboardSync.h"
 #include "../common/FileTransfer.h"
 #include "../common/KvmInput.h"
@@ -1563,6 +1565,171 @@ void TestVddDeterministicGuid() {
     std::cout << "[PASS] TestVddDeterministicGuid\n";
 }
 
+void TestDeltaQoiHybrid() {
+    const uint32_t W = 640, H = 360;
+    std::vector<uint8_t> fb(static_cast<size_t>(W) * H * 4, 0);
+    for (uint32_t y = 0; y < H; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            uint8_t* p = fb.data() + (static_cast<size_t>(y) * W + x) * 4;
+            if ((x / 16 + y / 16) % 2 == 0) {
+                p[0] = static_cast<uint8_t>((x * 3) & 0xFF);
+                p[1] = static_cast<uint8_t>((y * 5) & 0xFF);
+                p[2] = static_cast<uint8_t>((x + y) & 0xFF);
+                p[3] = 255;
+            } else if (x < 100) {
+                // Solid runs -> QOI_OP_RUN
+                p[0] = 30; p[1] = 60; p[2] = 90; p[3] = 255;
+            } else {
+                // Slight delta + varying alpha -> QOI_OP_DIFF / QOI_OP_LUMA / QOI_OP_RGBA
+                p[0] = static_cast<uint8_t>(30 + (x % 3));
+                p[1] = static_cast<uint8_t>(60 + (y % 4));
+                p[2] = static_cast<uint8_t>(90 + ((x ^ y) % 5));
+                p[3] = (y % 17 == 0) ? 128 : 255;
+            }
+        }
+    }
+
+    s2p::DeltaEncoder enc;
+    s2p::DeltaDecoder dec;
+    std::vector<uint8_t> payload;
+    bool isKey = false;
+    CHECK(enc.Encode(fb.data(), W, H, W * 4, {}, true, payload, isKey), "DLT3 QOI keyframe encode failed");
+    CHECK(isKey && payload.size() >= 4, "DLT3 keyframe flags missing");
+    uint32_t magic = 0;
+    std::memcpy(&magic, payload.data(), 4);
+    CHECK(magic == 0x444C5433u, "Expected DLT3 magic on QOI keyframe");
+    CHECK(dec.Decode(payload.data(), payload.size(), W, H), "DLT3 QOI keyframe decode failed");
+    CHECK(std::memcmp(dec.FrameData(), fb.data(), fb.size()) == 0, "DLT3 QOI keyframe pixel mismatch");
+
+    // Large 40% update -> QOI hybrid delta
+    for (uint32_t y = 0; y < H / 2; ++y) {
+        for (uint32_t x = 0; x < W; ++x) {
+            uint8_t* p = fb.data() + (static_cast<size_t>(y) * W + x) * 4;
+            p[0] = static_cast<uint8_t>(255 - (x & 0xFF));
+            p[1] = static_cast<uint8_t>((y * 7) & 0xFF);
+            p[2] = static_cast<uint8_t>((x * 11) & 0xFF);
+            p[3] = 255;
+        }
+    }
+    std::vector<s2p::DeltaRect> bigHint{ { 0, 0, W, H / 2 } };
+    CHECK(enc.Encode(fb.data(), W, H, W * 4, bigHint, false, payload, isKey), "DLT3 QOI delta encode failed");
+    CHECK(!isKey, "Delta frame unexpectedly flagged as keyframe");
+    std::memcpy(&magic, payload.data(), 4);
+    CHECK(magic == 0x444C5433u, "Expected DLT3 magic on large >=20% delta");
+    CHECK(dec.Decode(payload.data(), payload.size(), W, H), "DLT3 QOI delta decode failed");
+    CHECK(std::memcmp(dec.FrameData(), fb.data(), fb.size()) == 0, "DLT3 QOI delta pixel mismatch");
+
+    // Tiny 32x32 update -> XOR+LZ4 DLT2 path
+    for (uint32_t y = 200; y < 232; ++y) {
+        for (uint32_t x = 200; x < 232; ++x) {
+            uint8_t* p = fb.data() + (static_cast<size_t>(y) * W + x) * 4;
+            p[0] ^= 0x5Au; p[1] ^= 0x3Cu; p[2] ^= 0x7Eu;
+        }
+    }
+    std::vector<s2p::DeltaRect> smallHint{ { 200, 200, 32, 32 } };
+    CHECK(enc.Encode(fb.data(), W, H, W * 4, smallHint, false, payload, isKey), "DLT2 small XOR delta encode failed");
+    CHECK(dec.Decode(payload.data(), payload.size(), W, H), "DLT2 small XOR delta decode failed");
+    CHECK(std::memcmp(dec.FrameData(), fb.data(), fb.size()) == 0, "DLT2 small XOR delta pixel mismatch");
+
+    std::cout << "[PASS] TestDeltaQoiHybrid\n";
+}
+
+void TestUdpVideoFec() {
+    s2p::UdpVideoFecSender sender;
+    s2p::UdpVideoFecReceiver receiver;
+
+    // 1) Multi-group keyframe (~48 KB) with dropped shards recovered by RS-FEC
+    std::vector<uint8_t> keyBytes(49152);
+    for (size_t i = 0; i < keyBytes.size(); ++i) {
+        keyBytes[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
+    }
+    s2p::VideoFrameHeader vh{};
+    vh.monitorIndex = 0;
+    vh.frameIndex = 101;
+    vh.timestampUs = 987654321ULL;
+    vh.width = 2560;
+    vh.height = 1440;
+    vh.codec = static_cast<uint8_t>(s2p::CodecType::HEVC);
+    vh.flags = s2p::kFrameFlagKeyframe;
+    vh.dataSize = static_cast<uint32_t>(keyBytes.size());
+
+    std::vector<std::vector<uint8_t>> pkts;
+    uint32_t parityCnt = 0;
+    CHECK(sender.BuildPackets(0, vh.frameIndex, true, vh, keyBytes.data(), keyBytes.size(), pkts, &parityCnt),
+          "UdpVideoFecSender::BuildPackets failed on keyframe");
+    CHECK(pkts.size() > 20 && parityCnt >= 2, "Expected multi-group FEC packets on 48KB keyframe");
+
+    s2p::VideoFrameHeader outHdr{};
+    std::vector<uint8_t> outPayload;
+    bool needKey = false;
+    bool delivered = false;
+    // Drop shard index 1 and 5 in group 0 (<= 3 parity shards for keyframes -> fully recoverable!)
+    for (size_t i = 0; i < pkts.size(); ++i) {
+        if (i == 1 || i == 5) continue;
+        if (receiver.OnPacket(pkts[i].data(), pkts[i].size(), 1000ULL, outHdr, outPayload, needKey)) {
+            delivered = true;
+        }
+    }
+    CHECK(delivered, "RS-FEC failed to recover keyframe with 2 erased shards");
+    CHECK(outHdr.frameIndex == vh.frameIndex && outHdr.codec == static_cast<uint8_t>(s2p::CodecType::HEVC) &&
+          outPayload.size() == keyBytes.size() &&
+          std::memcmp(outPayload.data(), keyBytes.data(), keyBytes.size()) == 0,
+          "Recovered RS-FEC keyframe payload mismatch");
+
+    // 2) Small P-frame (~5 KB) with 1 erased shard recovered
+    std::vector<uint8_t> pBytes(5120, 0xA5);
+    vh.frameIndex = 102;
+    vh.flags = s2p::kFrameFlagNone;
+    vh.dataSize = static_cast<uint32_t>(pBytes.size());
+    CHECK(sender.BuildPackets(0, vh.frameIndex, false, vh, pBytes.data(), pBytes.size(), pkts, &parityCnt),
+          "BuildPackets P-frame failed");
+    delivered = false;
+    for (size_t i = 0; i < pkts.size(); ++i) {
+        if (i == 0) continue; // drop first data shard
+        if (receiver.OnPacket(pkts[i].data(), pkts[i].size(), 1005ULL, outHdr, outPayload, needKey)) {
+            delivered = true;
+        }
+    }
+    CHECK(delivered && outPayload.size() == pBytes.size() &&
+          std::memcmp(outPayload.data(), pBytes.data(), pBytes.size()) == 0,
+          "RS-FEC failed to recover P-frame with 1 erased shard");
+
+    // 3) Unrecoverable erasure expires cleanly and requests keyframe
+    vh.frameIndex = 103;
+    CHECK(sender.BuildPackets(0, vh.frameIndex, false, vh, pBytes.data(), pBytes.size(), pkts, &parityCnt),
+          "BuildPackets expiration test failed");
+    delivered = false;
+    for (size_t i = 3; i < pkts.size(); ++i) { // drop 3 shards > 1 P-frame parity shard
+        if (receiver.OnPacket(pkts[i].data(), pkts[i].size(), 1010ULL, outHdr, outPayload, needKey)) {
+            delivered = true;
+        }
+    }
+    CHECK(!delivered, "Unrecoverable frame unexpectedly succeeded");
+    CHECK(receiver.PruneExpired(1050ULL, 25), "PruneExpired did not trigger keyframe recovery");
+
+    std::cout << "[PASS] TestUdpVideoFec\n";
+}
+
+void TestAmfFallbackAndHevcHeaders() {
+    static_assert(s2p::kProtocolVersion == 3, "Protocol v3 required for HEVC + UDP-FEC");
+    static_assert(s2p::kPortVideoUdpBase == 48216, "UDP video port base mismatch");
+
+    s2p::AmfEncoder amf;
+    CHECK(!amf.Initialize(nullptr, nullptr, 1920, 1080, 60, 25000000, s2p::CodecType::HEVC),
+          "AmfEncoder with null D3D device must return false cleanly");
+    amf.Shutdown();
+
+    s2p::H264Encoder enc;
+    // Software HEVC fallback test: on machines without HEVC MFT it must fail gracefully without crashing
+    bool hevcOk = enc.Init(nullptr, nullptr, 640, 360, 60, 20, false, s2p::CodecType::HEVC);
+    if (hevcOk) {
+        CHECK(enc.ActiveCodec() == s2p::CodecType::HEVC, "ActiveCodec mismatch for HEVC");
+        enc.Shutdown();
+    }
+
+    std::cout << "[PASS] TestAmfFallbackAndHevcHeaders\n";
+}
+
 } // namespace
 
 int main() {
@@ -1573,6 +1740,8 @@ int main() {
 
     TestProtocol();
     TestDeltaCodec();
+    TestDeltaQoiHybrid();
+    TestUdpVideoFec();
     TestColorAndH264();
     TestLoopbackNetworking();
     TestClipboardSync();
@@ -1588,6 +1757,7 @@ int main() {
     TestFileTransferRecursiveAndCancel();
     TestPowerPolicyIniAndGuid();
     TestH264BitrateAndFpsInit();
+    TestAmfFallbackAndHevcHeaders();
     TestVddDeterministicGuid();
 
     CoUninitialize();

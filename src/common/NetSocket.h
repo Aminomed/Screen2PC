@@ -75,6 +75,9 @@ public:
     bool CreateForBroadcast();
     void Close();
     bool IsValid() const { return m_sock.load() != INVALID_SOCKET; }
+    SOCKET Handle() const { return m_sock.load(); }
+    bool SetBufferSizes(int sndBufBytes, int rcvBufBytes);
+    int  WaitReadable(int timeoutMs);
 
     bool SendTo(const std::string& ip, uint16_t port, const void* data, size_t len);
     bool Broadcast(uint16_t port, const void* data, size_t len);

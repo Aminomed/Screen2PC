@@ -1,4 +1,5 @@
 #include "CodecH264.h"
+#include "AmfEncoder.h"
 #include "Logger.h"
 #include "Protocol.h"
 #include <d3d11_1.h>
@@ -77,7 +78,7 @@ void ConfigureVideoProcessorBt709(ID3D11VideoContext* videoCtx, ID3D11VideoProce
     }
 }
 
-bool ContainsIdrNalu(const uint8_t* data, size_t size) {
+bool ContainsIdrNalu(const uint8_t* data, size_t size, CodecType codec) {
     if (!data || size < 5) return false;
     for (size_t i = 0; i + 4 < size; ++i) {
         if (data[i] == 0 && data[i + 1] == 0) {
@@ -88,8 +89,13 @@ bool ContainsIdrNalu(const uint8_t* data, size_t size) {
                 hdrIdx = i + 4;
             }
             if (hdrIdx > 0 && hdrIdx < size) {
-                uint8_t nalType = data[hdrIdx] & 0x1F;
-                if (nalType == 5) return true; // IDR slice
+                if (codec == CodecType::HEVC) {
+                    const uint8_t nalType = static_cast<uint8_t>((data[hdrIdx] >> 1) & 0x3F);
+                    if (nalType >= 16 && nalType <= 21) return true; // BLA / IDR / CRA IRAP
+                } else {
+                    const uint8_t nalType = data[hdrIdx] & 0x1F;
+                    if (nalType == 5) return true; // H.264 IDR slice
+                }
             }
         }
     }
@@ -112,27 +118,7 @@ HRESULT SetOutputSampleBuffer(IMFTransform* mft, DWORD streamId, DWORD bufSize, 
     return S_OK;
 }
 
-bool ProbeAmfRuntimePresent() {
-    static int s_state = -1;
-    if (s_state >= 0) return s_state == 1;
-    HMODULE hAmf = LoadLibraryW(L"amfrt64.dll");
-    if (hAmf) {
-        using AmfQueryVersionFn = int(__stdcall*)(uint64_t*);
-        auto fn = reinterpret_cast<AmfQueryVersionFn>(GetProcAddress(hAmf, "AMFQueryVersion"));
-        uint64_t ver = 0;
-        if (fn && fn(&ver) == 0 && ver != 0) {
-            s_state = 1;
-        } else {
-            s_state = 1;
-        }
-        FreeLibrary(hAmf);
-    } else {
-        s_state = 0;
-    }
-    return s_state == 1;
-}
-
-HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t fps, bool isInit) {
+HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t fps, bool isInit, CodecType codec) {
     if (!api) return E_POINTER;
 
     VARIANT vLow{};
@@ -147,10 +133,12 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
         vB.ulVal = 0;
         api->SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &vB);
 
-        VARIANT vCabac{};
-        vCabac.vt = VT_BOOL;
-        vCabac.boolVal = VARIANT_FALSE;
-        api->SetValue(&CODECAPI_AVEncH264CABACEnable, &vCabac);
+        if (codec == CodecType::H264) {
+            VARIANT vCabac{};
+            vCabac.vt = VT_BOOL;
+            vCabac.boolVal = VARIANT_FALSE;
+            api->SetValue(&CODECAPI_AVEncH264CABACEnable, &vCabac);
+        }
 
         constexpr UINT32 kRateControlLowDelayVbr = 4; // eAVEncCommonRateControlMode_LowDelayVBR
         VARIANT vRc{};
@@ -299,6 +287,10 @@ H264Encoder::~H264Encoder() {
 }
 
 void H264Encoder::Shutdown() {
+    if (m_amf) {
+        m_amf->Shutdown();
+        m_amf.reset();
+    }
     if (m_mft) {
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
@@ -336,6 +328,7 @@ void H264Encoder::Shutdown() {
     m_outputBufferSize = 0;
     m_mftProvidesOutputSamples = false;
     m_friendlyName.clear();
+    m_codec = CodecType::H264;
     m_initialized = false;
     m_isHardware = false;
     m_isAmf = false;
@@ -351,10 +344,14 @@ bool H264Encoder::Init(ID3D11Device* d3dDevice,
                        uint32_t height,
                        uint32_t fps,
                        uint32_t bitrateMbps,
-                       bool allowHardware) {
+                       bool allowHardware,
+                       CodecType codec) {
     Shutdown();
 
-    // H.264 requires even dimensions
+    m_codec = (codec == CodecType::HEVC) ? CodecType::HEVC : CodecType::H264;
+    const bool isHevc = (m_codec == CodecType::HEVC);
+
+    // H.264/HEVC 4:2:0 requires even dimensions
     m_width = width & ~1u;
     m_height = height & ~1u;
     if (m_width < 2 || m_height < 2 ||
@@ -372,6 +369,28 @@ bool H264Encoder::Init(ID3D11Device* d3dDevice,
     m_frameCounter = 0;
     m_nv12RingIdx = 0;
 
+    if (m_device) {
+        Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
+        if (SUCCEEDED(m_device.As(&mt)) && mt) {
+            mt->SetMultithreadProtected(TRUE);
+        }
+    }
+
+    // 1) Direct AMD AMF native encoder (amfrt64.dll) -> skips Media Foundation MFT overhead
+    if (allowHardware && m_device && m_context) {
+        auto amf = std::make_unique<AmfEncoder>();
+        if (amf->Initialize(m_device.Get(), m_context.Get(), m_width, m_height, m_fps, m_bitrateBps, m_codec)) {
+            m_amf = std::move(amf);
+            m_isHardware = true;
+            m_isAmf = true;
+            m_friendlyName = m_amf->BackendName();
+            m_initialized = true;
+            Logger::Instance().Info("H264_ENC_OK", L"Direct AMF encoder ready (" + m_friendlyName + L", " +
+                                     std::to_wstring(m_fps) + L"fps, " + std::to_wstring(m_bitrateBps / 1000000u) + L"Mbit/s)");
+            return true;
+        }
+    }
+
     HRESULT hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
         Logger::Instance().Error("H264_MF_INIT", L"MFStartup failed: " + FormatHr(hr));
@@ -381,24 +400,21 @@ bool H264Encoder::Init(ID3D11Device* d3dDevice,
     m_mfStarted = true;
 
     if (m_device) {
-        Microsoft::WRL::ComPtr<ID3D10Multithread> mt;
-        if (SUCCEEDED(m_device.As(&mt)) && mt) {
-            mt->SetMultithreadProtected(TRUE);
-        }
         UINT resetToken = 0;
         if (SUCCEEDED(MFCreateDXGIDeviceManager(&resetToken, &m_dxgiMgr))) {
             m_dxgiMgr->ResetDevice(m_device.Get(), resetToken);
         }
     }
 
-    // Try hardware encoder first if allowed and we have a D3D11 device, otherwise software fallback
+    // 2) Try Media Foundation hardware MFT, otherwise software MFT fallback
     bool ok = false;
     if (allowHardware && m_device) {
         ok = InitMft(true);
     }
     if (!ok) {
         if (allowHardware && m_device) {
-            Logger::Instance().Warn("H264_HW_FALLBACK", L"Hardware H.264 MFT unavailable, falling back to software MFT.");
+            Logger::Instance().Warn("H264_HW_FALLBACK",
+                std::wstring(L"Hardware ") + (isHevc ? L"HEVC" : L"H.264") + L" MFT unavailable, falling back to software MFT.");
         }
         ok = InitMft(false);
     }
@@ -410,25 +426,31 @@ bool H264Encoder::Init(ID3D11Device* d3dDevice,
 
     m_cpuNv12.resize(static_cast<size_t>(m_width) * m_height * 3 / 2);
     m_initialized = true;
-    Logger::Instance().Info("H264_ENC_OK", L"H.264 Encoder ready (" + m_friendlyName + L", hw=" + (m_isHardware ? L"1" : L"0") +
-                             L", " + std::to_wstring(m_fps) + L"fps, " + std::to_wstring(m_bitrateBps / 1000000u) + L"Mbit/s)");
+    Logger::Instance().Info("H264_ENC_OK",
+        std::wstring(isHevc ? L"HEVC" : L"H.264") + L" Encoder ready (" + m_friendlyName + L", hw=" +
+        (m_isHardware ? L"1" : L"0") + L", " + std::to_wstring(m_fps) + L"fps, " +
+        std::to_wstring(m_bitrateBps / 1000000u) + L"Mbit/s)");
     return true;
 }
 
 bool H264Encoder::SetBitrate(uint32_t bitrateMbps) {
     uint32_t clamped = std::clamp<uint32_t>(bitrateMbps, 2u, 300u);
     uint32_t newBps = clamped * 1000000u;
-    if (!m_initialized || !m_mft) {
+    if (!m_initialized) {
         return false;
     }
     if (newBps == m_bitrateBps) {
         return true;
     }
     m_bitrateBps = newBps;
-    if (!m_codecApi) {
+    if (m_amf) {
+        m_amf->SetBitrate(m_bitrateBps);
+        return true;
+    }
+    if (!m_mft || !m_codecApi) {
         return false;
     }
-    HRESULT hr = ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, false);
+    HRESULT hr = ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, false, m_codec);
     return SUCCEEDED(hr);
 }
 
@@ -445,7 +467,9 @@ bool H264Encoder::InitMft(bool tryHardware) {
     m_outputStreamId = 0;
     m_friendlyName.clear();
 
-    MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, MFVideoFormat_H264 };
+    const bool isHevc = (m_codec == CodecType::HEVC);
+    const GUID subtype = isHevc ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+    MFT_REGISTER_TYPE_INFO outInfo{ MFMediaType_Video, subtype };
     UINT32 flags = tryHardware
         ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)
         : (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER);
@@ -464,7 +488,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
         }
         CoTaskMemFree(activates);
     }
-    if (!tryHardware && candidates.empty()) {
+    if (!tryHardware && !isHevc && candidates.empty()) {
         Microsoft::WRL::ComPtr<IMFTransform> msEnc;
         if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&msEnc)))) {
             candidates.push_back(msEnc);
@@ -487,7 +511,9 @@ bool H264Encoder::InitMft(bool tryHardware) {
         m_inputStreamId = 0;
         m_outputStreamId = 0;
 
-        std::wstring candidateName = tryHardware ? L"Hardware H.264 MFT" : L"Microsoft H.264 MFT";
+        std::wstring candidateName = isHevc
+            ? (tryHardware ? L"Hardware HEVC MFT" : L"Software HEVC MFT")
+            : (tryHardware ? L"Hardware H.264 MFT" : L"Microsoft H.264 MFT");
         Microsoft::WRL::ComPtr<IMFAttributes> attrs;
         if (SUCCEEDED(candidate->GetAttributes(&attrs))) {
             UINT32 nameLen = 0;
@@ -531,20 +557,22 @@ bool H264Encoder::InitMft(bool tryHardware) {
         candidate.As(&m_codecApi);
         if (m_codecApi) {
             // Apply LowDelayVBR + rate control BEFORE SetOutputType (required by several GPU MFTs)
-            ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, true);
+            ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, true, m_codec);
         }
 
-        // Configure output type (H.264 Constrained Baseline for 0 B-frames and 0 DPB reorder delay)
+        // Configure output type (H.264 Constrained Baseline / HEVC Main for 0 B-frames and 0 DPB reorder delay)
         Microsoft::WRL::ComPtr<IMFMediaType> outType;
         if (FAILED(MFCreateMediaType(&outType))) continue;
         outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        outType->SetGUID(MF_MT_SUBTYPE, subtype);
         outType->SetUINT32(MF_MT_AVG_BITRATE, m_bitrateBps);
         MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, m_width, m_height);
         MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, m_fps, 1);
         MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+        outType->SetUINT32(MF_MT_MPEG2_PROFILE,
+                           isHevc ? static_cast<UINT32>(eAVEncH265VProfile_Main_420_8)
+                                  : static_cast<UINT32>(eAVEncH264VProfile_Base));
         outType->SetUINT32(MF_MT_MAX_KEYFRAME_SPACING, std::clamp<uint32_t>(m_fps * 4u, 30u, 300u));
         SetBt709MediaTypeAttributes(outType.Get());
 
@@ -553,7 +581,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
             ClearColorMediaTypeAttributes(outType.Get());
             hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
         }
-        if (FAILED(hr)) {
+        if (FAILED(hr) && !isHevc) {
             outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
             hr = candidate->SetOutputType(m_outputStreamId, outType.Get(), 0);
         }
@@ -607,7 +635,7 @@ bool H264Encoder::InitMft(bool tryHardware) {
 
         // Re-apply after SetInputType as well so both pre- and post-type MFT drivers lock low-delay VBR/CBR
         if (m_codecApi) {
-            ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, true);
+            ConfigureEncoderCodecApi(m_codecApi.Get(), m_bitrateBps, m_fps, true, m_codec);
         }
 
         MFT_OUTPUT_STREAM_INFO osi{};
@@ -741,6 +769,15 @@ bool H264Encoder::EncodeTexture(ID3D11Texture2D* bgraTexture,
                                 bool& outIsKeyframe) {
     m_lastWasWarmup = false;
     if (!m_initialized || !bgraTexture || !m_device || !m_context) return false;
+
+    if (m_amf) {
+        const bool forceIdr = m_forceKeyframe;
+        if (m_amf->EncodeTexture(bgraTexture, forceIdr, outAnnexB, outIsKeyframe)) {
+            m_forceKeyframe = false;
+            return true;
+        }
+        return false;
+    }
 
     D3D11_TEXTURE2D_DESC desc{};
     bgraTexture->GetDesc(&desc);
@@ -953,7 +990,7 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
                 if (outBuf.pSample) outBuf.pSample->Release();
                 if (outBuf.pEvents) outBuf.pEvents->Release();
                 if (!outAnnexB.empty()) {
-                    if (!outIsKeyframe) outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size());
+                    if (!outIsKeyframe) outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size(), m_codec);
                 }
             } else if (met == MEError) {
                 sawError = true;
@@ -962,7 +999,7 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
         }
         if (!outAnnexB.empty()) {
             m_warmupFramesPending = 0;
-            EnsureLowLatencyH264Stream(outAnnexB);
+            if (m_codec == CodecType::H264) EnsureLowLatencyH264Stream(outAnnexB);
             return true;
         }
         if (fedInput && !sawError && m_warmupFramesPending < 16) {
@@ -1012,9 +1049,9 @@ bool H264Encoder::EncodeNv12TextureOrBuffer(ID3D11Texture2D* nv12Tex,
         if (!outAnnexB.empty()) {
             m_warmupFramesPending = 0;
             if (!outIsKeyframe) {
-                outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size());
+                outIsKeyframe = ContainsIdrNalu(outAnnexB.data(), outAnnexB.size(), m_codec);
             }
-            EnsureLowLatencyH264Stream(outAnnexB);
+            if (m_codec == CodecType::H264) EnsureLowLatencyH264Stream(outAnnexB);
             return true;
         }
         if (sawNeedMoreInput && m_warmupFramesPending < 16) {
@@ -1082,7 +1119,8 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
                        uint32_t width,
                        uint32_t height,
                        bool allowHardware,
-                       uint32_t fps) {
+                       uint32_t fps,
+                       CodecType codec) {
     Shutdown();
 
     if (width < 2 || height < 2 ||
@@ -1090,6 +1128,10 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
         static_cast<uint64_t>(width) * height > 64ULL * 1024ULL * 1024ULL) {
         return false;
     }
+
+    m_codec = (codec == CodecType::HEVC) ? CodecType::HEVC : CodecType::H264;
+    const bool isHevc = (m_codec == CodecType::HEVC);
+    const GUID subtype = isHevc ? MFVideoFormat_HEVC : MFVideoFormat_H264;
 
     m_width = width;
     m_height = height;
@@ -1108,7 +1150,7 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
     }
     m_mfStarted = true;
 
-    MFT_REGISTER_TYPE_INFO inInfo{ MFMediaType_Video, MFVideoFormat_H264 };
+    MFT_REGISTER_TYPE_INFO inInfo{ MFMediaType_Video, subtype };
     UINT32 flags = (allowHardware ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT) : MFT_ENUM_FLAG_SYNCMFT) |
                    MFT_ENUM_FLAG_SORTANDFILTER;
 
@@ -1145,8 +1187,7 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
         if (SUCCEEDED(m_mft->GetAttributes(&attrs))) {
             UINT32 asyncFlag = 0;
             if (SUCCEEDED(attrs->GetUINT32(MF_TRANSFORM_ASYNC, &asyncFlag)) && asyncFlag != 0) {
-                // H264Decoder uses synchronous ProcessInput/ProcessOutput; skip pure async-only decoder MFTs
-                // since CMSH264DecoderMFT supports full D3D11 DXVA2/NVDEC hardware acceleration synchronously!
+                // Synchronous decoder path (CMSH264DecoderMFT / MS HEVC MFT support DXVA2 synchronously)
                 m_mft.Reset();
                 return false;
             }
@@ -1190,11 +1231,13 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
             return false;
         }
         inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        inType->SetGUID(MF_MT_SUBTYPE, subtype);
         MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, m_width, m_height);
         MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, m_fps, 1);
         inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        inType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+        inType->SetUINT32(MF_MT_MPEG2_PROFILE,
+                           isHevc ? static_cast<UINT32>(eAVEncH265VProfile_Main_420_8)
+                                  : static_cast<UINT32>(eAVEncH264VProfile_Base));
         SetBt709MediaTypeAttributes(inType.Get());
 
         HRESULT hrIn = m_mft->SetInputType(0, inType.Get(), 0);
@@ -1231,21 +1274,23 @@ bool H264Decoder::Init(ID3D11Device* d3dDevice,
             break;
         }
     }
-    if (!configured) {
+    if (!configured && !isHevc) {
         Microsoft::WRL::ComPtr<IMFTransform> msDec;
         if (SUCCEEDED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&msDec))) && msDec) {
             configured = tryConfigure(msDec);
         }
     }
     if (!configured) {
-        Logger::Instance().Error("H264_DEC_ENUM", L"No working H.264 decoder MFT found.");
+        Logger::Instance().Error("H264_DEC_ENUM",
+            std::wstring(L"No working ") + (isHevc ? L"HEVC" : L"H.264") + L" decoder MFT found.");
         Shutdown();
         return false;
     }
 
     m_initialized = true;
-    Logger::Instance().Info("H264_DEC_OK", L"H.264 Decoder ready (dxva=" + std::wstring(m_dxvaEnabled ? L"1" : L"0") +
-                             L", fps=" + std::to_wstring(m_fps) + L")");
+    Logger::Instance().Info("H264_DEC_OK",
+        std::wstring(isHevc ? L"HEVC" : L"H.264") + L" Decoder ready (dxva=" +
+        std::wstring(m_dxvaEnabled ? L"1" : L"0") + L", fps=" + std::to_wstring(m_fps) + L")");
     return true;
 }
 

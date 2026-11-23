@@ -138,6 +138,7 @@ private:
         D3D11Renderer* activeRenderer = nullptr;
         std::thread thread;
         TcpSocket listenSock;
+        UdpSocket videoUdpSock;
 
         std::mutex statsMutex;
         ReceiverStreamStats stats;
