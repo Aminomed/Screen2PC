@@ -53,6 +53,8 @@ private:
     std::vector<uint8_t> m_scratchRaw;
     std::vector<uint8_t> m_scratchCompressed;
     std::vector<uint8_t> m_scratchMove;
+    std::vector<uint32_t> m_lz4Hash;
+    std::vector<uint8_t> m_dirtyGrid;
 };
 
 class DeltaDecoder {

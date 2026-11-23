@@ -377,4 +377,75 @@ bool DxgiCapture::CopyFrameToCpu(std::vector<uint8_t>& outBgra,
     return true;
 }
 
+bool DxgiCapture::CopyFrameToCpuRegions(std::vector<uint8_t>& outBgra,
+                                        uint32_t& outStrideBytes,
+                                        const std::vector<DeltaRect>& regions) {
+    if (!m_initialized || !m_frameTex || !m_stagingTex) return false;
+    outStrideBytes = m_width * 4;
+    const size_t totalBytes = static_cast<size_t>(outStrideBytes) * m_height;
+    if (regions.empty() || outBgra.size() != totalBytes) {
+        return CopyFrameToCpu(outBgra, outStrideBytes, nullptr);
+    }
+
+    uint32_t minX = m_width, minY = m_height, maxX = 0, maxY = 0;
+    uint64_t sumArea = 0;
+    std::vector<DeltaRect> clipped;
+    clipped.reserve(regions.size());
+    for (const auto& r : regions) {
+        uint32_t x0 = std::min(r.x, m_width);
+        uint32_t y0 = std::min(r.y, m_height);
+        uint32_t x1 = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(r.x) + r.w, m_width));
+        uint32_t y1 = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(r.y) + r.h, m_height));
+        if (x1 <= x0 || y1 <= y0) continue;
+        uint32_t cw = x1 - x0;
+        uint32_t ch = y1 - y0;
+        clipped.push_back({x0, y0, cw, ch});
+        minX = std::min(minX, x0);
+        minY = std::min(minY, y0);
+        maxX = std::max(maxX, x1);
+        maxY = std::max(maxY, y1);
+        sumArea += static_cast<uint64_t>(cw) * ch;
+    }
+    if (clipped.empty() || maxX <= minX || maxY <= minY) {
+        return CopyFrameToCpu(outBgra, outStrideBytes, nullptr);
+    }
+
+    const uint64_t boundArea = static_cast<uint64_t>(maxX - minX) * (maxY - minY);
+    if (clipped.size() == 1 || clipped.size() > 16 || sumArea * 2 >= boundArea) {
+        DeltaRect bounds{ minX, minY, maxX - minX, maxY - minY };
+        return CopyFrameToCpu(outBgra, outStrideBytes, &bounds);
+    }
+
+    for (const auto& r : clipped) {
+        D3D11_BOX box{};
+        box.left = r.x;
+        box.top = r.y;
+        box.front = 0;
+        box.right = r.x + r.w;
+        box.bottom = r.y + r.h;
+        box.back = 1;
+        m_context->CopySubresourceRegion(m_stagingTex.Get(), 0, r.x, r.y, 0, m_frameTex.Get(), 0, &box);
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(m_context->Map(m_stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+    if (mapped.RowPitch < outStrideBytes) {
+        m_context->Unmap(m_stagingTex.Get(), 0);
+        return false;
+    }
+    for (const auto& r : clipped) {
+        const size_t copyBytes = static_cast<size_t>(r.w) * 4;
+        const size_t xOffBytes = static_cast<size_t>(r.x) * 4;
+        for (uint32_t y = r.y; y < r.y + r.h; ++y) {
+            std::memcpy(outBgra.data() + static_cast<size_t>(y) * outStrideBytes + xOffBytes,
+                        static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch + xOffBytes,
+                        copyBytes);
+        }
+    }
+    m_context->Unmap(m_stagingTex.Get(), 0);
+    return true;
+}
+
 } // namespace s2p

@@ -230,6 +230,37 @@ void TestDeltaCodec() {
         CHECK(dec2.Decode(pSettle.data(), pSettle.size(), 640, 360), "DLT2 lossless settle decode failed");
         CHECK(std::memcmp(fC.data(), dec2.FrameData(), fC.size()) == 0,
               "DLT2 lossless settle did not restore 100% bit-exact frame");
+
+        // Regression: fast-motion 2x2 followed by a small partial 1:1 frame (e.g. mouse move)
+        // must still allow a subsequent settle pass to restore 100% bit-exactness across the full frame.
+        std::vector<uint8_t> fD, pFast2, pMouse, pSettle2;
+        FillPatternBgra(fD, 640, 360, 640 * 4, 155);
+        bool kFast2 = false, usedFast2 = false;
+        CHECK(enc2.Encode(fD.data(), 640, 360, 640 * 4, fullHint, false, pFast2, kFast2, {}, true, &usedFast2) && usedFast2,
+              "DLT2 second fast-motion encode failed");
+        CHECK(dec2.Decode(pFast2.data(), pFast2.size(), 640, 360), "DLT2 second fast-motion decode failed");
+
+        for (uint32_t y = 10; y < 42; ++y) {
+            for (uint32_t x = 10; x < 42; ++x) {
+                size_t idx = static_cast<size_t>(y) * 640 * 4 + x * 4;
+                fD[idx + 0] = 0xFE;
+                fD[idx + 1] = 0x01;
+                fD[idx + 2] = 0x77;
+                fD[idx + 3] = 0xFF;
+            }
+        }
+        std::vector<s2p::DeltaRect> smallHint = { { 10, 10, 32, 32 } };
+        bool kMouse = false, usedFastMouse = true;
+        CHECK(enc2.Encode(fD.data(), 640, 360, 640 * 4, smallHint, false, pMouse, kMouse, {}, true, &usedFastMouse) && !usedFastMouse,
+              "DLT2 small mouse-area encode after fast-motion failed");
+        CHECK(dec2.Decode(pMouse.data(), pMouse.size(), 640, 360), "DLT2 small mouse-area decode failed");
+
+        bool kSettle2 = false, usedFastSettle2 = true;
+        CHECK(enc2.Encode(fD.data(), 640, 360, 640 * 4, fullHint, false, pSettle2, kSettle2, {}, false, &usedFastSettle2) && !usedFastSettle2,
+              "DLT2 post-mouse settle encode failed");
+        CHECK(dec2.Decode(pSettle2.data(), pSettle2.size(), 640, 360), "DLT2 post-mouse settle decode failed");
+        CHECK(std::memcmp(fD.data(), dec2.FrameData(), fD.size()) == 0,
+              "DLT2 post-mouse settle did not restore 100% bit-exact frame");
     }
 
     std::cout << "[PASS] TestDeltaCodec\n";

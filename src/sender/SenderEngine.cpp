@@ -32,6 +32,22 @@ uint64_t NowUs() {
         std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
 
+uint32_t ComputeStreamBitrateMbps(uint32_t totalBitrateMbps, uint32_t streamIdx, uint32_t streamCount) {
+    if (streamCount <= 1) return totalBitrateMbps;
+    uint32_t alloc = (streamIdx == 0)
+        ? (totalBitrateMbps * 60u) / 100u
+        : (totalBitrateMbps * 40u) / (100u * (streamCount - 1u));
+    return std::max<uint32_t>(10u, alloc);
+}
+
+uint32_t ResolveWorkerEffectiveFps(uint32_t fpsSetting, uint32_t monitorHz, uint32_t streamCount) {
+    uint32_t eff = ResolveEffectiveFps(fpsSetting, monitorHz);
+    if (fpsSetting == 0 && streamCount > 1) {
+        eff = std::min<uint32_t>(eff, 60u);
+    }
+    return eff;
+}
+
 void CopyWideSafe(wchar_t* dst, size_t dstChars, const std::wstring& src) {
     if (!dst || dstChars == 0) return;
     wcsncpy_s(dst, dstChars, src.c_str(), _TRUNCATE);
@@ -554,13 +570,14 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         uint32_t monHz = (helloResp.monitors[targetPcMon].refreshHz >= 30 && helloResp.monitors[targetPcMon].refreshHz <= 240)
                              ? helloResp.monitors[targetPcMon].refreshHz
                              : 60u;
-        uint32_t effFps = ResolveEffectiveFps(cfg.targetFps, monHz);
+        uint32_t effFps = ResolveWorkerEffectiveFps(cfg.targetFps, monHz, streamCount);
+        uint32_t streamBitrate = ComputeStreamBitrateMbps(cfg.bitrateMbps, i, streamCount);
         startReq.streams[i].monitorIndex = targetPcMon;
         startReq.streams[i].width = captureOutputs[i].width;
         startReq.streams[i].height = captureOutputs[i].height;
         startReq.streams[i].refreshHz = monHz;
         startReq.streams[i].codec = static_cast<uint8_t>(cfg.codec);
-        startReq.streams[i].bitrateMbps = cfg.bitrateMbps;
+        startReq.streams[i].bitrateMbps = streamBitrate;
         startReq.streams[i].targetFps = effFps;
     }
 
@@ -607,18 +624,19 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->height = captureOutputs[i].height;
         w->refreshHz = startReq.streams[i].refreshHz;
         w->codec = cfg.codec;
-        w->bitrateMbps = cfg.bitrateMbps;
+        w->bitrateMbps = startReq.streams[i].bitrateMbps;
         w->targetFps = startReq.streams[i].targetFps;
+        w->sessionStreamCount = streamCount;
         w->desiredCodec.store(static_cast<uint8_t>(cfg.codec));
-        w->desiredBitrateMbps.store(cfg.bitrateMbps);
+        w->desiredBitrateMbps.store(startReq.streams[i].bitrateMbps);
         w->desiredTargetFps.store(cfg.targetFps);
         w->peerIp = cfg.targetIp;
         w->streamPort = static_cast<uint16_t>(kPortStreamBase + i);
         w->stats.monitorIndex = startReq.streams[i].monitorIndex;
         w->stats.width = w->width;
         w->stats.height = w->height;
-        w->stats.configuredBitrateMbps = cfg.bitrateMbps;
-        w->stats.liveBitrateMbps = cfg.bitrateMbps;
+        w->stats.configuredBitrateMbps = startReq.streams[i].bitrateMbps;
+        w->stats.liveBitrateMbps = startReq.streams[i].bitrateMbps;
         w->stats.targetFps = w->targetFps;
 
         StreamWorker* raw = w.get();
@@ -944,9 +962,11 @@ bool SenderEngine::ReconfigureStream(CodecType codec, uint32_t bitrateMbps, uint
     std::vector<ReconfigureStreamPayload> notices;
     {
         std::lock_guard<std::mutex> wl(m_workersMutex);
+        const uint32_t streamCount = static_cast<uint32_t>(std::max<size_t>(1, m_workers.size()));
         for (auto& w : m_workers) {
+            uint32_t streamBitrate = ComputeStreamBitrateMbps(bitrateMbps, w->streamIndex, streamCount);
             w->desiredCodec.store(static_cast<uint8_t>(codec));
-            w->desiredBitrateMbps.store(bitrateMbps);
+            w->desiredBitrateMbps.store(streamBitrate);
             w->desiredTargetFps.store(targetFps);
             w->forceKeyframe.store(true);
             w->reconfigPending.store(true);
@@ -954,8 +974,8 @@ bool SenderEngine::ReconfigureStream(CodecType codec, uint32_t bitrateMbps, uint
             ReconfigureStreamPayload req{};
             req.streamIndex = w->streamIndex;
             req.codec = static_cast<uint8_t>(codec);
-            req.bitrateMbps = bitrateMbps;
-            req.targetFps = ResolveEffectiveFps(targetFps, w->refreshHz);
+            req.bitrateMbps = streamBitrate;
+            req.targetFps = ResolveWorkerEffectiveFps(targetFps, w->refreshHz, streamCount);
             notices.push_back(req);
         }
     }
@@ -1175,8 +1195,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         Logger::Instance().Error("SND-WRK", L"Failed to connect stream socket on port " + std::to_wstring(w->streamPort));
         return;
     }
-    // Asymmetric low-latency TCP buffers: small SNDBUF prevents multi-frame stale backlog on dynamic scenes
-    sock.TuneLowLatency(256 * 1024, 64 * 1024);
+    // Tight 64KB SNDBUF eliminates kernel TCP queue bloat so Latest-Frame-Wins backpressure works immediately
+    sock.TuneLowLatency(64 * 1024, 64 * 1024);
     sock.SetTimeouts(1500, 1500);
 
     DxgiCapture capture;
@@ -1209,7 +1229,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     QueryPerformanceFrequency(&qpcFreqLi);
     const int64_t qpcFreq = std::max<int64_t>(1, qpcFreqLi.QuadPart);
 
-    uint32_t effFps = ResolveEffectiveFps(w->desiredTargetFps.load(), w->refreshHz);
+    const uint32_t sessionStreams = std::max<uint32_t>(1u, w->sessionStreamCount);
+    uint32_t effFps = ResolveWorkerEffectiveFps(w->desiredTargetFps.load(), w->refreshHz, sessionStreams);
     uint32_t configBitrateMbps = w->desiredBitrateMbps.load();
     uint32_t liveBitrateMbps = configBitrateMbps;
 
@@ -1228,7 +1249,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
     DeltaEncoder delta;
     std::vector<uint8_t> encodedPayload;
-    std::vector<uint8_t> cursorPkt;
     std::vector<uint8_t> cpuBgra;
     std::vector<DeltaRect> pendingDirtyRects;
     std::vector<DeltaMoveRect> pendingMoveRects;
@@ -1236,7 +1256,10 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     bool pendingImageUpdate = false;
     bool forceFullDirtyRect = false;
     bool deltaNeedsSettle = false;
+    bool deltaSettleFull = false;
     bool losslessSettleActive = false;
+    uint32_t consecutiveLargeDeltaFrames = 0;
+    int64_t lastLargeDeltaQpc = 0;
     int64_t lastMotionQpc = 0;
     uint32_t cpuStride = 0;
     uint64_t frameIndex = 0;
@@ -1255,7 +1278,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
     }
 
-    // Decoupled 1-slot Latest-Frame-Wins TCP sender thread so capture/encode never blocks on TCP SendAll
+    // Decoupled 1-slot Latest-Frame-Wins TCP sender thread + priority cursor-shape queue
+    // so capture/encode NEVER blocks on TCP SendAll or sockSendMutex.
     struct PendingVideoPacket {
         std::vector<uint8_t> bytes;
         CodecType codec = CodecType::H264;
@@ -1265,6 +1289,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     std::mutex sendQueueMutex;
     std::condition_variable sendQueueCv;
     std::optional<PendingVideoPacket> pendingPacket;
+    std::vector<std::vector<uint8_t>> pendingCursorPackets;
     std::atomic<bool> sendQueueOccupied{false};
     bool sendThreadExit = false;
     std::atomic<bool> sendFailed{false};
@@ -1275,36 +1300,68 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     std::thread asyncSendThread([&]() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         while (true) {
-            PendingVideoPacket pkt;
+            std::vector<std::vector<uint8_t>> cursorsToSend;
+            std::optional<PendingVideoPacket> pktOpt;
             {
                 std::unique_lock<std::mutex> ql(sendQueueMutex);
-                sendQueueCv.wait(ql, [&]() { return sendThreadExit || pendingPacket.has_value(); });
-                if (sendThreadExit && !pendingPacket.has_value()) {
+                sendQueueCv.wait(ql, [&]() {
+                    return sendThreadExit || !pendingCursorPackets.empty() || pendingPacket.has_value();
+                });
+                if (sendThreadExit && pendingCursorPackets.empty() && !pendingPacket.has_value()) {
                     break;
                 }
-                pkt = std::move(*pendingPacket);
-                pendingPacket.reset();
-                sendQueueOccupied.store(false, std::memory_order_release);
+                if (!pendingCursorPackets.empty()) {
+                    cursorsToSend.swap(pendingCursorPackets);
+                }
+                if (pendingPacket.has_value()) {
+                    pktOpt = std::move(*pendingPacket);
+                    pendingPacket.reset();
+                    sendQueueOccupied.store(false, std::memory_order_release);
+                }
             }
 
-            LARGE_INTEGER s0{}, s1{};
-            QueryPerformanceCounter(&s0);
-            bool ok = false;
-            {
+            if (!cursorsToSend.empty()) {
                 std::lock_guard<std::mutex> sl(sockSendMutex);
-                ok = sock.SendPacket(MsgType::VideoFrame, pkt.bytes.data(), static_cast<uint32_t>(pkt.bytes.size()));
+                for (const auto& cp : cursorsToSend) {
+                    if (!sock.SendPacket(MsgType::CursorUpdate, cp.data(), static_cast<uint32_t>(cp.size()))) {
+                        sendFailed.store(true);
+                        break;
+                    }
+                }
+                if (sendFailed.load()) break;
             }
-            QueryPerformanceCounter(&s1);
-            if (!ok) {
-                sendFailed.store(true);
-                break;
+
+            if (pktOpt.has_value()) {
+                LARGE_INTEGER s0{}, s1{};
+                QueryPerformanceCounter(&s0);
+                bool ok = false;
+                {
+                    std::lock_guard<std::mutex> sl(sockSendMutex);
+                    ok = sock.SendPacket(MsgType::VideoFrame, pktOpt->bytes.data(), static_cast<uint32_t>(pktOpt->bytes.size()));
+                }
+                QueryPerformanceCounter(&s1);
+                if (!ok) {
+                    sendFailed.store(true);
+                    break;
+                }
+                double ms = static_cast<double>(s1.QuadPart - s0.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
+                latestSendMs.store(ms, std::memory_order_relaxed);
+                sendMsUpdated.store(true, std::memory_order_release);
+                sentPacketBytes.fetch_add(pktOpt->bytes.size() + sizeof(PacketHeader), std::memory_order_relaxed);
             }
-            double ms = static_cast<double>(s1.QuadPart - s0.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
-            latestSendMs.store(ms, std::memory_order_relaxed);
-            sendMsUpdated.store(true, std::memory_order_release);
-            sentPacketBytes.fetch_add(pkt.bytes.size() + sizeof(PacketHeader), std::memory_order_relaxed);
         }
     });
+
+    auto queueCursorPacket = [&](std::vector<uint8_t>&& cursorBytes) {
+        {
+            std::lock_guard<std::mutex> ql(sendQueueMutex);
+            if (pendingCursorPackets.size() >= 8) {
+                pendingCursorPackets.erase(pendingCursorPackets.begin());
+            }
+            pendingCursorPackets.push_back(std::move(cursorBytes));
+        }
+        sendQueueCv.notify_one();
+    };
 
     auto queueVideoPacket = [&](CodecType pktCodec, bool isKeyframe, const std::vector<uint8_t>& payloadBytes) {
         PendingVideoPacket pkt;
@@ -1328,8 +1385,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         {
             std::lock_guard<std::mutex> ql(sendQueueMutex);
             if (pendingPacket.has_value()) {
-                // Should rarely happen because we gate encoding on !sendQueueOccupied;
-                // if it does, force a keyframe so the decoder never references a dropped frame.
                 w->forceKeyframe.store(true);
             }
             pendingPacket = std::move(pkt);
@@ -1349,6 +1404,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     uint32_t stallCount = 0;
     uint32_t cleanSendStreak = 0;
     int64_t nextEncodeQpc = 0;
+    double smoothedEncMs = 0.0;
+    double smoothedSendMs = 0.0;
 
     ID3D11Device* activeD3dDevice = capture.Device();
     auto handleDynamicResizeIfNeeded = [&]() {
@@ -1415,10 +1472,14 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         settleDirtyRects.clear();
         forceFullDirtyRect = true;
         deltaNeedsSettle = false;
+        deltaSettleFull = false;
+        consecutiveLargeDeltaFrames = 0;
         losslessSettleActive = false;
         sentInitialFrame = false;
         consecutiveH264Fails = 0;
         nextEncodeQpc = 0;
+        smoothedEncMs = 0.0;
+        smoothedSendMs = 0.0;
     };
 
     auto applyLiveReconfigureIfNeeded = [&]() {
@@ -1427,7 +1488,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         CodecType newCodec = static_cast<CodecType>(w->desiredCodec.load());
         if (newCodec == CodecType::Auto) newCodec = CodecType::H264;
         uint32_t newBitrate = w->desiredBitrateMbps.load();
-        uint32_t newEffFps = ResolveEffectiveFps(w->desiredTargetFps.load(), w->refreshHz);
+        uint32_t newEffFps = ResolveWorkerEffectiveFps(w->desiredTargetFps.load(), w->refreshHz, sessionStreams);
 
         const bool codecChanged = (newCodec != activeCodec);
         const bool fpsChanged = (newEffFps != effFps);
@@ -1439,6 +1500,8 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         stallCount = 0;
         cleanSendStreak = 0;
         nextEncodeQpc = 0;
+        smoothedEncMs = 0.0;
+        smoothedSendMs = 0.0;
 
         if (codecChanged) {
             if (newCodec == CodecType::DeltaLossless) {
@@ -1472,6 +1535,9 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
 
         deltaNeedsSettle = false;
+        deltaSettleFull = false;
+        settleDirtyRects.clear();
+        consecutiveLargeDeltaFrames = 0;
         losslessSettleActive = false;
 
         std::lock_guard<std::mutex> sl(w->statsMutex);
@@ -1514,7 +1580,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
         handleDynamicResizeIfNeeded();
 
-        // Dispatch cursor updates immediately: position-only over UDP, shape changes over TCP
+        // Dispatch cursor updates immediately: position-only over UDP, shape changes non-blocking via asyncSendThread
         if (cursor.updated) {
             CursorUpdateHeader ch{};
             ch.monitorIndex = w->targetPcMonitor;
@@ -1540,15 +1606,12 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                 udpCur.body = ch;
                 m_realtimeUdpSock.SendTo(w->peerIp, kPortRealtimeUdp, &udpCur, sizeof(udpCur));
             } else if (static_cast<size_t>(ch.dataSize) <= kMaxFrameBytes - sizeof(CursorUpdateHeader)) {
-                cursorPkt.resize(sizeof(CursorUpdateHeader) + ch.dataSize);
-                std::memcpy(cursorPkt.data(), &ch, sizeof(CursorUpdateHeader));
+                std::vector<uint8_t> cPkt(sizeof(CursorUpdateHeader) + ch.dataSize);
+                std::memcpy(cPkt.data(), &ch, sizeof(CursorUpdateHeader));
                 if (ch.dataSize > 0) {
-                    std::memcpy(cursorPkt.data() + sizeof(CursorUpdateHeader), cursor.shapeData.data(), ch.dataSize);
+                    std::memcpy(cPkt.data() + sizeof(CursorUpdateHeader), cursor.shapeData.data(), ch.dataSize);
                 }
-                std::lock_guard<std::mutex> sl(sockSendMutex);
-                if (!sock.SendPacket(MsgType::CursorUpdate, cursorPkt.data(), static_cast<uint32_t>(cursorPkt.size()))) {
-                    break;
-                }
+                queueCursorPacket(std::move(cPkt));
             }
         }
 
@@ -1598,14 +1661,15 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             const double sendMs = latestSendMs.load(std::memory_order_relaxed);
             windowSendMsSum += sendMs;
             ++windowSendCount;
+            smoothedSendMs = (smoothedSendMs <= 0.0) ? sendMs : (smoothedSendMs * 0.75 + sendMs * 0.25);
 
             if (activeCodec == CodecType::H264) {
-                const double stallThreshMs = std::max<double>(18.0, 1200.0 / static_cast<double>(effFps));
+                const double stallThreshMs = std::max<double>(10.0, 900.0 / static_cast<double>(effFps));
                 if (sendMs > stallThreshMs) {
                     cleanSendStreak = 0;
-                    if (++stallCount >= 2 && liveBitrateMbps > 15) {
+                    if (++stallCount >= 2 && liveBitrateMbps > 8) {
                         stallCount = 0;
-                        uint32_t newBr = std::max<uint32_t>(15u, (liveBitrateMbps * 3u) / 4u);
+                        uint32_t newBr = std::max<uint32_t>(8u, (liveBitrateMbps * 3u) / 4u);
                         if (newBr < liveBitrateMbps && h264.SetBitrate(newBr)) {
                             liveBitrateMbps = newBr;
                             std::lock_guard<std::mutex> sl(w->statsMutex);
@@ -1617,10 +1681,10 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                     }
                 } else {
                     stallCount = 0;
-                    if (sendMs < 10.0 && liveBitrateMbps < configBitrateMbps) {
+                    if (sendMs < 6.0 && liveBitrateMbps < configBitrateMbps) {
                         if (++cleanSendStreak >= effFps * 3u) {
                             cleanSendStreak = 0;
-                            uint32_t step = std::max<uint32_t>(5u, configBitrateMbps / 8u);
+                            uint32_t step = std::max<uint32_t>(4u, configBitrateMbps / 8u);
                             uint32_t newBr = std::min<uint32_t>(configBitrateMbps, liveBitrateMbps + step);
                             if (newBr > liveBitrateMbps && h264.SetBitrate(newBr)) {
                                 liveBitrateMbps = newBr;
@@ -1630,7 +1694,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                                     L"Network recovered -> raised H.264 bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
                             }
                         }
-                    } else if (sendMs >= 10.0) {
+                    } else if (sendMs >= 6.0) {
                         cleanSendStreak = 0;
                     }
                 }
@@ -1639,13 +1703,10 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
         const bool socketReady = !sendQueueOccupied.load(std::memory_order_acquire);
         const bool hasKeyReq = w->forceKeyframe.load(std::memory_order_acquire) || !sentInitialFrame;
-        const bool dueForEncode = (w->desiredTargetFps.load() == 0 && effFps >= w->refreshHz) ||
-                                  (nextEncodeQpc == 0 || nowQpc >= nextEncodeQpc);
+        const bool dueForEncode = (nextEncodeQpc == 0 || nowQpc >= nextEncodeQpc);
 
         if (socketReady && ((pendingImageUpdate && dueForEncode) || hasKeyReq)) {
             const bool needKey = w->forceKeyframe.exchange(false) || !sentInitialFrame;
-            const int64_t intervalQpc = std::max<int64_t>(1, (qpcFreq * 9) / (static_cast<int64_t>(effFps) * 10));
-            nextEncodeQpc = nowQpc + intervalQpc; // 10% slack avoids beat-frequency stalls vs DXGI VSync
 
             encodedPayload.clear();
             bool isKeyframe = false;
@@ -1688,48 +1749,67 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
             if (activeCodec == CodecType::DeltaLossless) {
                 encodedCodec = CodecType::DeltaLossless;
-                DeltaRect readBounds{};
-                const DeltaRect* pReadBounds = nullptr;
                 std::vector<DeltaRect> mergedHints;
+                std::vector<DeltaRect> copyRegions;
+                uint64_t approxHintArea = 0;
+                const uint64_t totalScreenArea = static_cast<uint64_t>(capture.Width()) * capture.Height();
+
                 if (!forceFullDirtyRect && !needKey && (!pendingDirtyRects.empty() || !pendingMoveRects.empty())) {
                     mergedHints = DeltaEncoder::MergeAndBoundRects(
                         pendingDirtyRects, capture.Width(), capture.Height(), 32);
-                    uint32_t minX = capture.Width(), minY = capture.Height(), maxX = 0, maxY = 0;
+                    copyRegions = mergedHints;
                     for (const auto& r : mergedHints) {
-                        minX = std::min(minX, r.x);
-                        minY = std::min(minY, r.y);
-                        maxX = std::max(maxX, r.x + r.w);
-                        maxY = std::max(maxY, r.y + r.h);
+                        approxHintArea += static_cast<uint64_t>(r.w) * r.h;
                     }
                     for (const auto& m : pendingMoveRects) {
-                        minX = std::min(minX, std::min(m.srcX, m.dstX));
-                        minY = std::min(minY, std::min(m.srcY, m.dstY));
-                        maxX = std::max(maxX, std::max(m.srcX + m.w, m.dstX + m.w));
-                        maxY = std::max(maxY, std::max(m.srcY + m.h, m.dstY + m.h));
+                        copyRegions.push_back(DeltaRect{m.dstX, m.dstY, m.w, m.h});
+                        approxHintArea += static_cast<uint64_t>(m.w) * m.h;
                     }
-                    if (maxX > minX && maxY > minY) {
-                        readBounds = DeltaRect{minX, minY, maxX - minX, maxY - minY};
-                        pReadBounds = &readBounds;
-                    }
+                } else {
+                    approxHintArea = totalScreenArea;
                 }
 
-                if (capture.CopyFrameToCpu(cpuBgra, cpuStride, pReadBounds)) {
+                // Only engage 2x2 fast-motion on *sustained* large-area motion (>= 2 consecutive large frames
+                // within 150ms) so single tab/window switches render 100% razor-sharp immediately!
+                const int64_t fastWindowQpc = (qpcFreq * 150) / 1000;
+                const bool isLargeFrame = (totalScreenArea > 0) && (approxHintArea * 100ULL >= totalScreenArea * 35ULL);
+                if (isLargeFrame) {
+                    if (lastLargeDeltaQpc > 0 && (nowQpc - lastLargeDeltaQpc) <= fastWindowQpc) {
+                        ++consecutiveLargeDeltaFrames;
+                    } else {
+                        consecutiveLargeDeltaFrames = 1;
+                    }
+                    lastLargeDeltaQpc = nowQpc;
+                } else {
+                    consecutiveLargeDeltaFrames = 0;
+                }
+                const bool allowFastMotion = (consecutiveLargeDeltaFrames >= 2);
+
+                const bool copied = (!forceFullDirtyRect && !needKey && !copyRegions.empty())
+                                        ? capture.CopyFrameToCpuRegions(cpuBgra, cpuStride, copyRegions)
+                                        : capture.CopyFrameToCpu(cpuBgra, cpuStride, nullptr);
+
+                if (copied) {
                     const std::vector<DeltaRect> emptyHints;
                     const auto& hints = (forceFullDirtyRect || needKey) ? emptyHints : mergedHints;
                     bool usedFastMotion = false;
                     encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
                                             cpuStride, hints, needKey, encodedPayload, isKeyframe,
                                             (forceFullDirtyRect || needKey) ? std::vector<DeltaMoveRect>{} : pendingMoveRects,
-                                            /*allowFastMotion=*/true, &usedFastMotion);
+                                            allowFastMotion, &usedFastMotion);
                     if (encodeOk && usedFastMotion) {
+                        // Arm settle and accumulate affected regions; NEVER clear on later small non-fast-motion frames!
                         deltaNeedsSettle = true;
-                        settleDirtyRects = mergedHints;
-                        if (forceFullDirtyRect || needKey) {
+                        if (forceFullDirtyRect || needKey || mergedHints.empty()) {
+                            deltaSettleFull = true;
                             settleDirtyRects.clear();
+                        } else if (!deltaSettleFull) {
+                            settleDirtyRects.insert(settleDirtyRects.end(), mergedHints.begin(), mergedHints.end());
+                            if (settleDirtyRects.size() > 32) {
+                                settleDirtyRects = DeltaEncoder::MergeAndBoundRects(
+                                    settleDirtyRects, capture.Width(), capture.Height(), 32);
+                            }
                         }
-                    } else if (encodeOk) {
-                        deltaNeedsSettle = false;
-                        settleDirtyRects.clear();
                     }
                 }
             }
@@ -1738,6 +1818,13 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             double encMs = static_cast<double>(encEndLi.QuadPart - encStartLi.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
             windowEncodeMsSum += encMs;
             ++windowEncodeCount;
+            smoothedEncMs = (smoothedEncMs <= 0.0) ? encMs : (smoothedEncMs * 0.75 + encMs * 0.25);
+
+            // Adaptive pacing: never run faster than the Surface iGPU/CPU + Wi-Fi can drain without queuing
+            const int64_t intervalQpc = std::max<int64_t>(1, (qpcFreq * 9) / (static_cast<int64_t>(effFps) * 10));
+            const double pacingMs = std::max(smoothedEncMs, smoothedSendMs) * 1.05;
+            const int64_t workPaceQpc = static_cast<int64_t>((pacingMs * static_cast<double>(qpcFreq)) / 1000.0);
+            nextEncodeQpc = nowQpc + std::max(intervalQpc, workPaceQpc);
 
             if (encodeOk && !encodedPayload.empty()) {
                 if (encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
@@ -1761,12 +1848,18 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             const bool dueSettle = (lastMotionQpc > 0 && (nowQpc - lastMotionQpc) >= settleDelayQpc);
 
             if (dueSettle && activeCodec == CodecType::DeltaLossless && deltaNeedsSettle) {
-                if (capture.CopyFrameToCpu(cpuBgra, cpuStride, nullptr)) {
+                const bool usePartialSettle = (!deltaSettleFull && !settleDirtyRects.empty());
+                const bool copied = usePartialSettle
+                                        ? capture.CopyFrameToCpuRegions(cpuBgra, cpuStride, settleDirtyRects)
+                                        : capture.CopyFrameToCpu(cpuBgra, cpuStride, nullptr);
+                if (copied) {
                     encodedPayload.clear();
                     bool isKeyframe = false;
                     bool usedFastMotion = false;
+                    const std::vector<DeltaRect> emptyHints;
+                    const auto& settleHints = usePartialSettle ? settleDirtyRects : emptyHints;
                     if (delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
-                                     cpuStride, settleDirtyRects, false, encodedPayload, isKeyframe,
+                                     cpuStride, settleHints, false, encodedPayload, isKeyframe,
                                      {}, /*allowFastMotion=*/false, &usedFastMotion) &&
                         !encodedPayload.empty() &&
                         encodedPayload.size() <= kMaxFrameBytes - sizeof(VideoFrameHeader)) {
@@ -1776,7 +1869,9 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                     }
                 }
                 deltaNeedsSettle = false;
+                deltaSettleFull = false;
                 settleDirtyRects.clear();
+                consecutiveLargeDeltaFrames = 0;
             }
         }
 

@@ -75,11 +75,14 @@ inline uint32_t ReadU32(const uint8_t* p) {
     return v;
 }
 
+constexpr uint32_t kLz4HashBits = 12;
+constexpr size_t   kLz4HashSize = (1u << kLz4HashBits);
+
 inline uint32_t HashLz4(uint32_t val) {
-    return (val * 2654435761U) >> (32 - 14); // 16K hash table entries
+    return (val * 2654435761U) >> (32 - kLz4HashBits);
 }
 
-void CompressLz4Block(const uint8_t* src, size_t srcSize, std::vector<uint8_t>& out) {
+void CompressLz4Block(const uint8_t* src, size_t srcSize, std::vector<uint8_t>& out, std::vector<uint32_t>& hashTable) {
     out.clear();
     if (srcSize == 0) return;
 
@@ -92,7 +95,11 @@ void CompressLz4Block(const uint8_t* src, size_t srcSize, std::vector<uint8_t>& 
         return;
     }
 
-    uint32_t hashTable[1 << 14] = {};
+    if (hashTable.size() != kLz4HashSize) {
+        hashTable.assign(kLz4HashSize, 0);
+    } else {
+        std::memset(hashTable.data(), 0, kLz4HashSize * sizeof(uint32_t));
+    }
     const uint8_t* const srcEnd = src + srcSize;
     const uint8_t* const matchLimit = srcEnd - 5;
     const uint8_t* const mflimit = srcEnd - 12;
@@ -445,56 +452,85 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
     std::vector<DeltaRect> rects;
     if (outIsKeyframe) {
         rects.push_back({0, 0, width, height});
-    } else if (!hints.empty()) {
-        // Refine hints with 64x64 tile check against m_prevFrame so unchanged sub-regions are skipped!
-        std::vector<DeltaRect> mergedHints = MergeAndBoundRects(hints, width, height, 32);
-        std::vector<DeltaRect> dirtyTiles;
-        for (const auto& hr : mergedHints) {
-            uint32_t txStart = (hr.x / kTileSize) * kTileSize;
-            uint32_t tyStart = (hr.y / kTileSize) * kTileSize;
-            uint32_t txEnd = std::min(width, hr.x + hr.w);
-            uint32_t tyEnd = std::min(height, hr.y + hr.h);
-            for (uint32_t ty = tyStart; ty < tyEnd; ty += kTileSize) {
-                uint32_t th = std::min(kTileSize, tyEnd - ty);
-                for (uint32_t tx = txStart; tx < txEnd; tx += kTileSize) {
-                    uint32_t tw = std::min(kTileSize, txEnd - tx);
+    } else {
+        const uint32_t tilesX = (width + kTileSize - 1) / kTileSize;
+        const uint32_t tilesY = (height + kTileSize - 1) / kTileSize;
+        m_dirtyGrid.assign(static_cast<size_t>(tilesX) * tilesY, 0);
+
+        auto scanTileRange = [&](uint32_t tx0, uint32_t ty0, uint32_t tx1, uint32_t ty1) {
+            for (uint32_t tyIdx = ty0; tyIdx < ty1; ++tyIdx) {
+                uint32_t py = tyIdx * kTileSize;
+                uint32_t th = std::min(kTileSize, height - py);
+                for (uint32_t txIdx = tx0; txIdx < tx1; ++txIdx) {
+                    const size_t cell = static_cast<size_t>(tyIdx) * tilesX + txIdx;
+                    if (m_dirtyGrid[cell]) continue;
+                    uint32_t px = txIdx * kTileSize;
+                    uint32_t tw = std::min(kTileSize, width - px);
+                    const size_t rowBytes = static_cast<size_t>(tw) * 4;
                     bool dirty = false;
                     for (uint32_t row = 0; row < th; ++row) {
-                        const uint8_t* curRow = bgraFrame + static_cast<size_t>(ty + row) * strideBytes + static_cast<size_t>(tx) * 4;
-                        const uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(ty + row) * width + tx) * 4;
-                        if (std::memcmp(curRow, prevRow, static_cast<size_t>(tw) * 4) != 0) {
+                        const uint8_t* curRow = bgraFrame + static_cast<size_t>(py + row) * strideBytes + static_cast<size_t>(px) * 4;
+                        const uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(py + row) * width + px) * 4;
+                        if (std::memcmp(curRow, prevRow, rowBytes) != 0) {
                             dirty = true;
                             break;
                         }
                     }
                     if (dirty) {
-                        dirtyTiles.push_back({tx, ty, tw, th});
+                        m_dirtyGrid[cell] = 1;
                     }
                 }
             }
+        };
+
+        if (!hints.empty()) {
+            std::vector<DeltaRect> mergedHints = MergeAndBoundRects(hints, width, height, 32);
+            for (const auto& hr : mergedHints) {
+                uint32_t tx0 = hr.x / kTileSize;
+                uint32_t ty0 = hr.y / kTileSize;
+                uint32_t tx1 = (std::min(width, hr.x + hr.w) + kTileSize - 1) / kTileSize;
+                uint32_t ty1 = (std::min(height, hr.y + hr.h) + kTileSize - 1) / kTileSize;
+                scanTileRange(tx0, ty0, tx1, ty1);
+            }
+        } else {
+            scanTileRange(0, 0, tilesX, tilesY);
         }
-        rects = MergeAndBoundRects(dirtyTiles, width, height, 32);
-    } else {
-        std::vector<DeltaRect> dirtyTiles;
-        for (uint32_t ty = 0; ty < height; ty += kTileSize) {
-            uint32_t th = std::min(kTileSize, height - ty);
-            for (uint32_t tx = 0; tx < width; tx += kTileSize) {
-                uint32_t tw = std::min(kTileSize, width - tx);
-                bool dirty = false;
-                for (uint32_t row = 0; row < th; ++row) {
-                    const uint8_t* curRow = bgraFrame + static_cast<size_t>(ty + row) * strideBytes + static_cast<size_t>(tx) * 4;
-                    const uint8_t* prevRow = m_prevFrame.data() + (static_cast<size_t>(ty + row) * width + tx) * 4;
-                    if (std::memcmp(curRow, prevRow, static_cast<size_t>(tw) * 4) != 0) {
-                        dirty = true;
+
+        // O(tiles) horizontal run coalescing + exact vertical run merging
+        for (uint32_t tyIdx = 0; tyIdx < tilesY; ++tyIdx) {
+            uint32_t py = tyIdx * kTileSize;
+            uint32_t th = std::min(kTileSize, height - py);
+            const uint8_t* gridRow = m_dirtyGrid.data() + static_cast<size_t>(tyIdx) * tilesX;
+            uint32_t txIdx = 0;
+            while (txIdx < tilesX) {
+                if (!gridRow[txIdx]) {
+                    ++txIdx;
+                    continue;
+                }
+                uint32_t runStart = txIdx;
+                while (txIdx < tilesX && gridRow[txIdx]) {
+                    ++txIdx;
+                }
+                uint32_t rx = runStart * kTileSize;
+                uint32_t rxEnd = std::min(width, txIdx * kTileSize);
+                uint32_t rw = rxEnd - rx;
+                bool mergedVert = false;
+                for (auto it = rects.rbegin(); it != rects.rend(); ++it) {
+                    if (it->y + it->h == py && it->x == rx && it->w == rw) {
+                        it->h += th;
+                        mergedVert = true;
                         break;
                     }
+                    if (it->y + it->h < py) break;
                 }
-                if (dirty) {
-                    dirtyTiles.push_back({tx, ty, tw, th});
+                if (!mergedVert) {
+                    rects.push_back({rx, py, rw, th});
                 }
             }
         }
-        rects = MergeAndBoundRects(dirtyTiles, width, height, 32);
+        if (rects.size() > 32) {
+            rects = MergeAndBoundRects(rects, width, height, 32);
+        }
     }
 
     uint64_t dirtyArea = 0;
@@ -585,7 +621,7 @@ bool DeltaEncoder::Encode(const uint8_t* bgraFrame,
             }
         }
 
-        CompressLz4Block(m_scratchRaw.data(), uncompBytes, m_scratchCompressed);
+        CompressLz4Block(m_scratchRaw.data(), uncompBytes, m_scratchCompressed, m_lz4Hash);
         const uint8_t* payloadData = m_scratchCompressed.data();
         size_t payloadLen = m_scratchCompressed.size();
 

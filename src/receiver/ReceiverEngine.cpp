@@ -947,8 +947,8 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         Logger::Instance().Warn("RCV-STRM", L"Timed out or canceled waiting for stream connection on port " + std::to_wstring(w->port));
         return;
     }
-    // Asymmetric low-latency stream socket (small SNDBUF, generous RCVBUF)
-    sock.TuneLowLatency(64 * 1024, 512 * 1024);
+    // Asymmetric low-latency stream socket (small SNDBUF, tight 128KB RCVBUF to prevent multi-frame queue bloat)
+    sock.TuneLowLatency(64 * 1024, 128 * 1024);
     sock.SetTimeouts(3000, 1500);
 
     const uint32_t colorIdx = std::min<uint32_t>(w->targetMonitorIndex, kMaxMonitors - 1);
@@ -1032,6 +1032,44 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
             }
 
             // Drain burst of queued packets so we always render the freshest cursor & video frame
+            bool pendingDeltaCommit = false;
+            bool deltaUnionFull = false;
+            uint32_t deltaUx0 = 0, deltaUy0 = 0, deltaUx1 = 0, deltaUy1 = 0;
+            uint32_t deltaLastW = 0, deltaLastH = 0;
+
+            bool pendingGpuCommit = false;
+            bool pendingGpuIsNv12 = false;
+            bool pendingCpuH264Commit = false;
+            uint32_t cpuH264W = 0, cpuH264H = 0;
+
+            auto flushPendingBurstFrames = [&]() {
+                if (pendingDeltaCommit && delta.Width() > 0 && delta.Height() > 0) {
+                    if (deltaUnionFull || deltaUx1 <= deltaUx0 || deltaUy1 <= deltaUy0) {
+                        renderer.QueueCpuFrame(delta.FrameData(), delta.StrideBytes(),
+                                               delta.Width(), delta.Height());
+                    } else {
+                        renderer.QueueCpuFrame(delta.FrameData(), delta.StrideBytes(),
+                                               delta.Width(), delta.Height(),
+                                               deltaUx0, deltaUy0, deltaUx1 - deltaUx0, deltaUy1 - deltaUy0);
+                    }
+                    pendingDeltaCommit = false;
+                    deltaUnionFull = false;
+                }
+                if (pendingGpuCommit) {
+                    {
+                        std::lock_guard<std::mutex> gpuLock(renderer.GpuMutex());
+                        if (renderer.Context()) {
+                            renderer.Context()->Flush();
+                        }
+                    }
+                    renderer.MarkGpuFrameUpdated(pendingGpuIsNv12);
+                    pendingGpuCommit = false;
+                } else if (pendingCpuH264Commit && !cpuBgra.empty()) {
+                    renderer.QueueCpuFrame(cpuBgra.data(), cpuH264W * 4, cpuH264W, cpuH264H);
+                    pendingCpuH264Commit = false;
+                }
+            };
+
             for (int drained = 0; drained < 8 && wr > 0 && !recvStop && !m_stop && !m_sessionStop && !w->stop; ++drained) {
                 PacketHeader hdr{};
                 std::vector<uint8_t> payload;
@@ -1074,6 +1112,9 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                     QueryPerformanceCounter(&decStartLi);
 
                     if (vh.codec == static_cast<uint8_t>(CodecType::H264)) {
+                        if (pendingDeltaCommit) {
+                            flushPendingBurstFrames();
+                        }
                         uint32_t outW = vh.width, outH = vh.height;
                         bool pushCpuFrame = false;
                         bool pushGpuFrame = false;
@@ -1130,8 +1171,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                                                                     nv12Target ? nullptr : renderer.FrameTexture(),
                                                                     nullptr, &outW, &outH,
                                                                     nv12Target, &decodedToNv12);
-                                            if (decodedOk && renderer.Context()) {
-                                                renderer.Context()->Flush();
+                                            if (decodedOk) {
                                                 pushGpuFrame = true;
                                             }
                                         }
@@ -1177,9 +1217,14 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                         } // Unlock m_gpuMutex before queuing/waking/network I/O
 
                         if (pushGpuFrame) {
-                            renderer.MarkGpuFrameUpdated(decodedToNv12);
+                            pendingGpuCommit = true;
+                            pendingGpuIsNv12 = decodedToNv12;
+                            pendingCpuH264Commit = false;
                         } else if (pushCpuFrame) {
-                            renderer.QueueCpuFrame(cpuBgra.data(), outW * 4, outW, outH);
+                            pendingCpuH264Commit = true;
+                            cpuH264W = outW;
+                            cpuH264H = outH;
+                            pendingGpuCommit = false;
                         }
                         if (needKeyframeNow) {
                             RequestKeyframe(w->monitorIndex);
@@ -1188,11 +1233,28 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                             maybeRequestKeyframe();
                         }
                     } else if (vh.codec == static_cast<uint8_t>(CodecType::DeltaLossless)) {
+                        if (pendingGpuCommit || pendingCpuH264Commit) {
+                            flushPendingBurstFrames();
+                        }
                         if (delta.Decode(frameData, vh.dataSize, vh.width, vh.height)) {
                             const DeltaRect& bounds = delta.LastBoundingRect();
-                            renderer.QueueCpuFrame(delta.FrameData(), delta.StrideBytes(),
-                                                   delta.Width(), delta.Height(),
-                                                   bounds.x, bounds.y, bounds.w, bounds.h);
+                            if (!pendingDeltaCommit || delta.Width() != deltaLastW || delta.Height() != deltaLastH) {
+                                deltaLastW = delta.Width();
+                                deltaLastH = delta.Height();
+                                deltaUnionFull = (bounds.w == 0 || bounds.h == 0);
+                                deltaUx0 = bounds.x;
+                                deltaUy0 = bounds.y;
+                                deltaUx1 = std::min(deltaLastW, bounds.x + bounds.w);
+                                deltaUy1 = std::min(deltaLastH, bounds.y + bounds.h);
+                            } else if (bounds.w == 0 || bounds.h == 0) {
+                                deltaUnionFull = true;
+                            } else if (!deltaUnionFull) {
+                                deltaUx0 = std::min(deltaUx0, bounds.x);
+                                deltaUy0 = std::min(deltaUy0, bounds.y);
+                                deltaUx1 = std::max(deltaUx1, std::min(deltaLastW, bounds.x + bounds.w));
+                                deltaUy1 = std::max(deltaUy1, std::min(deltaLastH, bounds.y + bounds.h));
+                            }
+                            pendingDeltaCommit = true;
                             decodedOk = true;
                             codecLabel = delta.LastDecodeUsedFastMotion() ? L"Delta Fast-Motion" : L"Delta Lossless";
                         } else {
@@ -1239,6 +1301,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                     break;
                 }
             }
+            flushPendingBurstFrames();
         }
 
         {

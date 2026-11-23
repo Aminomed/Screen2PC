@@ -176,9 +176,9 @@ HRESULT ConfigureEncoderCodecApi(ICodecAPI* api, uint32_t bitrateBps, uint32_t f
     vMax.ulVal = static_cast<ULONG>(std::min<uint64_t>(0xFFFFFFFFULL, std::max<uint64_t>(bitrateBps, maxBitrate)));
     api->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &vMax);
 
-    // Ultra-tight VBV buffer (~2 frames at target FPS) so scene changes never cause 500ms bufferbloat spikes
+    // Ultra-tight VBV buffer (~1.5 frames at target FPS) so scene changes never cause bufferbloat spikes
     uint32_t safeFps = std::clamp<uint32_t>(fps, 24u, 240u);
-    uint32_t vbvBytes = std::max<uint32_t>(32768u, ((bitrateBps / 8u) * 2u) / safeFps);
+    uint32_t vbvBytes = std::max<uint32_t>(32768u, ((bitrateBps / 8u) * 3u) / (safeFps * 2u));
     VARIANT vBuf{};
     vBuf.vt = VT_UI4;
     vBuf.ulVal = vbvBytes;
@@ -729,6 +729,9 @@ bool H264Encoder::ConvertBgraToNv12Gpu(ID3D11Texture2D* bgraTex, size_t slotIdx)
     stream.pInputSurface = m_vpInView.Get();
 
     HRESULT hr = m_videoCtx->VideoProcessorBlt(m_vp.Get(), m_vpOutViewRing[slotIdx].Get(), 0, 1, &stream);
+    if (SUCCEEDED(hr) && m_isHardware && m_context) {
+        m_context->Flush();
+    }
     return SUCCEEDED(hr);
 }
 

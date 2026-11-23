@@ -127,6 +127,7 @@ private:
         CodecType codec = CodecType::H264;
         uint32_t bitrateMbps = 80;
         uint32_t targetFps = 60;
+        uint32_t sessionStreamCount = 1;
         std::string peerIp;
         uint16_t streamPort = kPortStreamBase;
 

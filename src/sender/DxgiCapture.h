@@ -72,6 +72,10 @@ public:
                         uint32_t& outStrideBytes,
                         const DeltaRect* dirtyBounds = nullptr);
 
+    bool CopyFrameToCpuRegions(std::vector<uint8_t>& outBgra,
+                               uint32_t& outStrideBytes,
+                               const std::vector<DeltaRect>& regions);
+
 private:
     bool RecreateDuplication();
 

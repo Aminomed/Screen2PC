@@ -1028,42 +1028,52 @@ void D3D11Renderer::QueueCpuFrame(const uint8_t* bgra,
                                  m_pendingCpuFrame.bgra.size() != totalBytes);
         m_pendingCpuFrame.bgra.resize(totalBytes);
 
-        uint32_t y0 = 0, y1 = height;
-        if (!dimChanged && dirtyW > 0 && dirtyH > 0 && dirtyY < height) {
-            y0 = dirtyY;
-            y1 = std::min(height, dirtyY + dirtyH);
-        }
-        if (strideBytes == rowBytes && y0 == 0 && y1 == height) {
-            std::memcpy(m_pendingCpuFrame.bgra.data(), bgra, totalBytes);
-        } else {
-            for (uint32_t y = y0; y < y1; ++y) {
-                std::memcpy(m_pendingCpuFrame.bgra.data() + static_cast<size_t>(y) * rowBytes,
-                            bgra + static_cast<size_t>(y) * strideBytes,
-                            rowBytes);
-            }
-        }
+        uint32_t targetX = dimChanged ? 0 : dirtyX;
+        uint32_t targetY = dimChanged ? 0 : dirtyY;
+        uint32_t targetW = dimChanged ? width : dirtyW;
+        uint32_t targetH = dimChanged ? height : dirtyH;
+
         if (m_pendingCpuFrame.dirty && !dimChanged) {
             if (m_pendingCpuFrame.dirtyW == 0 || m_pendingCpuFrame.dirtyH == 0 || dirtyW == 0 || dirtyH == 0) {
-                m_pendingCpuFrame.dirtyX = 0;
-                m_pendingCpuFrame.dirtyY = 0;
-                m_pendingCpuFrame.dirtyW = width;
-                m_pendingCpuFrame.dirtyH = height;
+                targetX = 0;
+                targetY = 0;
+                targetW = width;
+                targetH = height;
             } else {
                 uint32_t ux0 = std::min(m_pendingCpuFrame.dirtyX, dirtyX);
                 uint32_t uy0 = std::min(m_pendingCpuFrame.dirtyY, dirtyY);
                 uint32_t ux1 = std::min(width, std::max(m_pendingCpuFrame.dirtyX + m_pendingCpuFrame.dirtyW, dirtyX + dirtyW));
                 uint32_t uy1 = std::min(height, std::max(m_pendingCpuFrame.dirtyY + m_pendingCpuFrame.dirtyH, dirtyY + dirtyH));
-                m_pendingCpuFrame.dirtyX = ux0;
-                m_pendingCpuFrame.dirtyY = uy0;
-                m_pendingCpuFrame.dirtyW = (ux1 > ux0) ? (ux1 - ux0) : width;
-                m_pendingCpuFrame.dirtyH = (uy1 > uy0) ? (uy1 - uy0) : height;
+                targetX = ux0;
+                targetY = uy0;
+                targetW = (ux1 > ux0) ? (ux1 - ux0) : width;
+                targetH = (uy1 > uy0) ? (uy1 - uy0) : height;
             }
-        } else {
-            m_pendingCpuFrame.dirtyX = dimChanged ? 0 : dirtyX;
-            m_pendingCpuFrame.dirtyY = dimChanged ? 0 : dirtyY;
-            m_pendingCpuFrame.dirtyW = dimChanged ? width : dirtyW;
-            m_pendingCpuFrame.dirtyH = dimChanged ? height : dirtyH;
         }
+
+        uint32_t y0 = 0, y1 = height;
+        uint32_t x0 = 0, x1 = width;
+        if (!dimChanged && targetW > 0 && targetH > 0 && targetX < width && targetY < height) {
+            x0 = targetX;
+            x1 = std::min(width, targetX + targetW);
+            y0 = targetY;
+            y1 = std::min(height, targetY + targetH);
+        }
+        if (strideBytes == rowBytes && x0 == 0 && x1 == width && y0 == 0 && y1 == height) {
+            std::memcpy(m_pendingCpuFrame.bgra.data(), bgra, totalBytes);
+        } else {
+            const size_t copyBytes = static_cast<size_t>(x1 - x0) * 4;
+            const size_t xOffBytes = static_cast<size_t>(x0) * 4;
+            for (uint32_t y = y0; y < y1; ++y) {
+                std::memcpy(m_pendingCpuFrame.bgra.data() + static_cast<size_t>(y) * rowBytes + xOffBytes,
+                            bgra + static_cast<size_t>(y) * strideBytes + xOffBytes,
+                            copyBytes);
+            }
+        }
+        m_pendingCpuFrame.dirtyX = targetX;
+        m_pendingCpuFrame.dirtyY = targetY;
+        m_pendingCpuFrame.dirtyW = targetW;
+        m_pendingCpuFrame.dirtyH = targetH;
         m_pendingCpuFrame.width = width;
         m_pendingCpuFrame.height = height;
         m_pendingCpuFrame.stride = static_cast<uint32_t>(rowBytes);
