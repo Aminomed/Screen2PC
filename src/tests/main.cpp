@@ -885,6 +885,39 @@ void TestAutostartAndCli() {
           std::wstring(s2p::kAutostartValueName) != std::wstring(s2p::kAutostartSenderValueName),
           "Autostart registry value names for Receiver and Sender must be non-empty and distinct");
 
+    const std::wstring exeEsc = L"C:\\Tools\\R&D\\Screen2PC.Sender.exe";
+    const std::wstring xml = s2p::BuildSenderTaskXml(exeEsc, L"S-1-5-21-1234-5678");
+    CHECK(!xml.empty() &&
+          xml.find(L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>") != std::wstring::npos &&
+          xml.find(L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>") != std::wstring::npos &&
+          xml.find(L"<StartWhenAvailable>true</StartWhenAvailable>") != std::wstring::npos &&
+          xml.find(L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>") != std::wstring::npos &&
+          xml.find(L"<RunLevel>HighestAvailable</RunLevel>") != std::wstring::npos &&
+          xml.find(L"<Arguments>--tray</Arguments>") != std::wstring::npos &&
+          xml.find(L"R&amp;D") != std::wstring::npos &&
+          xml.find(L"<UserId>S-1-5-21-1234-5678</UserId>") != std::wstring::npos,
+          "BuildSenderTaskXml must disable battery restrictions and escape paths properly");
+
+    CHECK(s2p::IsSenderTaskXmlEnabled(xml), "Generated task XML must report enabled");
+    std::wstring disabledXml = xml;
+    size_t pos = disabledXml.find(L"<Enabled>true</Enabled>");
+    CHECK(pos != std::wstring::npos, "Generated task XML should contain <Enabled>true</Enabled>");
+    disabledXml.replace(pos, 23, L"<Enabled>false</Enabled>");
+    CHECK(!s2p::IsSenderTaskXmlEnabled(disabledXml), "Disabled task XML must report disabled");
+    CHECK(!s2p::IsSenderTaskXmlEnabled(L""), "Empty task XML must report disabled");
+
+    CHECK(!s2p::NeedsSenderTaskUpgrade(xml, exeEsc),
+          "Freshly generated battery-safe XML must not trigger upgrade");
+    CHECK(s2p::NeedsSenderTaskUpgrade(xml, L"D:\\Other\\Screen2PC.Sender.exe"),
+          "Mismatched exe path must trigger task upgrade");
+
+    std::wstring legacyXml = xml;
+    size_t batPos = legacyXml.find(L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>");
+    CHECK(batPos != std::wstring::npos, "Expected battery tag in generated XML");
+    legacyXml.replace(batPos, 63, L"<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>");
+    CHECK(s2p::NeedsSenderTaskUpgrade(legacyXml, exeEsc),
+          "Legacy battery-restricted task XML must trigger upgrade");
+
     std::cout << "[PASS] TestAutostartAndCli\n";
 }
 

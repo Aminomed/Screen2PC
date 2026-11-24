@@ -1,5 +1,7 @@
 #include "Autostart.h"
 
+#include <sddl.h>
+#include <cstring>
 #include <cwctype>
 #include <vector>
 
@@ -32,6 +34,65 @@ std::wstring CurrentExePath() {
     return std::wstring(buf.data(), n);
 }
 
+std::wstring XmlEscape(const std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size() + 16);
+    for (wchar_t ch : s) {
+        switch (ch) {
+        case L'&':  out += L"&amp;"; break;
+        case L'<':  out += L"&lt;"; break;
+        case L'>':  out += L"&gt;"; break;
+        case L'"':  out += L"&quot;"; break;
+        case L'\'': out += L"&apos;"; break;
+        default:    out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+std::wstring CurrentUserSidString() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return L"";
+    }
+    DWORD needed = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &needed);
+    std::wstring sidStr;
+    if (needed > 0) {
+        std::vector<BYTE> buf(needed);
+        if (GetTokenInformation(hToken, TokenUser, buf.data(), needed, &needed)) {
+            const auto* user = reinterpret_cast<const TOKEN_USER*>(buf.data());
+            LPWSTR pSid = nullptr;
+            if (user && user->User.Sid && ConvertSidToStringSidW(user->User.Sid, &pSid) && pSid) {
+                sidStr = pSid;
+                LocalFree(pSid);
+            }
+        }
+    }
+    CloseHandle(hToken);
+    return sidStr;
+}
+
+bool WriteUtf16LeFile(const std::wstring& path, const std::wstring& content) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const uint16_t bom = 0xFEFF;
+    DWORD written = 0;
+    bool ok = WriteFile(hFile, &bom, sizeof(bom), &written, nullptr) && written == sizeof(bom);
+    if (ok && !content.empty()) {
+        const DWORD bytes = static_cast<DWORD>(content.size() * sizeof(wchar_t));
+        ok = WriteFile(hFile, content.data(), bytes, &written, nullptr) && written == bytes;
+    }
+    CloseHandle(hFile);
+    if (!ok) {
+        DeleteFileW(path.c_str());
+    }
+    return ok;
+}
+
 bool IsStartupApprovedDisabled(const wchar_t* valueName) {
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kStartupApprovedKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
@@ -50,8 +111,73 @@ bool IsStartupApprovedDisabled(const wchar_t* valueName) {
     return false;
 }
 
+bool HasRunRegEntry(const wchar_t* valueName) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return false;
+    }
+    wchar_t buf[2048]{};
+    DWORD type = 0;
+    DWORD cb = sizeof(buf);
+    LSTATUS st = RegQueryValueExW(hKey, valueName, nullptr, &type, reinterpret_cast<BYTE*>(buf), &cb);
+    RegCloseKey(hKey);
+    if (st != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || cb <= sizeof(wchar_t)) {
+        return false;
+    }
+    return !IsStartupApprovedDisabled(valueName);
+}
+
 bool IsSenderTaskMode(const wchar_t* valueName) {
     return valueName && _wcsicmp(valueName, kAutostartSenderValueName) == 0;
+}
+
+std::wstring DecodeProcessBytesToWide(const std::string& raw) {
+    if (raw.empty()) return L"";
+
+    // UTF-16LE with BOM
+    if (raw.size() >= 2 &&
+        static_cast<unsigned char>(raw[0]) == 0xFF &&
+        static_cast<unsigned char>(raw[1]) == 0xFE) {
+        size_t wcharCount = (raw.size() - 2) / sizeof(wchar_t);
+        std::wstring out(wcharCount, L'\0');
+        if (wcharCount > 0) {
+            std::memcpy(out.data(), raw.data() + 2, wcharCount * sizeof(wchar_t));
+        }
+        return out;
+    }
+
+    // Heuristic for UTF-16LE without BOM (e.g. "<?xml" -> '<', 0, '?', 0)
+    if (raw.size() >= 4 && raw[1] == '\0' && raw[3] == '\0') {
+        size_t wcharCount = raw.size() / sizeof(wchar_t);
+        std::wstring out(wcharCount, L'\0');
+        std::memcpy(out.data(), raw.data(), wcharCount * sizeof(wchar_t));
+        return out;
+    }
+
+    const char* ptr = raw.data();
+    int len = static_cast<int>(raw.size());
+    if (raw.size() >= 3 &&
+        static_cast<unsigned char>(raw[0]) == 0xEF &&
+        static_cast<unsigned char>(raw[1]) == 0xBB &&
+        static_cast<unsigned char>(raw[2]) == 0xBF) {
+        ptr += 3;
+        len -= 3;
+    }
+    if (len <= 0) return L"";
+
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, ptr, len, nullptr, 0);
+    UINT cp = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    if (wlen <= 0) {
+        cp = CP_OEMCP;
+        flags = 0;
+        wlen = MultiByteToWideChar(cp, flags, ptr, len, nullptr, 0);
+    }
+    if (wlen <= 0) return L"";
+
+    std::wstring out(wlen, L'\0');
+    MultiByteToWideChar(cp, flags, ptr, len, out.data(), wlen);
+    return out;
 }
 
 bool RunSchtasks(const std::wstring& args, std::wstring* outStdout = nullptr) {
@@ -97,13 +223,7 @@ bool RunSchtasks(const std::wstring& args, std::wstring* outStdout = nullptr) {
         while (ReadFile(hRead, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
             raw.append(buf, bytesRead);
         }
-        if (!raw.empty()) {
-            int wlen = MultiByteToWideChar(CP_OEMCP, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
-            if (wlen > 0) {
-                outStdout->resize(wlen);
-                MultiByteToWideChar(CP_OEMCP, 0, raw.data(), static_cast<int>(raw.size()), outStdout->data(), wlen);
-            }
-        }
+        *outStdout = DecodeProcessBytesToWide(raw);
     }
     if (hRead) CloseHandle(hRead);
 
@@ -201,28 +321,122 @@ std::wstring ExtractExePathFromCommand(const std::wstring& cmd) {
     return s;
 }
 
+std::wstring BuildSenderTaskXml(const std::wstring& exePath, const std::wstring& userSid) {
+    if (exePath.empty()) return L"";
+
+    std::wstring workDir;
+    const size_t slash = exePath.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && slash > 0) {
+        workDir = exePath.substr(0, slash);
+    }
+
+    const std::wstring escExe = XmlEscape(exePath);
+    const std::wstring escDir = XmlEscape(workDir);
+    const std::wstring escSid = XmlEscape(userSid);
+
+    std::wstring xml;
+    xml.reserve(1800);
+    xml += L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n";
+    xml += L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n";
+    xml += L"  <RegistrationInfo>\r\n";
+    xml += L"    <Description>Starts Screen2PC Sender minimized in the system tray at user logon.</Description>\r\n";
+    xml += L"  </RegistrationInfo>\r\n";
+    xml += L"  <Triggers>\r\n";
+    xml += L"    <LogonTrigger>\r\n";
+    xml += L"      <Enabled>true</Enabled>\r\n";
+    if (!escSid.empty()) {
+        xml += L"      <UserId>" + escSid + L"</UserId>\r\n";
+    }
+    xml += L"    </LogonTrigger>\r\n";
+    xml += L"  </Triggers>\r\n";
+    xml += L"  <Principals>\r\n";
+    xml += L"    <Principal id=\"Author\">\r\n";
+    if (!escSid.empty()) {
+        xml += L"      <UserId>" + escSid + L"</UserId>\r\n";
+    }
+    xml += L"      <LogonType>InteractiveToken</LogonType>\r\n";
+    xml += L"      <RunLevel>HighestAvailable</RunLevel>\r\n";
+    xml += L"    </Principal>\r\n";
+    xml += L"  </Principals>\r\n";
+    xml += L"  <Settings>\r\n";
+    xml += L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n";
+    xml += L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n";
+    xml += L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n";
+    xml += L"    <AllowHardTerminate>false</AllowHardTerminate>\r\n";
+    xml += L"    <StartWhenAvailable>true</StartWhenAvailable>\r\n";
+    xml += L"    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n";
+    xml += L"    <IdleSettings>\r\n";
+    xml += L"      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n";
+    xml += L"      <RestartOnIdle>false</RestartOnIdle>\r\n";
+    xml += L"    </IdleSettings>\r\n";
+    xml += L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n";
+    xml += L"    <Enabled>true</Enabled>\r\n";
+    xml += L"    <Hidden>false</Hidden>\r\n";
+    xml += L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n";
+    xml += L"    <WakeToRun>false</WakeToRun>\r\n";
+    xml += L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n";
+    xml += L"    <Priority>7</Priority>\r\n";
+    xml += L"  </Settings>\r\n";
+    xml += L"  <Actions Context=\"Author\">\r\n";
+    xml += L"    <Exec>\r\n";
+    xml += L"      <Command>" + escExe + L"</Command>\r\n";
+    xml += L"      <Arguments>--tray</Arguments>\r\n";
+    if (!escDir.empty()) {
+        xml += L"      <WorkingDirectory>" + escDir + L"</WorkingDirectory>\r\n";
+    }
+    xml += L"    </Exec>\r\n";
+    xml += L"  </Actions>\r\n";
+    xml += L"</Task>\r\n";
+    return xml;
+}
+
+bool IsSenderTaskXmlEnabled(const std::wstring& taskXml) {
+    if (taskXml.empty()) return false;
+    const std::wstring lower = ToLowerCopy(taskXml);
+    return lower.find(L"<enabled>false</enabled>") == std::wstring::npos;
+}
+
+bool NeedsSenderTaskUpgrade(const std::wstring& taskXml, const std::wstring& expectedExePath) {
+    if (taskXml.empty() || expectedExePath.empty()) return true;
+    const std::wstring lower = ToLowerCopy(taskXml);
+    const std::wstring lowerExe = ToLowerCopy(expectedExePath);
+
+    if (lower.find(lowerExe) == std::wstring::npos &&
+        lower.find(ToLowerCopy(XmlEscape(expectedExePath))) == std::wstring::npos) {
+        return true;
+    }
+    if (lower.find(L"--tray") == std::wstring::npos) {
+        return true;
+    }
+    if (lower.find(L"<disallowstartifonbatteries>false</disallowstartifonbatteries>") == std::wstring::npos) {
+        return true;
+    }
+    if (lower.find(L"<stopifgoingonbatteries>false</stopifgoingonbatteries>") == std::wstring::npos) {
+        return true;
+    }
+    if (lower.find(L"<startwhenavailable>true</startwhenavailable>") == std::wstring::npos) {
+        return true;
+    }
+    if (lower.find(L"<executiontimelimit>pt0s</executiontimelimit>") == std::wstring::npos) {
+        return true;
+    }
+    if (lower.find(L"<runlevel>highestavailable</runlevel>") == std::wstring::npos) {
+        return true;
+    }
+    return false;
+}
+
 bool IsAutostartEnabled(const wchar_t* valueName) {
     if (!valueName || !*valueName) return false;
     if (IsSenderTaskMode(valueName)) {
-        return RunSchtasks(L"/Query /TN \"Screen2PC Sender\"");
+        std::wstring xml;
+        if (!RunSchtasks(L"/Query /TN \"Screen2PC Sender\" /XML", &xml)) {
+            return false;
+        }
+        return IsSenderTaskXmlEnabled(xml);
     }
 
-    HKEY hKey = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunRegKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
-        return false;
-    }
-    wchar_t buf[2048]{};
-    DWORD type = 0;
-    DWORD cb = sizeof(buf);
-    LSTATUS st = RegQueryValueExW(hKey, valueName, nullptr, &type, reinterpret_cast<BYTE*>(buf), &cb);
-    RegCloseKey(hKey);
-    if (st != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || cb <= sizeof(wchar_t)) {
-        return false;
-    }
-    if (IsStartupApprovedDisabled(valueName)) {
-        return false;
-    }
-    return true;
+    return HasRunRegEntry(valueName);
 }
 
 bool SetAutostartEnabled(bool enabled, const wchar_t* valueName) {
@@ -232,6 +446,23 @@ bool SetAutostartEnabled(bool enabled, const wchar_t* valueName) {
         DeleteLegacyRunEntries(valueName);
         if (enabled) {
             std::wstring exe = CurrentExePath();
+            if (exe.empty()) return false;
+
+            const std::wstring xml = BuildSenderTaskXml(exe, CurrentUserSidString());
+            wchar_t tempDir[MAX_PATH]{};
+            DWORD tn = GetTempPathW(MAX_PATH, tempDir);
+            if (!xml.empty() && tn > 0 && tn < MAX_PATH) {
+                std::wstring xmlPath = std::wstring(tempDir) + L"s2p_sender_task_" +
+                                       std::to_wstring(GetCurrentProcessId()) + L".xml";
+                if (WriteUtf16LeFile(xmlPath, xml)) {
+                    std::wstring args = L"/Create /TN \"Screen2PC Sender\" /XML \"" +
+                                        EscapeForCmdArg(xmlPath) + L"\" /F";
+                    bool created = RunSchtasks(args);
+                    DeleteFileW(xmlPath.c_str());
+                    if (created) return true;
+                }
+            }
+
             std::wstring cmd = BuildAutostartCommand(exe);
             if (cmd.empty()) return false;
             std::wstring args = L"/Create /TN \"Screen2PC Sender\" /TR \"" +
@@ -273,13 +504,16 @@ bool SetAutostartEnabled(bool enabled, const wchar_t* valueName) {
 
 void RefreshAutostartPathIfNeeded(const wchar_t* valueName) {
     if (IsSenderTaskMode(valueName)) {
-        if (!IsAutostartEnabled(valueName)) return;
         std::wstring xml;
         if (RunSchtasks(L"/Query /TN \"Screen2PC Sender\" /XML", &xml)) {
+            DeleteLegacyRunEntries(valueName);
             std::wstring exe = CurrentExePath();
-            if (!exe.empty() && ToLowerCopy(xml).find(ToLowerCopy(exe)) == std::wstring::npos) {
+            if (!exe.empty() && IsSenderTaskXmlEnabled(xml) && NeedsSenderTaskUpgrade(xml, exe)) {
                 SetAutostartEnabled(true, valueName);
             }
+        } else if (HasRunRegEntry(valueName)) {
+            // Migrate legacy HKCU\...\Run entry (blocked by UAC RequireAdministrator) to Task Scheduler XML
+            SetAutostartEnabled(true, valueName);
         }
         return;
     }

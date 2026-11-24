@@ -55,6 +55,7 @@ constexpr UINT WM_SHOW_PIN_PROMPT   = WM_APP + 6;
 constexpr UINT WM_APP_DIM_DISMISSED = WM_APP + 7;
 
 constexpr UINT_PTR TIMER_TELEMETRY  = 1;
+constexpr UINT_PTR TIMER_TRAY_RETRY = 2;
 constexpr int HOTKEY_TOGGLE_CONNECT = 1001;
 
 constexpr int IDC_PEER_COMBO        = 101;
@@ -158,6 +159,8 @@ s2p::ui::StatusTone g_heroTone = s2p::ui::StatusTone::Neutral;
 int g_activeTab = 0; // 0 = Verbindung, 1 = Dateitransfer, 2 = Einstellungen
 
 NOTIFYICONDATAW g_nid{};
+bool g_trayIconAdded = false;
+int g_trayRetryCount = 0;
 UINT g_wmShowExisting = 0;
 UINT g_wmTaskbarCreated = 0;
 
@@ -385,7 +388,7 @@ void ApplyLiveStreamReconfigureIfConnected(HWND hwnd) {
     }
 }
 
-void AddTrayIcon(HWND hwnd) {
+bool AddTrayIcon(HWND hwnd) {
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
@@ -393,7 +396,11 @@ void AddTrayIcon(HWND hwnd) {
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = s2p::LoadAppSmallIcon(GetModuleHandleW(nullptr));
     wcscpy_s(g_nid.szTip, L"Screen2PC Sender (Laptop)");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (g_trayIconAdded && Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+        return true;
+    }
+    g_trayIconAdded = (Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE);
+    return g_trayIconAdded;
 }
 
 void StartAsyncUpdateCheck(bool userInitiated) {
@@ -1042,8 +1049,8 @@ void ApplySenderLanguage(HWND hwnd) {
 
     if (g_tooltip) {
         s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_AUTOSTART),
-            Tr(L"Startet Screen2PC Sender minimiert im System-Tray (Task-Manager Autostart).",
-               L"Starts Screen2PC Sender minimized in the system tray (Task Manager Startup)."));
+            Tr(L"Startet Screen2PC Sender automatisch beim Anmelden minimiert im System-Tray (Aufgabenplanung mit Admin-Rechten, auch im Akkubetrieb).",
+               L"Starts Screen2PC Sender automatically at logon minimized in the system tray (Task Scheduler with admin rights, even on battery)."));
         s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_AUTOCONNECT),
             Tr(L"Verbindet beim Start automatisch mit dem zuletzt verwendeten oder gefundenen PC.",
                L"Automatically connects to the last used or discovered PC on startup."));
@@ -1470,17 +1477,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (g_wmTaskbarCreated != 0 && msg == g_wmTaskbarCreated) {
-        AddTrayIcon(hwnd);
+        g_trayIconAdded = false;
+        if (!AddTrayIcon(hwnd)) {
+            g_trayRetryCount = 0;
+            SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, nullptr);
+        }
         return 0;
     }
 
     switch (msg) {
     case WM_CREATE:
+        if (g_wmTaskbarCreated != 0) {
+            ChangeWindowMessageFilterEx(hwnd, g_wmTaskbarCreated, MSGFLT_ALLOW, nullptr);
+        }
+        if (g_wmShowExisting != 0) {
+            ChangeWindowMessageFilterEx(hwnd, g_wmShowExisting, MSGFLT_ALLOW, nullptr);
+        }
         CreateUiControls(hwnd);
         DragAcceptFiles(hwnd, TRUE);
         RegisterHotKey(hwnd, HOTKEY_TOGGLE_CONNECT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'K');
         SetTimer(hwnd, TIMER_TELEMETRY, 250, nullptr);
-        AddTrayIcon(hwnd);
+        if (!AddTrayIcon(hwnd)) {
+            g_trayRetryCount = 0;
+            SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, nullptr);
+        }
 
         UpdateUiFromState();
         StartAsyncDiscovery();
@@ -1660,7 +1680,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool checked = ToggleSwitch(hwnd, IDC_CHK_AUTOSTART);
             if (!s2p::SetAutostartEnabled(checked, s2p::kAutostartSenderValueName)) {
                 SetToggleChecked(hwnd, IDC_CHK_AUTOSTART, s2p::IsAutostartEnabled(s2p::kAutostartSenderValueName));
-                MessageBoxW(hwnd, L"Autostart-Eintrag in der Registry konnte nicht geschrieben werden.",
+                MessageBoxW(hwnd, L"Autostart-Aufgabe konnte nicht in der Aufgabenplanung eingerichtet werden.",
                             L"Screen2PC Sender", MB_ICONWARNING);
             }
             return 0;
@@ -1775,6 +1795,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_TIMER:
+        if (wp == TIMER_TRAY_RETRY) {
+            ++g_trayRetryCount;
+            if (AddTrayIcon(hwnd) || g_trayRetryCount >= 60) {
+                KillTimer(hwnd, TIMER_TRAY_RETRY);
+            }
+            return 0;
+        }
         if (wp == TIMER_TELEMETRY) {
             UpdateUiFromState();
             if (g_reconnectArmed &&
@@ -2001,11 +2028,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_closing = true;
         g_reconnectArmed = false;
         KillTimer(hwnd, TIMER_TELEMETRY);
+        KillTimer(hwnd, TIMER_TRAY_RETRY);
         UnregisterHotKey(hwnd, HOTKEY_TOGGLE_CONNECT);
         g_dimOverlay.Hide(false);
         g_lidGuard.Restore(GetIniPath());
         CancelActivePinPrompt();
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_trayIconAdded = false;
         if (g_engine) g_engine->SignalStop();
         if (g_connectThread.joinable()) g_connectThread.join();
         if (g_scanThread.joinable()) g_scanThread.join();

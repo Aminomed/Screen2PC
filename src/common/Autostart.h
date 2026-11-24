@@ -26,7 +26,12 @@ bool IsAutostartEnabled(const wchar_t* valueName = kAutostartValueName);
 // Enables or disables autostart under HKCU\...\Run and clears any Task Manager disable flag in StartupApproved\Run
 bool SetAutostartEnabled(bool enabled, const wchar_t* valueName = kAutostartValueName);
 
-// Updates the stored executable path in HKCU\...\Run if autostart is currently enabled and points elsewhere
+// Updates the stored executable path (or upgrades legacy Run / battery-blocked tasks) if autostart is enabled
 void RefreshAutostartPathIfNeeded(const wchar_t* valueName = kAutostartValueName);
+
+// Pure helpers exposed for unit testing
+std::wstring BuildSenderTaskXml(const std::wstring& exePath, const std::wstring& userSid = L"");
+bool IsSenderTaskXmlEnabled(const std::wstring& taskXml);
+bool NeedsSenderTaskUpgrade(const std::wstring& taskXml, const std::wstring& expectedExePath);
 
 } // namespace s2p

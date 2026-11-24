@@ -50,6 +50,7 @@ constexpr UINT WM_PIN_DISMISS       = WM_APP + 15;
 constexpr UINT WM_VERSION_MISMATCH  = WM_APP + 16;
 
 constexpr UINT_PTR TIMER_TELEMETRY  = 1;
+constexpr UINT_PTR TIMER_TRAY_RETRY = 2;
 
 constexpr int IDC_INFO_LABEL        = 201;
 constexpr int IDC_CHK_FULLSCR       = 202;
@@ -179,6 +180,8 @@ s2p::ui::StatusTone g_heroTone = s2p::ui::StatusTone::Neutral;
 int g_activeTab = 0; // 0 = Uebersicht, 1 = Dateitransfer, 2 = Einstellungen
 
 NOTIFYICONDATAW g_nid{};
+bool g_trayIconAdded = false;
+int g_trayRetryCount = 0;
 UINT g_wmShowExisting = 0;
 UINT g_wmTaskbarCreated = 0;
 
@@ -339,7 +342,7 @@ std::wstring DefaultUpdateButtonText() {
     return L"Nach Updates suchen (v" + s2p::FormatAppVersion(s2p::CurrentAppVersion()) + L")";
 }
 
-void AddTrayIcon(HWND hwnd) {
+bool AddTrayIcon(HWND hwnd) {
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
@@ -347,7 +350,11 @@ void AddTrayIcon(HWND hwnd) {
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = s2p::LoadAppSmallIcon(GetModuleHandleW(nullptr));
     wcscpy_s(g_nid.szTip, L"Screen2PC Receiver (PC)");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (g_trayIconAdded && Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+        return true;
+    }
+    g_trayIconAdded = (Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE);
+    return g_trayIconAdded;
 }
 
 // ============================================================================
@@ -1654,16 +1661,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (g_wmTaskbarCreated != 0 && msg == g_wmTaskbarCreated) {
-        AddTrayIcon(hwnd);
+        g_trayIconAdded = false;
+        if (!AddTrayIcon(hwnd)) {
+            g_trayRetryCount = 0;
+            SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, nullptr);
+        }
         return 0;
     }
 
     switch (msg) {
     case WM_CREATE:
+        if (g_wmTaskbarCreated != 0) {
+            ChangeWindowMessageFilterEx(hwnd, g_wmTaskbarCreated, MSGFLT_ALLOW, nullptr);
+        }
+        if (g_wmShowExisting != 0) {
+            ChangeWindowMessageFilterEx(hwnd, g_wmShowExisting, MSGFLT_ALLOW, nullptr);
+        }
         CreateUiControls(hwnd);
         DragAcceptFiles(hwnd, TRUE);
         SetTimer(hwnd, TIMER_TELEMETRY, 250, nullptr);
-        AddTrayIcon(hwnd);
+        if (!AddTrayIcon(hwnd)) {
+            g_trayRetryCount = 0;
+            SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, nullptr);
+        }
 
         UpdateUi();
         if (LoadBoolPref(L"AutoUpdateCheck", 1)) {
@@ -2076,6 +2096,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_TIMER:
+        if (wp == TIMER_TRAY_RETRY) {
+            ++g_trayRetryCount;
+            if (AddTrayIcon(hwnd) || g_trayRetryCount >= 60) {
+                KillTimer(hwnd, TIMER_TRAY_RETRY);
+            }
+            return 0;
+        }
         if (wp == TIMER_TELEMETRY) UpdateUi();
         return 0;
 
@@ -2099,6 +2126,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         g_closing = true;
         KillTimer(hwnd, TIMER_TELEMETRY);
+        KillTimer(hwnd, TIMER_TRAY_RETRY);
         if (g_colorWnd && IsWindow(g_colorWnd)) {
             DestroyWindow(g_colorWnd);
             g_colorWnd = nullptr;
@@ -2109,6 +2137,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_trustedWnd = nullptr;
         }
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_trayIconAdded = false;
         if (g_engine) g_engine->Stop();
         if (g_disconnThread.joinable()) g_disconnThread.join();
         if (g_updateThread.joinable()) g_updateThread.join();
