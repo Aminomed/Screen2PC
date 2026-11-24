@@ -6,18 +6,16 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Stream-Timeout-Fix & Automatischer Stream-Reconnect bei aktivem Control-Channel (Release v1.5.0.54)`
-- **Status:** Im grünen CI-Build **Run `45411535572`** (Commit `76a42bc`, **GitHub Release `v1.5.0.54`**, **21/21 Test-Suites PASS**, INF/CAT OK) ist das unerwartete Schließen des Streamfensters nach `> 1,5 s` Timeout bei aktivem Control-Channel vollständig behoben:
-  1. **Erhöhte TCP-Stream- & Control-Timeouts (`SenderEngine.cpp`, `ReceiverEngine.cpp`):**
-     - `SO_SNDTIMEO`/`SO_RCVTIMEO` auf den TCP-Stream-Sockets (`48212–48213`) von `1500 ms` auf **`6000 ms`** angehoben (aligned mit dem 8-Sekunden-Heartbeat des Control-Channels); Post-Handshake-Control-Timeouts (`48211`) auf **`4000 ms`** erhöht, um auch größere `ClipboardSync`-Payloads und kurze Wi-Fi-/Capture-Hänger ohne Verbindungsabbruch abzufangen.
-  2. **Nahtloser Stream-Auto-Reconnect am Receiver (`ReceiverEngine.h/.cpp`):**
-     - `StreamReceiverWorker` speichert `expectedPeerIp` und validiert Initial-/Reconnect-Accepts gegen den authentifizierten Sender.
-     - Bei Stream-Abbruch, Timeout (`RecvPacket`-Fehler), `POLLERR|POLLHUP` oder `StreamEnd` während laufender Control-Session (`!m_stop && !m_sessionStop && !w->stop`) bleibt das `D3D11Renderer`-Streamfenster **geöffnet** (`renderer.Destroy()` wird nicht mehr ausgelöst). `recvDecodeThread` schließt den alten Stream-Socket sauber (`sockLifecycleMutex`), setzt `H264Decoder`, `DeltaDecoder`, `UdpVideoFecReceiver` und `lastDecodedFrameIdx` zurück, leert veraltete UDP-Shards, öffnet `w->listenSock` erneut, nimmt den Reconnect entgegen und fordert sofort per `RequestKeyframe` ein frisches Keyframe an.
-  3. **Nahtloser Stream-Auto-Reconnect & Peer-Close-Erkennung am Sender (`NetSocket.*`, `SenderEngine.cpp`):**
-     - `TcpSocket::IsPeerClosed()` erkennt per non-blocking `WSAPoll` + `MSG_PEEK` auch im Leerlauf einen geschlossenen Peer-Stream-Socket (`wait_for(250 ms)` in `asyncSendThread`).
-     - Bei `sendFailed` während aktivem Control-Channel beendet `RunStreamWorker` `asyncSendThread` sauber (ohne irreführendes `StreamEnd`), verbindet den Stream-Socket automatisch neu (`sock.Connect` Loop mit `500 ms` Connect-Timeout), erzwingt ein frisches Keyframe (`forceKeyframe = true`, `sentInitialFrame = false`, Delta-Reset) und setzt das Streaming fort; bei echtem Shutdown verhindert `inBlockingSend` + sofortiges `sock.Close()` ein Blockieren von `Disconnect()`.
-  4. **Basis aus `v1.5.0.53` (Protokoll `v3`) weiter aktiv:**
-     - Direct AMD AMF (`amfrt64.dll` H.264/HEVC), D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer`), `DLT3` QOI-Lossless-Hybrid & UDP Video + GF(2⁸)-Cauchy-RS-FEC (`48216–48217`).
+- **Phase:** `Akku-/UIPI-fester Sender-Autostart & Tray-Resilienz (Release v1.5.0.55)`
+- **Status:** Im grünen CI-Build **Run `45414540566`** (Commit `daf8f3b`, **GitHub Release `v1.5.0.55`**, **21/21 Test-Suites PASS**, INF/CAT OK) sind alle Sofort-Fixes für das Autostart-/Tray-Problem am Laptop nach Neustart/Windows-Update umgesetzt und verifiziert:
+  1. **Akku- & Timeout-fester Sender-Autostart via Task-XML (`Autostart.h/.cpp`):**
+     - Der Sender-Task (`"Screen2PC Sender"`, `HighestAvailable` wegen `RequireAdministrator`/UIPI) wird per UTF-16LE **Task-XML** (`BuildSenderTaskXml`) statt über die eingeschränkte `schtasks`-CLI registriert: `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>`, `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>`, `<StartWhenAvailable>true</StartWhenAvailable>`, `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`, User-SID & `--tray`.
+     - `RefreshAutostartPathIfNeeded` migriert alte `HKCU\...\Run`-Einträge automatisch in die Aufgabenplanung und rüstet ältere Tasks ohne Akku-Freigabe beim nächsten App-Start automatisch nach (`NeedsSenderTaskUpgrade`); `RunSchtasks` dekodiert UTF-16LE/UTF-8/OEM-Ausgaben sauber, `IsAutostartEnabled` prüft auch `<Enabled>false</Enabled>`.
+  2. **UIPI-Filter & Tray-Icon-Retry (`src/sender/main.cpp`, `src/receiver/main.cpp`):**
+     - `ChangeWindowMessageFilterEx(hwnd, ..., MSGFLT_ALLOW, nullptr)` für `TaskbarCreated` und `g_wmShowExisting` in `WM_CREATE`, damit `explorer.exe` (`Medium Integrity`) das erhöhte Sender-Fenster erreicht.
+     - `TIMER_TRAY_RETRY` (1-s-Retry bis 60 s), falls `Shell_NotifyIconW(NIM_ADD, ...)` beim frühen Login noch vor dem Start der Taskleiste aufgerufen wird.
+  3. **Basis aus `v1.5.0.53`–`v1.5.0.54` weiter aktiv:**
+     - Stream-Timeout-Fix (`6000 ms` Stream / `4000 ms` Control) + nahtloser Stream-Auto-Reconnect bei aktivem Control-Channel (`v1.5.0.54`), Direct AMD AMF (`amfrt64.dll` H.264/HEVC), D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer`), `DLT3` QOI-Lossless-Hybrid & UDP Video + GF(2⁸)-Cauchy-RS-FEC (`48216–48217`, Protokoll `v3`).
 - **Zurückgestellte Feature-Ideen (Deferred Feature Backlog — explizit vorgemerkt, NICHT in diesem Release):**
   1. **10-Bit HDR End-to-End Streaming** (8-Bit HEVC HW-Encode/-Decode ist seit `v1.5.0.53` aktiv).
   2. **WASAPI Loopback Audio-Streaming** (System-Ton Surface -> PC).
@@ -25,8 +23,8 @@
   4. **In-Stream Quick-HUD Overlay** (weitere Erweiterungen; Basis-HUD bereits aktiv).
   5. **Desktop-Profile** (gespeicherte Presets für Home/Office/Gaming inkl. Auflösungs-, Codec-, KVM- & Power-Kombinationen).
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45411535572`), `infverif.exe` & `Inf2Cat.exe` OK, GitHub Release **`v1.5.0.54`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`, inkl. erweitertem `TestLoopbackNetworking` für `IsPeerClosed()` & Same-Port-Reconnect).
-- **Next Step:** Auf **PC** und **Surface** auf **`v1.5.0.54`** aktualisieren und die Stream-Stabilität bei kurzen Wi-Fi-/Capture-Aussetzern (> 1,5 s) im Alltag verifizieren.
+  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45414540566`), `infverif.exe` & `Inf2Cat.exe` OK, GitHub Release **`v1.5.0.55`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`, inkl. erweitertem `TestAutostartAndCli` für Task-XML & Upgrade-Checks).
+- **Next Step:** Auf Laptop & PC auf **`v1.5.0.55`** aktualisieren (am Laptop ggf. einmalig öffnen/Autostart prüfen, damit die neue Task-XML ohne Akku-Sperre greift) und **Installer-Design (Weg A)** mit dem User festzurren.
 
 ---
 
@@ -127,3 +125,4 @@
 | 2026-11-23 | Pipeline-Latenz- & Delta-Unschärfe-Fix | `SenderEngine`/`ReceiverEngine`: TCP-Puffer auf `64 KB` / `128 KB` gestrafft, Dual-Monitor-Bitraten-Split (`60%/40%`) & `60 FPS` Auto-Cap, adaptives Encode/Send-Pacing + schnelleres ABR (`10 ms`, Floor `8 Mbit/s`), non-blocking Cursor-Shape-Queue, Burst-Drain-Coalescing & partielles `QueueCpuFrame`; `CodecH264`: 1.5-Frame-VBV & `Flush()` nach `VideoProcessorBlt`; `CodecDelta`/`DxgiCapture`: `O(tiles)`-Grid-Run-Coalescing, 16-KB-L1-LZ4-Hash, `CopyFrameToCpuRegions`, Sustained-Only-2×2 & nicht-abbrechendes Settle (`3cc0af9`, Run `45200582324`, Release `v1.5.0.50`) |
 | 2026-11-23 | Direct AMF (`amfrt64.dll`), HEVC (H.265), GPU Compute Delta, `DLT3` QOI & UDP+RS-FEC | `AmfMinimal.h` / `AmfEncoder.*` direkt auf `amfrt64.dll`; `CodecH264` + UI + `ReceiverEngine` für `CodecType::HEVC`; `GpuDeltaAnalyzer.*` (`cs_5_0` 64×64 Tile Diff + Bounding-Box-Readback); `CodecDelta` `DLT3` QOI-Lossless-Hybrid; `UdpVideoFec.*` + `Protocol v3` UDP `48216–48217` RS-FEC mit TCP-Fallback & Firewall-Update (`7c2d6db`, Run `45221116035`, Release `v1.5.0.53`, 21/21 Tests PASS) |
 | 2026-11-24 | Stream-Timeout- & Auto-Reconnect-Fix | TCP-Stream-Timeouts (`48212–48213`) auf `6000 ms` und Post-Handshake-Control-Timeouts (`48211`) auf `4000 ms` angehoben; `NetSocket::IsPeerClosed()`, automatischer Stream-Socket-Reconnect in `SenderEngine::RunStreamWorker` & `ReceiverEngine::RunStreamWorker` bei aktivem Control-Channel (Streamfenster/`D3D11Renderer` bleibt offen, Decoder/FEC-Reset + `RequestKeyframe`, `expectedPeerIp`-Prüfung, `inBlockingSend`-Shutdown-Guard) + `TestLoopbackNetworking`-Reconnect-Tests (`76a42bc`, Run `45411535572`, Release `v1.5.0.54`, 21/21 Tests PASS) |
+| 2026-11-24 | Akku-/UIPI-fester Sender-Autostart & Tray-Resilienz | `Autostart.h/.cpp`: `BuildSenderTaskXml` registriert `"Screen2PC Sender"` per UTF-16LE Task-XML mit `DisallowStartIfOnBatteries=false`, `StopIfGoingOnBatteries=false`, `StartWhenAvailable=true`, `ExecutionTimeLimit=PT0S`, User-SID & `HighestAvailable`; `RefreshAutostartPathIfNeeded` migriert alte `HKCU\Run`-Einträge und aktualisiert bestehende Tasks automatisch (`NeedsSenderTaskUpgrade`); `RunSchtasks` unterstützt UTF-16LE/UTF-8/OEM; `sender/main.cpp` & `receiver/main.cpp`: `ChangeWindowMessageFilterEx` (`TaskbarCreated` / `g_wmShowExisting`) + `TIMER_TRAY_RETRY` (60×1 s) + erweiterte `TestAutostartAndCli`-Tests (`daf8f3b`, Run `45414540566`, Release `v1.5.0.55`, 21/21 Tests PASS) |
