@@ -26,8 +26,8 @@ AppUpdatesURL=https://github.com/Aminomed/Screen2PC/releases
 DefaultDirName={autopf}\Screen2PC
 DefaultGroupName=Screen2PC
 DisableProgramGroupPage=yes
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 OutputDir={#OutDir}
 OutputBaseFilename=Screen2PC-Setup-x64
@@ -149,7 +149,7 @@ Filename: "{app}\Screen2PC.Receiver.exe"; Description: "{cm:LaunchAfterInstall,S
 
 [UninstallRun]
 Filename: "{app}\Screen2PC.Sender.exe"; Parameters: "--uninstall-autostart"; Components: laptop; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstAutostartSender"
-Filename: "{app}\Screen2PC.Receiver.exe"; Parameters: "--uninstall-autostart"; Components: pc; Flags: runasoriginaluser runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstAutostartReceiver"
+Filename: "{app}\Screen2PC.Receiver.exe"; Parameters: "--uninstall-autostart"; Components: pc; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstAutostartReceiver"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall_driver.ps1"""; Components: laptop; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstDriverLaptop"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC"""; Components: pc; Flags: runhidden waituntilterminated; RunOnceId: "UninstFwTcp"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC Discovery"""; Components: pc; Flags: runhidden waituntilterminated; RunOnceId: "UninstFwUdp"
