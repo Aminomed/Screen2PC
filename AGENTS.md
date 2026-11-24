@@ -81,7 +81,8 @@ This file is the authoritative instruction & architecture reference for AI codin
 | `src/receiver/` (`Screen2PC.Receiver.vcxproj`) | PC Receiver app (`ReceiverEngine.*`, `D3D11Renderer.*`, `main.cpp`) |
 | `src/tests/` (`Screen2PC.Tests.vcxproj`) | Automated unit & integration test suite (`Screen2PC.Tests.exe`, 21 suites) |
 | `scripts/` | `install_driver.ps1`, `uninstall_driver.ps1`, `generate_icons.py` |
-| `.github/workflows/ci.yml` | Windows-2022 CI: MSBuild `Release\|x64`, `Screen2PC.Tests.exe`, `infverif`, `Inf2Cat`, Artifact & GitHub Release |
+| `installer/` | `Screen2PC.iss` — Inno Setup 6 Windows x64 installer (`Screen2PC-Setup-x64.exe`, Laptop/PC roles, autostart, driver/firewall setup) |
+| `.github/workflows/ci.yml` | Windows-2022 CI: MSBuild `Release\|x64`, `Screen2PC.Tests.exe`, `infverif`, `Inf2Cat`, Inno Setup, Artifact & GitHub Release |
 
 ---
 

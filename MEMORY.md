@@ -6,16 +6,17 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Akku-/UIPI-fester Sender-Autostart & Tray-Resilienz (Release v1.5.0.55)`
-- **Status:** Im grünen CI-Build **Run `45414540566`** (Commit `daf8f3b`, **GitHub Release `v1.5.0.55`**, **21/21 Test-Suites PASS**, INF/CAT OK) sind alle Sofort-Fixes für das Autostart-/Tray-Problem am Laptop nach Neustart/Windows-Update umgesetzt und verifiziert:
-  1. **Akku- & Timeout-fester Sender-Autostart via Task-XML (`Autostart.h/.cpp`):**
-     - Der Sender-Task (`"Screen2PC Sender"`, `HighestAvailable` wegen `RequireAdministrator`/UIPI) wird per UTF-16LE **Task-XML** (`BuildSenderTaskXml`) statt über die eingeschränkte `schtasks`-CLI registriert: `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>`, `<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>`, `<StartWhenAvailable>true</StartWhenAvailable>`, `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`, User-SID & `--tray`.
-     - `RefreshAutostartPathIfNeeded` migriert alte `HKCU\...\Run`-Einträge automatisch in die Aufgabenplanung und rüstet ältere Tasks ohne Akku-Freigabe beim nächsten App-Start automatisch nach (`NeedsSenderTaskUpgrade`); `RunSchtasks` dekodiert UTF-16LE/UTF-8/OEM-Ausgaben sauber, `IsAutostartEnabled` prüft auch `<Enabled>false</Enabled>`.
-  2. **UIPI-Filter & Tray-Icon-Retry (`src/sender/main.cpp`, `src/receiver/main.cpp`):**
-     - `ChangeWindowMessageFilterEx(hwnd, ..., MSGFLT_ALLOW, nullptr)` für `TaskbarCreated` und `g_wmShowExisting` in `WM_CREATE`, damit `explorer.exe` (`Medium Integrity`) das erhöhte Sender-Fenster erreicht.
-     - `TIMER_TRAY_RETRY` (1-s-Retry bis 60 s), falls `Shell_NotifyIconW(NIM_ADD, ...)` beim frühen Login noch vor dem Start der Taskleiste aufgerufen wird.
-  3. **Basis aus `v1.5.0.53`–`v1.5.0.54` weiter aktiv:**
-     - Stream-Timeout-Fix (`6000 ms` Stream / `4000 ms` Control) + nahtloser Stream-Auto-Reconnect bei aktivem Control-Channel (`v1.5.0.54`), Direct AMD AMF (`amfrt64.dll` H.264/HEVC), D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer`), `DLT3` QOI-Lossless-Hybrid & UDP Video + GF(2⁸)-Cauchy-RS-FEC (`48216–48217`, Protokoll `v3`).
+- **Phase:** `Inno Setup Windows-x64-Installer & Autostart-/Shutdown-Integration (Release v1.5.0.57)`
+- **Status:** Im grünen CI-Build **Run `45419971886`** (Commit `9179b94`, **GitHub Release `v1.5.0.57`**, **21/21 Test-Suites PASS**, INF/CAT OK) ist zusätzlich zum portablen ZIP (`Screen2PC-Windows-x64.zip`, `1.31 MB`) der geführte Windows-x64-Installer **`Screen2PC-Setup-x64.exe`** (`2.62 MB`) live:
+  1. **Inno Setup 6 Installer (`installer/Screen2PC.iss`, `.github/workflows/ci.yml`):**
+     - Zweisprachiger moderner Wizard (Deutsch/Englisch), Installation nach `C:\Program Files\Screen2PC` (kompatibel mit dem GitHub Auto-Updater via `needAdmin`), Startmenü- & optionale Desktop-Verknüpfungen sowie Apps-&-Features-Deinstaller.
+     - Exklusive Rollenauswahl per `[Types]`/`[Components]`: **Laptop (Sender + UMDF v2 VDD-Treiber)** oder **PC (Empfänger — 100 % treiberfrei + Firewall)** inkl. `[InstallDelete]`-Bereinigung bei Rollenwechsel.
+     - Richtet auf Wunsch automatisch den Treiber (`install_driver.ps1` am Laptop) bzw. die Firewall-Ports (`TCP 48211–48215`, `UDP 48210/48215–48217` am PC) sowie den Autostart ein und räumt bei Deinstallation sauber auf (`uninstall_driver.ps1`, Firewall-Regeln, Autostart).
+  2. **Headless Autostart-CLI & Graceful Shutdown (`src/sender/main.cpp`, `src/receiver/main.cpp`):**
+     - `--install-autostart` und `--uninstall-autostart` erlauben dem Installer, exakt die interne C++20-Autostart-Logik auszuführen (Laptop: Task-XML ohne Akku-Sperre; PC: `HKCU\...\Run` mit `runasoriginaluser`).
+     - `WM_QUERYENDSESSION`/`WM_ENDSESSION` schließen Tray-Instanzen bei Upgrades/Windows-Shutdown sauber (`DestroyWindow`), ergänzt um `taskkill`-Fallback im Installer.
+  3. **Basis aus `v1.5.0.53`–`v1.5.0.55` weiter aktiv:**
+     - Akku-/UIPI-fester Sender-Autostart & `TIMER_TRAY_RETRY` (`v1.5.0.55`), Stream-Timeout-Fix + Auto-Reconnect (`v1.5.0.54`), Direct AMD AMF (`amfrt64.dll` H.264/HEVC), D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer`), `DLT3` QOI-Lossless-Hybrid & UDP Video + GF(2⁸)-Cauchy-RS-FEC (`48216–48217`, Protokoll `v3`).
 - **Zurückgestellte Feature-Ideen (Deferred Feature Backlog — explizit vorgemerkt, NICHT in diesem Release):**
   1. **10-Bit HDR End-to-End Streaming** (8-Bit HEVC HW-Encode/-Decode ist seit `v1.5.0.53` aktiv).
   2. **WASAPI Loopback Audio-Streaming** (System-Ton Surface -> PC).
@@ -23,8 +24,8 @@
   4. **In-Stream Quick-HUD Overlay** (weitere Erweiterungen; Basis-HUD bereits aktiv).
   5. **Desktop-Profile** (gespeicherte Presets für Home/Office/Gaming inkl. Auflösungs-, Codec-, KVM- & Power-Kombinationen).
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45414540566`), `infverif.exe` & `Inf2Cat.exe` OK, GitHub Release **`v1.5.0.55`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`, inkl. erweitertem `TestAutostartAndCli` für Task-XML & Upgrade-Checks).
-- **Next Step:** Auf Laptop & PC auf **`v1.5.0.55`** aktualisieren (am Laptop ggf. einmalig öffnen/Autostart prüfen, damit die neue Task-XML ohne Akku-Sperre greift) und **Installer-Design (Weg A)** mit dem User festzurren.
+  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45419971886`), `infverif.exe` & `Inf2Cat.exe` OK, Inno Setup 6.7.1 OK (`Screen2PC-Setup-x64.exe` + `Screen2PC-Windows-x64.zip`), GitHub Release **`v1.5.0.57`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`).
+- **Next Step:** **`Screen2PC-Setup-x64.exe` (`v1.5.0.57`)** auf Laptop (Rolle *Laptop*) und — sobald verfügbar — auf dem Gaming-PC (Rolle *PC*) testen: Installation nach `C:\Program Files\Screen2PC`, Akku-Autostart nach Neustart sowie Streaming (`v1.5.0.54+` Reconnect, Direct AMF/HEVC, UDP+FEC).
 
 ---
 
@@ -74,7 +75,8 @@
 | `src/receiver/` (`Screen2PC.Receiver.vcxproj`) | PC-App (treiberfrei): `ReceiverEngine.*` (`WSAPoll` TCP+UDP Video+FEC Reassembly, H.264/HEVC/Delta Decode, PIN/MAC-Auth), `D3D11Renderer.*` (Direct NV12 Shader, `ALLOW_TEARING`, HDR/`scRGB`, Quick-HUD), `Screen2PC.Receiver.rc`, `main.cpp` (Firewall inkl. UDP `48216–48217`) |
 | `src/tests/` (`Screen2PC.Tests.vcxproj`) | `main.cpp` -> `Screen2PC.Tests.exe`: 21 Suiten (inkl. `TestDeltaQoiHybrid`, `TestUdpVideoFec`, `TestAmfFallbackAndHevcHeaders`) |
 | `scripts/` | `install_driver.ps1`, `uninstall_driver.ps1`, `generate_icons.py` |
-| `.github/workflows/ci.yml` | Windows-2022 CI: MSBuild `Release\|x64`, Tests, `infverif`, `Inf2Cat`, Artifact & GitHub Release `Screen2PC-Windows-x64.zip` |
+| `installer/` | `Screen2PC.iss` — Inno Setup 6 Windows-x64-Installer (`Screen2PC-Setup-x64.exe`: Laptop/PC-Rollen, Treiber/Firewall, `--install-autostart`, Uninstaller) |
+| `.github/workflows/ci.yml` | Windows-2022 CI: MSBuild `Release\|x64`, Tests, `infverif`, `Inf2Cat`, Inno Setup 6, Artifact & GitHub Release (`Screen2PC-Setup-x64.exe` + `Screen2PC-Windows-x64.zip`) |
 
 ---
 
@@ -126,3 +128,4 @@
 | 2026-11-23 | Direct AMF (`amfrt64.dll`), HEVC (H.265), GPU Compute Delta, `DLT3` QOI & UDP+RS-FEC | `AmfMinimal.h` / `AmfEncoder.*` direkt auf `amfrt64.dll`; `CodecH264` + UI + `ReceiverEngine` für `CodecType::HEVC`; `GpuDeltaAnalyzer.*` (`cs_5_0` 64×64 Tile Diff + Bounding-Box-Readback); `CodecDelta` `DLT3` QOI-Lossless-Hybrid; `UdpVideoFec.*` + `Protocol v3` UDP `48216–48217` RS-FEC mit TCP-Fallback & Firewall-Update (`7c2d6db`, Run `45221116035`, Release `v1.5.0.53`, 21/21 Tests PASS) |
 | 2026-11-24 | Stream-Timeout- & Auto-Reconnect-Fix | TCP-Stream-Timeouts (`48212–48213`) auf `6000 ms` und Post-Handshake-Control-Timeouts (`48211`) auf `4000 ms` angehoben; `NetSocket::IsPeerClosed()`, automatischer Stream-Socket-Reconnect in `SenderEngine::RunStreamWorker` & `ReceiverEngine::RunStreamWorker` bei aktivem Control-Channel (Streamfenster/`D3D11Renderer` bleibt offen, Decoder/FEC-Reset + `RequestKeyframe`, `expectedPeerIp`-Prüfung, `inBlockingSend`-Shutdown-Guard) + `TestLoopbackNetworking`-Reconnect-Tests (`76a42bc`, Run `45411535572`, Release `v1.5.0.54`, 21/21 Tests PASS) |
 | 2026-11-24 | Akku-/UIPI-fester Sender-Autostart & Tray-Resilienz | `Autostart.h/.cpp`: `BuildSenderTaskXml` registriert `"Screen2PC Sender"` per UTF-16LE Task-XML mit `DisallowStartIfOnBatteries=false`, `StopIfGoingOnBatteries=false`, `StartWhenAvailable=true`, `ExecutionTimeLimit=PT0S`, User-SID & `HighestAvailable`; `RefreshAutostartPathIfNeeded` migriert alte `HKCU\Run`-Einträge und aktualisiert bestehende Tasks automatisch (`NeedsSenderTaskUpgrade`); `RunSchtasks` unterstützt UTF-16LE/UTF-8/OEM; `sender/main.cpp` & `receiver/main.cpp`: `ChangeWindowMessageFilterEx` (`TaskbarCreated` / `g_wmShowExisting`) + `TIMER_TRAY_RETRY` (60×1 s) + erweiterte `TestAutostartAndCli`-Tests (`daf8f3b`, Run `45414540566`, Release `v1.5.0.55`, 21/21 Tests PASS) |
+| 2026-11-24 | Inno Setup Windows-x64-Installer (`Screen2PC-Setup-x64.exe`) | `installer/Screen2PC.iss` & `.github/workflows/ci.yml`: zweisprachiger Wizard (DE/EN), exklusive Rollen *Laptop* (`Sender` + `install_driver.ps1` + Task-XML-Autostart) vs. *PC* (`Receiver` 100 % treiberfrei + Firewall TCP `48211–48215` / UDP `48210,48215–48217` + `runasoriginaluser` Autostart), Installation nach `C:\Program Files\Screen2PC`, `[InstallDelete]` bei Rollenwechsel & sauberer Deinstaller; `--install-autostart`/`--uninstall-autostart` & `WM_QUERYENDSESSION`/`WM_ENDSESSION` in `sender/main.cpp` & `receiver/main.cpp`; Release liefert `Screen2PC-Setup-x64.exe` (`2.62 MB`) + `Screen2PC-Windows-x64.zip` (`1.31 MB`) für den In-App-Updater (`9179b94`, Run `45419971886`, Release `v1.5.0.57`, 21/21 Tests PASS) |
