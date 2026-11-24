@@ -721,6 +721,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
         w->monitorIndex = i;
         w->targetMonitorIndex = targetIdx;
         w->port = static_cast<uint16_t>(kPortStreamBase + i);
+        w->expectedPeerIp = peerIp;
         w->targetMonitorRect = RECT{ md.left, md.top, md.right, md.bottom };
         w->expectedWidth = spec.width ? spec.width : md.width;
         w->expectedHeight = spec.height ? spec.height : md.height;
@@ -787,6 +788,7 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
         });
     }
 
+    clientSock.SetTimeouts(4000, 4000);
     {
         std::lock_guard<std::mutex> lock(m_ctrlSendMutex);
         m_activeCtrlSock = std::move(clientSock);
@@ -946,8 +948,19 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     TcpSocket sock;
     for (int iter = 0; iter < 50 && !m_stop && !m_sessionStop && !w->stop && w->listenSock.IsValid(); ++iter) {
-        sock = w->listenSock.Accept(nullptr, 100);
-        if (sock.IsValid()) break;
+        std::string acceptedIp;
+        TcpSocket candidate = w->listenSock.Accept(&acceptedIp, 100);
+        if (candidate.IsValid()) {
+            if (!w->expectedPeerIp.empty() && !acceptedIp.empty() && acceptedIp != w->expectedPeerIp) {
+                Logger::Instance().Warn("RCV-STRM",
+                    L"Rejected unexpected initial stream connection from " + Utf8ToWide(acceptedIp) +
+                    L" on port " + std::to_wstring(w->port));
+                candidate.Close();
+                continue;
+            }
+            sock = std::move(candidate);
+            break;
+        }
     }
     w->listenSock.Close();
     if (!sock.IsValid()) {
@@ -956,7 +969,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     }
     // Asymmetric low-latency stream socket (small SNDBUF, tight 128KB RCVBUF to prevent multi-frame queue bloat)
     sock.TuneLowLatency(64 * 1024, 128 * 1024);
-    sock.SetTimeouts(3000, 1500);
+    sock.SetTimeouts(6000, 6000);
 
     const uint32_t colorIdx = std::min<uint32_t>(w->targetMonitorIndex, kMaxMonitors - 1);
     uint64_t lastColorGen = m_colorGeneration[colorIdx].load(std::memory_order_acquire);
@@ -991,6 +1004,7 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
 
     std::atomic<bool> recvStop{ false };
     std::atomic<bool> streamEnded{ false };
+    std::mutex sockLifecycleMutex;
 
     // Dedicated recv + decode worker thread: never stalls on Present(), Win32 resizing, or RawInput
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -1034,38 +1048,40 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
         uint64_t windowDecodeCount = 0;
         uint64_t totalFrames = 0;
 
-        while (!m_stop && !m_sessionStop && !w->stop && !recvStop && !streamEnded) {
-            WSAPOLLFD fds[2]{};
-            ULONG nfds = 0;
-            if (sock.IsValid()) {
-                fds[nfds].fd = sock.Handle();
-                fds[nfds].events = POLLRDNORM;
-                ++nfds;
-            }
-            if (w->videoUdpSock.IsValid()) {
-                fds[nfds].fd = w->videoUdpSock.Handle();
-                fds[nfds].events = POLLRDNORM;
-                ++nfds;
-            }
-            if (nfds == 0) {
-                streamEnded.store(true);
-                break;
-            }
-            int pr = WSAPoll(fds, nfds, 16);
-            if (pr < 0) {
-                streamEnded.store(true);
-                break;
-            }
-            if (pr == 0) {
-                if (w->videoUdpSock.IsValid() && udpFecRecv.PruneExpired(GetTickCount64(), 25)) {
-                    maybeRequestKeyframe();
+        while (!m_stop && !m_sessionStop && !w->stop && !recvStop) {
+            bool streamInterrupted = false;
+            while (!m_stop && !m_sessionStop && !w->stop && !recvStop && !streamInterrupted) {
+                WSAPOLLFD fds[2]{};
+                ULONG nfds = 0;
+                if (sock.IsValid()) {
+                    fds[nfds].fd = sock.Handle();
+                    fds[nfds].events = POLLRDNORM;
+                    ++nfds;
                 }
-                continue;
-            }
-            if (sock.IsValid() && (fds[0].revents & (POLLERR | POLLHUP)) && !(fds[0].revents & POLLRDNORM)) {
-                streamEnded.store(true);
-                break;
-            }
+                if (w->videoUdpSock.IsValid()) {
+                    fds[nfds].fd = w->videoUdpSock.Handle();
+                    fds[nfds].events = POLLRDNORM;
+                    ++nfds;
+                }
+                if (nfds == 0) {
+                    streamInterrupted = true;
+                    break;
+                }
+                int pr = WSAPoll(fds, nfds, 16);
+                if (pr < 0) {
+                    streamInterrupted = true;
+                    break;
+                }
+                if (pr == 0) {
+                    if (w->videoUdpSock.IsValid() && udpFecRecv.PruneExpired(GetTickCount64(), 25)) {
+                        maybeRequestKeyframe();
+                    }
+                    continue;
+                }
+                if (sock.IsValid() && (fds[0].revents & (POLLERR | POLLHUP)) && !(fds[0].revents & POLLRDNORM)) {
+                    streamInterrupted = true;
+                    break;
+                }
 
             // Drain burst of queued packets so we always render the freshest cursor & video frame
             bool pendingDeltaCommit = false;
@@ -1329,49 +1345,141 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
                 }
             }
 
-            int wr = sock.WaitReadable(0);
-            if (wr < 0) {
-                streamEnded.store(true);
-            }
-            for (int drained = 0; drained < 8 && wr > 0 && !recvStop && !m_stop && !m_sessionStop && !w->stop && !streamEnded; ++drained) {
-                PacketHeader hdr{};
-                std::vector<uint8_t> payload;
-                if (!sock.RecvPacket(hdr, payload)) {
-                    streamEnded.store(true);
-                    break;
+                int wr = sock.WaitReadable(0);
+                if (wr < 0) {
+                    streamInterrupted = true;
                 }
+                for (int drained = 0; drained < 8 && wr > 0 && !recvStop && !m_stop && !m_sessionStop && !w->stop && !streamInterrupted; ++drained) {
+                    PacketHeader hdr{};
+                    std::vector<uint8_t> payload;
+                    if (!sock.RecvPacket(hdr, payload)) {
+                        streamInterrupted = true;
+                        break;
+                    }
 
-                if (hdr.type == static_cast<uint16_t>(MsgType::StreamEnd)) {
-                    streamEnded.store(true);
-                    break;
-                } else if (hdr.type == static_cast<uint16_t>(MsgType::CursorUpdate) &&
-                           payload.size() >= sizeof(CursorUpdateHeader)) {
-                    CursorUpdateHeader ch{};
-                    std::memcpy(&ch, payload.data(), sizeof(ch));
-                    const uint8_t* shapePtr = (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize)
-                                                  ? (payload.data() + sizeof(ch))
-                                                  : nullptr;
-                    renderer.QueueCursorUpdate(ch.visible != 0, ch.x, ch.y, ch.shapeChanged != 0, ch.shapeType,
-                                               ch.shapeWidth, ch.shapeHeight, ch.shapePitch, ch.hotX, ch.hotY,
-                                               shapePtr, ch.dataSize);
-                } else if (hdr.type == static_cast<uint16_t>(MsgType::VideoFrame) &&
-                           payload.size() >= sizeof(VideoFrameHeader)) {
-                    VideoFrameHeader vh{};
-                    std::memcpy(&vh, payload.data(), sizeof(vh));
-                    if (payload.size() >= sizeof(vh) + vh.dataSize) {
-                        processVideoFrame(vh, payload.data() + sizeof(vh), payload.size() + sizeof(PacketHeader));
+                    if (hdr.type == static_cast<uint16_t>(MsgType::StreamEnd)) {
+                        streamInterrupted = true;
+                        break;
+                    } else if (hdr.type == static_cast<uint16_t>(MsgType::CursorUpdate) &&
+                               payload.size() >= sizeof(CursorUpdateHeader)) {
+                        CursorUpdateHeader ch{};
+                        std::memcpy(&ch, payload.data(), sizeof(ch));
+                        const uint8_t* shapePtr = (ch.dataSize > 0 && payload.size() >= sizeof(ch) + ch.dataSize)
+                                                      ? (payload.data() + sizeof(ch))
+                                                      : nullptr;
+                        renderer.QueueCursorUpdate(ch.visible != 0, ch.x, ch.y, ch.shapeChanged != 0, ch.shapeType,
+                                                   ch.shapeWidth, ch.shapeHeight, ch.shapePitch, ch.hotX, ch.hotY,
+                                                   shapePtr, ch.dataSize);
+                    } else if (hdr.type == static_cast<uint16_t>(MsgType::VideoFrame) &&
+                               payload.size() >= sizeof(VideoFrameHeader)) {
+                        VideoFrameHeader vh{};
+                        std::memcpy(&vh, payload.data(), sizeof(vh));
+                        if (payload.size() >= sizeof(vh) + vh.dataSize) {
+                            processVideoFrame(vh, payload.data() + sizeof(vh), payload.size() + sizeof(PacketHeader));
+                        }
+                    }
+
+                    wr = sock.WaitReadable(0);
+                    if (wr < 0) {
+                        streamInterrupted = true;
+                        break;
                     }
                 }
+                flushPendingBurstFrames();
+            }
 
-                wr = sock.WaitReadable(0);
-                if (wr < 0) {
-                    streamEnded.store(true);
-                    break;
+            if (!streamInterrupted || m_stop || m_sessionStop || w->stop || recvStop) {
+                break;
+            }
+
+            Logger::Instance().Warn("RCV-STRM",
+                L"Stream connection interrupted on port " + std::to_wstring(w->port) +
+                L" (wsa=" + std::to_wstring(WSAGetLastError()) +
+                L"); keeping stream window open and waiting for reconnect...");
+
+            {
+                std::lock_guard<std::mutex> sl(sockLifecycleMutex);
+                sock.Close();
+            }
+
+            {
+                std::lock_guard<std::mutex> gpuLock(renderer.GpuMutex());
+                h264.Shutdown();
+            }
+            h264W = 0;
+            h264H = 0;
+            h264InitFailed = false;
+            decodedAnyH264 = false;
+            consecutiveH264Fails = 0;
+            needMoreInputStreak = 0;
+            delta.Reset();
+            udpFecRecv.Reset();
+            lastDecodedFrameIdx = 0;
+            lastKeyframeReq = std::chrono::steady_clock::time_point{};
+
+            if (w->videoUdpSock.IsValid()) {
+                for (int u = 0; u < 256 && w->videoUdpSock.WaitReadable(0) > 0; ++u) {
+                    if (w->videoUdpSock.RecvFrom(udpBuf, sizeof(udpBuf), udpPeerIp, udpPeerPort, 0) <= 0) break;
                 }
             }
-            flushPendingBurstFrames();
+
+            while (!m_stop && !m_sessionStop && !w->stop && !recvStop && !sock.IsValid()) {
+                {
+                    std::lock_guard<std::mutex> sl(sockLifecycleMutex);
+                    if (m_stop || m_sessionStop || w->stop || recvStop) {
+                        break;
+                    }
+                    if (!w->listenSock.IsValid()) {
+                        if (!w->listenSock.Listen(w->port, 2)) {
+                            // Retry after short sleep outside lock
+                        }
+                    }
+                }
+                if (!w->listenSock.IsValid()) {
+                    Sleep(100);
+                    continue;
+                }
+
+                std::string acceptedIp;
+                TcpSocket candidate = w->listenSock.Accept(&acceptedIp, 100);
+                if (!candidate.IsValid()) {
+                    continue;
+                }
+                if (!w->expectedPeerIp.empty() && !acceptedIp.empty() && acceptedIp != w->expectedPeerIp) {
+                    Logger::Instance().Warn("RCV-STRM",
+                        L"Rejected unexpected stream reconnect from " + Utf8ToWide(acceptedIp) +
+                        L" on port " + std::to_wstring(w->port));
+                    candidate.Close();
+                    continue;
+                }
+
+                std::lock_guard<std::mutex> sl(sockLifecycleMutex);
+                if (m_stop || m_sessionStop || w->stop || recvStop) {
+                    candidate.Close();
+                    break;
+                }
+                sock = std::move(candidate);
+                w->listenSock.Close();
+                sock.TuneLowLatency(64 * 1024, 128 * 1024);
+                sock.SetTimeouts(6000, 6000);
+            }
+
+            if (sock.IsValid() && !m_stop && !m_sessionStop && !w->stop && !recvStop) {
+                if (w->videoUdpSock.IsValid()) {
+                    for (int u = 0; u < 256 && w->videoUdpSock.WaitReadable(0) > 0; ++u) {
+                        if (w->videoUdpSock.RecvFrom(udpBuf, sizeof(udpBuf), udpPeerIp, udpPeerPort, 0) <= 0) break;
+                    }
+                }
+                udpFecRecv.Reset();
+                lastDecodedFrameIdx = 0;
+                RequestKeyframe(w->monitorIndex);
+                lastKeyframeReq = std::chrono::steady_clock::now();
+                Logger::Instance().Info("RCV-STRM",
+                    L"Stream reconnected on port " + std::to_wstring(w->port) + L".");
+            }
         }
 
+        streamEnded.store(true);
         {
             std::lock_guard<std::mutex> gpuLock(renderer.GpuMutex());
             h264.Shutdown();
@@ -1425,8 +1533,12 @@ void ReceiverEngine::RunStreamWorker(StreamReceiverWorker* w) {
     }
 
     recvStop.store(true);
-    sock.Close();
-    w->videoUdpSock.Close();
+    {
+        std::lock_guard<std::mutex> sl(sockLifecycleMutex);
+        sock.Close();
+        w->listenSock.Close();
+        w->videoUdpSock.Close();
+    }
     if (recvDecodeThread.joinable()) {
         recvDecodeThread.join();
     }

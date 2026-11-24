@@ -46,6 +46,8 @@ public:
     void SetTimeouts(int sendTimeoutMs, int recvTimeoutMs);
     // Returns 1 if readable, 0 on timeout, -1 on error/invalid socket
     int WaitReadable(int timeoutMs);
+    // Returns true if the socket is invalid or the peer has closed/reset the connection (non-blocking)
+    bool IsPeerClosed() const;
 
     bool SendAll(const void* data, size_t len);
     bool RecvAll(void* data, size_t len);

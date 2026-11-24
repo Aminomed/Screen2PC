@@ -235,6 +235,29 @@ int TcpSocket::WaitReadable(int timeoutMs) {
     return -1;
 }
 
+bool TcpSocket::IsPeerClosed() const {
+    SOCKET s = m_sock.load();
+    if (s == INVALID_SOCKET) return true;
+
+    WSAPOLLFD pfd{};
+    pfd.fd = s;
+    pfd.events = POLLRDNORM;
+    int pr = WSAPoll(&pfd, 1, 0);
+    if (pr < 0) return true;
+    if (pr == 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+    if (pfd.revents & POLLRDNORM) {
+        char buf = 0;
+        int n = recv(s, &buf, 1, MSG_PEEK);
+        if (n == 0) return true;
+        if (n < 0) {
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) return true;
+        }
+    }
+    return false;
+}
+
 bool TcpSocket::SendAll(const void* data, size_t len) {
     SOCKET s = m_sock.load();
     if (s == INVALID_SOCKET) return false;

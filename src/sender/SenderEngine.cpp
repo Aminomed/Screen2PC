@@ -1199,7 +1199,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     }
     // Tight 64KB SNDBUF eliminates kernel TCP queue bloat so Latest-Frame-Wins backpressure works immediately
     sock.TuneLowLatency(64 * 1024, 64 * 1024);
-    sock.SetTimeouts(1500, 1500);
+    sock.SetTimeouts(6000, 6000);
 
     DxgiCapture capture;
     bool capOk = false;
@@ -1319,101 +1319,146 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     std::atomic<bool> sendQueueOccupied{false};
     bool sendThreadExit = false;
     std::atomic<bool> sendFailed{false};
+    std::atomic<bool> inBlockingSend{false};
     std::atomic<uint64_t> sentPacketBytes{0};
     std::atomic<double> latestSendMs{0.0};
     std::atomic<bool> sendMsUpdated{false};
+    std::thread asyncSendThread;
 
-    std::thread asyncSendThread([&]() {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-        std::vector<std::vector<uint8_t>> udpShards;
-        std::vector<uint8_t> tcpFrameBuf;
-        while (true) {
-            std::vector<std::vector<uint8_t>> cursorsToSend;
-            std::optional<PendingVideoPacket> pktOpt;
-            {
-                std::unique_lock<std::mutex> ql(sendQueueMutex);
-                sendQueueCv.wait(ql, [&]() {
-                    return sendThreadExit || !pendingCursorPackets.empty() || pendingPacket.has_value();
-                });
-                if (sendThreadExit && pendingCursorPackets.empty() && !pendingPacket.has_value()) {
-                    break;
-                }
-                if (!pendingCursorPackets.empty()) {
-                    cursorsToSend.swap(pendingCursorPackets);
-                }
-                if (pendingPacket.has_value()) {
-                    pktOpt = std::move(*pendingPacket);
-                    pendingPacket.reset();
-                    sendQueueOccupied.store(false, std::memory_order_release);
-                }
-            }
+    auto startAsyncSendThread = [&]() {
+        {
+            std::lock_guard<std::mutex> ql(sendQueueMutex);
+            pendingCursorPackets.clear();
+            pendingPacket.reset();
+            sendQueueOccupied.store(false, std::memory_order_release);
+            sendThreadExit = false;
+        }
+        sendFailed.store(false, std::memory_order_release);
+        inBlockingSend.store(false, std::memory_order_release);
 
-            if (!cursorsToSend.empty()) {
-                std::lock_guard<std::mutex> sl(sockSendMutex);
-                for (const auto& cp : cursorsToSend) {
-                    if (!sock.SendPacket(MsgType::CursorUpdate, cp.data(), static_cast<uint32_t>(cp.size()))) {
+        asyncSendThread = std::thread([&]() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+            std::vector<std::vector<uint8_t>> udpShards;
+            std::vector<uint8_t> tcpFrameBuf;
+            while (true) {
+                std::vector<std::vector<uint8_t>> cursorsToSend;
+                std::optional<PendingVideoPacket> pktOpt;
+                bool timedOutIdle = false;
+                {
+                    std::unique_lock<std::mutex> ql(sendQueueMutex);
+                    if (!sendQueueCv.wait_for(ql, std::chrono::milliseconds(250), [&]() {
+                            return sendThreadExit || !pendingCursorPackets.empty() || pendingPacket.has_value();
+                        })) {
+                        timedOutIdle = true;
+                    }
+                    if (sendThreadExit && pendingCursorPackets.empty() && !pendingPacket.has_value()) {
+                        break;
+                    }
+                    if (!pendingCursorPackets.empty()) {
+                        cursorsToSend.swap(pendingCursorPackets);
+                    }
+                    if (pendingPacket.has_value()) {
+                        pktOpt = std::move(*pendingPacket);
+                        pendingPacket.reset();
+                        sendQueueOccupied.store(false, std::memory_order_release);
+                    }
+                }
+
+                if (timedOutIdle && cursorsToSend.empty() && !pktOpt.has_value()) {
+                    if (sock.IsPeerClosed()) {
                         sendFailed.store(true);
                         break;
                     }
+                    continue;
                 }
-                if (sendFailed.load()) break;
-            }
 
-            if (pktOpt.has_value()) {
-                LARGE_INTEGER s0{}, s1{};
-                QueryPerformanceCounter(&s0);
-                bool sentOverUdp = false;
-                size_t wireBytes = 0;
-
-                if (videoUdpReady && pktOpt->payload.size() <= kUdpVideoMaxPayloadBytes) {
-                    size_t parityCnt = 0;
-                    if (udpFecSender.BuildPackets(w->streamIndex,
-                                                  pktOpt->header.frameIndex,
-                                                  pktOpt->isKeyframe,
-                                                  pktOpt->header,
-                                                  pktOpt->payload.data(),
-                                                  pktOpt->payload.size(),
-                                                  udpShards,
-                                                  &parityCnt)) {
-                        sentOverUdp = true;
-                        for (const auto& shard : udpShards) {
-                            if (!videoUdpSock.SendTo(w->peerIp, peerVideoUdpPort, shard.data(), shard.size())) {
-                                sentOverUdp = false;
-                                break;
-                            }
-                            wireBytes += shard.size();
+                if (!cursorsToSend.empty()) {
+                    std::lock_guard<std::mutex> sl(sockSendMutex);
+                    inBlockingSend.store(true, std::memory_order_release);
+                    for (const auto& cp : cursorsToSend) {
+                        if (!sock.SendPacket(MsgType::CursorUpdate, cp.data(), static_cast<uint32_t>(cp.size()))) {
+                            sendFailed.store(true);
+                            break;
                         }
                     }
+                    inBlockingSend.store(false, std::memory_order_release);
+                    if (sendFailed.load()) break;
                 }
 
-                bool ok = sentOverUdp;
-                if (!ok) {
-                    tcpFrameBuf.resize(sizeof(VideoFrameHeader) + pktOpt->payload.size());
-                    std::memcpy(tcpFrameBuf.data(), &pktOpt->header, sizeof(VideoFrameHeader));
-                    if (!pktOpt->payload.empty()) {
-                        std::memcpy(tcpFrameBuf.data() + sizeof(VideoFrameHeader),
-                                    pktOpt->payload.data(),
-                                    pktOpt->payload.size());
-                    }
-                    {
-                        std::lock_guard<std::mutex> sl(sockSendMutex);
-                        ok = sock.SendPacket(MsgType::VideoFrame, tcpFrameBuf.data(), static_cast<uint32_t>(tcpFrameBuf.size()));
-                    }
-                    wireBytes = tcpFrameBuf.size() + sizeof(PacketHeader);
-                }
+                if (pktOpt.has_value()) {
+                    LARGE_INTEGER s0{}, s1{};
+                    QueryPerformanceCounter(&s0);
+                    bool sentOverUdp = false;
+                    size_t wireBytes = 0;
 
-                QueryPerformanceCounter(&s1);
-                if (!ok) {
-                    sendFailed.store(true);
-                    break;
+                    if (videoUdpReady && pktOpt->payload.size() <= kUdpVideoMaxPayloadBytes) {
+                        size_t parityCnt = 0;
+                        if (udpFecSender.BuildPackets(w->streamIndex,
+                                                      pktOpt->header.frameIndex,
+                                                      pktOpt->isKeyframe,
+                                                      pktOpt->header,
+                                                      pktOpt->payload.data(),
+                                                      pktOpt->payload.size(),
+                                                      udpShards,
+                                                      &parityCnt)) {
+                            sentOverUdp = true;
+                            for (const auto& shard : udpShards) {
+                                if (!videoUdpSock.SendTo(w->peerIp, peerVideoUdpPort, shard.data(), shard.size())) {
+                                    sentOverUdp = false;
+                                    break;
+                                }
+                                wireBytes += shard.size();
+                            }
+                        }
+                    }
+
+                    bool ok = sentOverUdp;
+                    if (!ok) {
+                        tcpFrameBuf.resize(sizeof(VideoFrameHeader) + pktOpt->payload.size());
+                        std::memcpy(tcpFrameBuf.data(), &pktOpt->header, sizeof(VideoFrameHeader));
+                        if (!pktOpt->payload.empty()) {
+                            std::memcpy(tcpFrameBuf.data() + sizeof(VideoFrameHeader),
+                                        pktOpt->payload.data(),
+                                        pktOpt->payload.size());
+                        }
+                        {
+                            std::lock_guard<std::mutex> sl(sockSendMutex);
+                            inBlockingSend.store(true, std::memory_order_release);
+                            ok = sock.SendPacket(MsgType::VideoFrame, tcpFrameBuf.data(), static_cast<uint32_t>(tcpFrameBuf.size()));
+                            inBlockingSend.store(false, std::memory_order_release);
+                        }
+                        wireBytes = tcpFrameBuf.size() + sizeof(PacketHeader);
+                    }
+
+                    QueryPerformanceCounter(&s1);
+                    if (!ok) {
+                        sendFailed.store(true);
+                        break;
+                    }
+                    double ms = static_cast<double>(s1.QuadPart - s0.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
+                    latestSendMs.store(ms, std::memory_order_relaxed);
+                    sendMsUpdated.store(true, std::memory_order_release);
+                    sentPacketBytes.fetch_add(wireBytes, std::memory_order_relaxed);
                 }
-                double ms = static_cast<double>(s1.QuadPart - s0.QuadPart) * 1000.0 / static_cast<double>(qpcFreq);
-                latestSendMs.store(ms, std::memory_order_relaxed);
-                sendMsUpdated.store(true, std::memory_order_release);
-                sentPacketBytes.fetch_add(wireBytes, std::memory_order_relaxed);
             }
+        });
+    };
+
+    auto stopAsyncSendThread = [&](bool forceCloseSocket) {
+        {
+            std::lock_guard<std::mutex> ql(sendQueueMutex);
+            sendThreadExit = true;
         }
-    });
+        sendQueueCv.notify_all();
+        if (forceCloseSocket || inBlockingSend.load(std::memory_order_acquire)) {
+            sock.Close();
+        }
+        if (asyncSendThread.joinable()) {
+            asyncSendThread.join();
+        }
+    };
+
+    startAsyncSendThread();
 
     auto queueCursorPacket = [&](std::vector<uint8_t>&& cursorBytes) {
         {
@@ -1621,7 +1666,51 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             L" Mbit/s, " + std::to_wstring(effFps) + L" FPS");
     };
 
-    while (!m_stop && !w->stop && !sendFailed.load()) {
+    while (!m_stop && !w->stop) {
+        if (sendFailed.load()) {
+            stopAsyncSendThread(true);
+            Logger::Instance().Warn("SND-WRK",
+                L"Stream connection interrupted on port " + std::to_wstring(w->streamPort) +
+                L"; reconnecting...");
+
+            bool reconnected = false;
+            while (!m_stop && !w->stop) {
+                if (sock.Connect(w->peerIp, w->streamPort, 500, &m_stop)) {
+                    reconnected = true;
+                    break;
+                }
+                SleepInterruptible(150, m_stop);
+            }
+            if (!reconnected || m_stop || w->stop) {
+                break;
+            }
+
+            sock.TuneLowLatency(64 * 1024, 64 * 1024);
+            sock.SetTimeouts(6000, 6000);
+            w->forceKeyframe.store(true);
+            sentInitialFrame = false;
+            forceFullDirtyRect = true;
+            pendingDirtyRects.clear();
+            pendingMoveRects.clear();
+            settleDirtyRects.clear();
+            deltaNeedsSettle = false;
+            deltaSettleFull = false;
+            losslessSettleActive = false;
+            consecutiveLargeDeltaFrames = 0;
+            stallCount = 0;
+            cleanSendStreak = 0;
+            nextEncodeQpc = 0;
+            smoothedEncMs = 0.0;
+            smoothedSendMs = 0.0;
+            if (activeCodec == CodecType::DeltaLossless) {
+                delta.Reset();
+                gpuDelta.Shutdown();
+            }
+            startAsyncSendThread();
+            Logger::Instance().Info("SND-WRK",
+                L"Stream reconnected on port " + std::to_wstring(w->streamPort) + L".");
+            continue;
+        }
         applyLiveReconfigureIfNeeded();
 
         const uint32_t acqTimeoutMs = std::max<uint32_t>(1u, std::min<uint32_t>(4u, 350u / std::max<uint32_t>(30u, effFps)));
@@ -2031,20 +2120,15 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
     }
 
-    {
-        std::lock_guard<std::mutex> ql(sendQueueMutex);
-        sendThreadExit = true;
-    }
-    sendQueueCv.notify_all();
-    if (asyncSendThread.joinable()) {
-        asyncSendThread.join();
-    }
+    const bool hadSendFailure = sendFailed.load();
+    stopAsyncSendThread(hadSendFailure);
 
-    if (sock.IsValid()) {
+    if (sock.IsValid() && !hadSendFailure) {
         std::lock_guard<std::mutex> sl(sockSendMutex);
+        sock.SetTimeouts(300, 300);
         sock.SendPacket(MsgType::StreamEnd, nullptr, 0);
-        sock.Close();
     }
+    sock.Close();
     videoUdpSock.Close();
     gpuDelta.Shutdown();
     capture.Shutdown();

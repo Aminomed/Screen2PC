@@ -431,6 +431,87 @@ void TestLoopbackNetworking() {
               "Canceled TcpSocket::Connect should return false immediately");
     }
 
+    // 1c. TcpSocket::IsPeerClosed() + same-port stream reconnect after interruption
+    {
+        const uint16_t reconnPort = 48293;
+        s2p::TcpSocket reconnListen;
+        CHECK(reconnListen.Listen(reconnPort, 2), "Reconnect test Listen failed");
+
+        std::atomic<bool> firstAccepted{ false };
+        std::atomic<bool> secondFrameOk{ false };
+        std::thread reconnSrv([&]() {
+            std::string peerIp;
+            s2p::TcpSocket s1 = reconnListen.Accept(&peerIp, 2000);
+            if (!s1.IsValid()) return;
+            reconnListen.Close();
+            firstAccepted.store(true);
+
+            s2p::PacketHeader h1{};
+            std::vector<uint8_t> p1;
+            if (!s1.RecvPacket(h1, p1)) { s1.Close(); return; }
+            s1.SendPacket(s2p::MsgType::SessionAck, p1.data(), static_cast<uint32_t>(p1.size()), 101);
+            Sleep(30);
+            // Simulate abrupt stream interruption (timeout/drop) -> close s1 & re-listen on same port
+            s1.Close();
+
+            if (!reconnListen.Listen(reconnPort, 2)) return;
+            s2p::TcpSocket s2 = reconnListen.Accept(nullptr, 2500);
+            reconnListen.Close();
+            if (!s2.IsValid()) return;
+
+            s2p::PacketHeader h2{};
+            std::vector<uint8_t> p2;
+            if (s2.RecvPacket(h2, p2) &&
+                h2.type == static_cast<uint16_t>(s2p::MsgType::VideoFrame) &&
+                h2.reserved == 202) {
+                secondFrameOk.store(true);
+            }
+            s2.Close();
+        });
+
+        s2p::TcpSocket cli;
+        CHECK(cli.Connect("127.0.0.1", reconnPort, 2000), "Reconnect test Connect #1 failed");
+        CHECK(!cli.IsPeerClosed(), "IsPeerClosed unexpectedly true on healthy idle socket");
+
+        const std::vector<uint8_t> ping1 = { 0x11, 0x22, 0x33 };
+        CHECK(cli.SendPacket(s2p::MsgType::VideoFrame, ping1.data(), static_cast<uint32_t>(ping1.size()), 101),
+              "SendPacket #1 failed");
+        CHECK(cli.WaitReadable(2000) == 1, "WaitReadable for ACK #1 failed");
+        CHECK(!cli.IsPeerClosed(), "IsPeerClosed unexpectedly true with unread packet queued");
+
+        s2p::PacketHeader ah{};
+        std::vector<uint8_t> ap;
+        CHECK(cli.RecvPacket(ah, ap) && ah.reserved == 101 && ap == ping1, "ACK #1 corrupted by IsPeerClosed");
+
+        bool detectedClose = false;
+        for (int i = 0; i < 80; ++i) {
+            if (cli.IsPeerClosed()) {
+                detectedClose = true;
+                break;
+            }
+            Sleep(15);
+        }
+        CHECK(detectedClose, "TcpSocket::IsPeerClosed did not detect peer stream close");
+        cli.Close();
+        CHECK(cli.IsPeerClosed(), "IsPeerClosed should return true on closed socket");
+
+        bool reconnected = false;
+        for (int i = 0; i < 40; ++i) {
+            if (cli.Connect("127.0.0.1", reconnPort, 500)) {
+                reconnected = true;
+                break;
+            }
+            Sleep(25);
+        }
+        CHECK(reconnected, "Stream reconnect on same port failed");
+        CHECK(cli.SendPacket(s2p::MsgType::VideoFrame, ping1.data(), static_cast<uint32_t>(ping1.size()), 202),
+              "SendPacket #2 after reconnect failed");
+
+        cli.Close();
+        reconnSrv.join();
+        CHECK(firstAccepted.load() && secondFrameOk.load(), "Server did not receive post-reconnect frame");
+    }
+
     // 2. UDP Loopback packet roundtrip + bounds check
     s2p::UdpSocket udpSrv;
     s2p::UdpSocket udpCli;

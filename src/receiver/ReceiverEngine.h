@@ -124,6 +124,7 @@ private:
         uint32_t monitorIndex = 0;
         uint32_t targetMonitorIndex = 0;
         uint16_t port = kPortStreamBase;
+        std::string expectedPeerIp;
         RECT targetMonitorRect{};
         uint32_t expectedWidth = 1920;
         uint32_t expectedHeight = 1080;
