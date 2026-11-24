@@ -2123,6 +2123,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ShowWindow(hwnd, SW_HIDE);
         return 0;
 
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wp) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+
     case WM_DESTROY:
         g_closing = true;
         KillTimer(hwnd, TIMER_TELEMETRY);
@@ -2155,6 +2164,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
+    if (s2p::HasCliFlag(lpCmdLine, L"--install-autostart")) {
+        return s2p::SetAutostartEnabled(true) ? 0 : 1;
+    }
+    if (s2p::HasCliFlag(lpCmdLine, L"--uninstall-autostart")) {
+        return s2p::SetAutostartEnabled(false) ? 0 : 1;
+    }
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);

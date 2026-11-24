@@ -918,6 +918,13 @@ void TestAutostartAndCli() {
     CHECK(s2p::NeedsSenderTaskUpgrade(legacyXml, exeEsc),
           "Legacy battery-restricted task XML must trigger upgrade");
 
+    CHECK(s2p::HasCliFlag(L"\"C:\\Program Files\\Screen2PC\\Screen2PC.Sender.exe\" --install-autostart", L"--install-autostart"),
+          "HasCliFlag should match --install-autostart");
+    CHECK(s2p::HasCliFlag(L"Screen2PC.Receiver.exe --UNINSTALL-AUTOSTART", L"--uninstall-autostart"),
+          "HasCliFlag should match --uninstall-autostart case-insensitively");
+    CHECK(!s2p::HasTrayLaunchFlag(L"Screen2PC.Sender.exe --install-autostart"),
+          "Installer CLI flags must not trigger tray launch flag");
+
     std::cout << "[PASS] TestAutostartAndCli\n";
 }
 

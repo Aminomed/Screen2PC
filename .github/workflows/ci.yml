@@ -98,18 +98,8 @@ jobs:
           Compress-Archive -Path "$dist\*" -DestinationPath "dist\Screen2PC-Windows-x64.zip" -Force
           Get-ChildItem -Path $dist -Recurse
 
-      - name: Upload Windows Release Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Screen2PC-Windows-x64
-          path: dist/Screen2PC-Windows-x64.zip
-          if-no-files-found: error
-
-      - name: Publish GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Build Windows Installer (Inno Setup)
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $verHeader = Get-Content -Path "src\common\Version.h" -Raw
           $maj = [regex]::Match($verHeader, '#define\s+SCREEN2PC_VERSION_MAJOR\s+(\d+)').Groups[1].Value
@@ -119,26 +109,71 @@ jobs:
             throw "Failed to parse version macros from src\common\Version.h"
           }
           $ver = "$maj.$min.$pat.$env:GITHUB_RUN_NUMBER"
+          "SCREEN2PC_VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $iscc) {
+            Write-Host "Installing Inno Setup 6 via Chocolatey..."
+            choco install innosetup -y --no-progress
+            $iscc = @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup." }
+
+          $distAbs = (Resolve-Path "dist\Screen2PC-Windows-x64").Path
+          $outAbs = (Resolve-Path "dist").Path
+          $repoAbs = (Resolve-Path ".").Path
+
+          Write-Host "Compiling installer v$ver with $iscc..."
+          & $iscc "/DAppVersion=$ver" "/DDistDir=$distAbs" "/DOutDir=$outAbs" "/DRepoRoot=$repoAbs" "installer\Screen2PC.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "dist\Screen2PC-Setup-x64.exe")) { throw "Screen2PC-Setup-x64.exe not generated" }
+          Get-Item "dist\Screen2PC-Setup-x64.exe"
+
+      - name: Upload Windows Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Screen2PC-Windows-x64
+          path: |
+            dist/Screen2PC-Windows-x64.zip
+            dist/Screen2PC-Setup-x64.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = $env:SCREEN2PC_VER
+          if (-not $ver) { throw "SCREEN2PC_VER missing from environment" }
           $tag = "v$ver"
           $zip = "dist\Screen2PC-Windows-x64.zip"
-          Write-Host "Publishing GitHub Release $tag ($zip) for $env:GITHUB_REPOSITORY..."
+          $setupExe = "dist\Screen2PC-Setup-x64.exe"
+          Write-Host "Publishing GitHub Release $tag ($setupExe + $zip) for $env:GITHUB_REPOSITORY..."
 
           $notes = @(
             "Automatischer Screen2PC Windows x64 Release-Build (**v$ver**).",
             "",
+            "- **Installer (``Screen2PC-Setup-x64.exe``):** Gefuehrte Installation fuer Laptop (Sender + VDD-Treiber + Akku-fester Autostart) oder PC (Empfaenger — 100 % treiberfrei + Firewall + Autostart)",
+            "- **Portable (``Screen2PC-Windows-x64.zip``):** Fuer portablen Einsatz & den integrierten 1-Klick GitHub Auto-Updater",
             "- Alle C++ Unit- & Integrations-Tests bestanden",
-            "- UMDF v2 IddCx Treiberpaket via ``infverif.exe`` und ``Inf2Cat.exe`` geprueft",
-            "- Entpacken & Ausfuehren auf Surface (Sender) und PC (Empfaenger — 100 % treiberfrei)",
-            "- Integrierter GitHub Auto-Updater aktualisiert kuenftige Releases direkt per Klick in der App"
+            "- UMDF v2 IddCx Treiberpaket via ``infverif.exe`` und ``Inf2Cat.exe`` geprueft"
           ) -join "`n"
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $zip --repo $env:GITHUB_REPOSITORY --clobber
+            gh release upload $tag $setupExe $zip --repo $env:GITHUB_REPOSITORY --clobber
             if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
             gh release edit $tag --repo $env:GITHUB_REPOSITORY --title "Screen2PC $tag" --notes $notes --latest
             if ($LASTEXITCODE -ne 0) { throw "gh release edit failed with exit code $LASTEXITCODE" }
           } else {
-            gh release create $tag $zip --repo $env:GITHUB_REPOSITORY --title "Screen2PC $tag" --notes $notes --latest
+            gh release create $tag $setupExe $zip --repo $env:GITHUB_REPOSITORY --title "Screen2PC $tag" --notes $notes --latest
             if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit code $LASTEXITCODE" }
           }
