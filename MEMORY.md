@@ -6,20 +6,18 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Direct AMD AMF (H.264 & HEVC), D3D11 Compute-Shader Delta, DLT3 QOI Hybrid & UDP + RS-FEC Video (Release v1.5.0.53)`
-- **Status:** Im grünen CI-Build **Run `45221116035`** (Commit `7c2d6db`, **GitHub Release `v1.5.0.53`**, **21/21 Test-Suites PASS**, INF/CAT OK) sind alle fünf Engine-/Transport-Upgrades umgesetzt und verifiziert:
-  1. **Direct AMD AMF (`AmfMinimal.h`, `AmfEncoder.*`, `CodecH264.*`):**
-     - Lädt `amfrt64.dll` direkt per dynamischem C-ABI (`pVtbl`), ohne Drittanbieter-Header/Libs, vor der MF-MFT-Enumeration (`H.264 (AMF Direct)` / `HEVC (AMF Direct)`).
-     - Interne BT.709-Studio-GPU-Konvertierung in eine 3-Slot-AMF-Surface-Ring-Pipeline (`AllocSurface` + direkter `VideoProcessorOutputView`-Write mit `CopyResource`-Fallback), `ULTRA_LOW_LATENCY`-Usage, `0` B-Frames und sauberem MF-/CPU-Fallback falls `amfrt64.dll` fehlt.
-  2. **HEVC (H.265) Hardware-Encode & -Decode (`Protocol.h`, `AmfEncoder.*`, `CodecH264.*`, `SenderEngine`, `ReceiverEngine`, `sender/main.cpp`):**
-     - End-to-End `CodecType::HEVC` (`3`) über `AMFVideoEncoderHW_HEVC` (bzw. MF HEVC HW/SW MFT Fallback) am Surface und `MFVideoFormat_HEVC` / NVDEC Direct (`PSMainNv12`) am PC.
-     - Im Sender-Dropdown direkt live auswählbar & per `ReconfigureStream` im laufenden Betrieb umschaltbar (`0 = H.264 Low-Latency`, `1 = HEVC (H.265) Low-Latency`, `2 = Delta Lossless (4:4:4)`).
-  3. **D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer.*`, `SenderEngine.cpp`):**
-     - `cs_5_0`-Compute-Shader vergleicht aktuellen vs. vorherigen GPU-Frame in `64×64`-Tiles direkt auf der Radeon iGPU und liest nur ~3,6 KB Tile-Flags zurück (`0` Byte Pixel-Readback bei unverändertem Bild, nur Bounding-Box-Readback per `CopySubresourceRegion` bei Änderungen).
-  4. **DLT3 QOI-Lossless-Hybrid (`CodecDelta.*`):**
-     - Reiner C++20-**QOI**-BGRA-Encoder/-Decoder im `DLT3`-Format (`kRectEncodingQoi`) für Keyframes und größere Bildwechsel (`>= 20 %` Dirty-Area ohne Fast-Motion) sowie weiterhin `XOR+LZ4` (`DLT2`) für kleine UI-Diffs — voll abwärtskompatibel zu `DLT1`/`DLT2`.
-  5. **Video über UDP + Reed-Solomon FEC (`UdpVideoFec.*`, `NetSocket.*`, `Protocol.h`, `SenderEngine`, `ReceiverEngine`, `receiver/main.cpp`):**
-     - **Protokoll `v3` (`kProtocolVersion = 3`):** Frames `<= 256 KB` werden als `UdpVideoShardHeader`-Pakete (`kPortVideoUdpBase = 48216..48217`) mit systematischer GF(2⁸)-Cauchy-Reed-Solomon-FEC (`UdpVideoFecSender`/`Receiver`) über UDP gesendet; verlorene Shards werden ohne TCP-Head-of-Line-Blocking rekonstruiert, mit automatischem TCP-Fallback (`> 256 KB` / Fehler) und Keyframe-Recovery bei unrecoverable Loss. Windows-Firewall-Regel am Receiver erlaubt nun zusätzlich UDP `48216,48217`.
+- **Phase:** `Stream-Timeout-Fix & Automatischer Stream-Reconnect bei aktivem Control-Channel (Release v1.5.0.54)`
+- **Status:** Im grünen CI-Build **Run `45411535572`** (Commit `76a42bc`, **GitHub Release `v1.5.0.54`**, **21/21 Test-Suites PASS**, INF/CAT OK) ist das unerwartete Schließen des Streamfensters nach `> 1,5 s` Timeout bei aktivem Control-Channel vollständig behoben:
+  1. **Erhöhte TCP-Stream- & Control-Timeouts (`SenderEngine.cpp`, `ReceiverEngine.cpp`):**
+     - `SO_SNDTIMEO`/`SO_RCVTIMEO` auf den TCP-Stream-Sockets (`48212–48213`) von `1500 ms` auf **`6000 ms`** angehoben (aligned mit dem 8-Sekunden-Heartbeat des Control-Channels); Post-Handshake-Control-Timeouts (`48211`) auf **`4000 ms`** erhöht, um auch größere `ClipboardSync`-Payloads und kurze Wi-Fi-/Capture-Hänger ohne Verbindungsabbruch abzufangen.
+  2. **Nahtloser Stream-Auto-Reconnect am Receiver (`ReceiverEngine.h/.cpp`):**
+     - `StreamReceiverWorker` speichert `expectedPeerIp` und validiert Initial-/Reconnect-Accepts gegen den authentifizierten Sender.
+     - Bei Stream-Abbruch, Timeout (`RecvPacket`-Fehler), `POLLERR|POLLHUP` oder `StreamEnd` während laufender Control-Session (`!m_stop && !m_sessionStop && !w->stop`) bleibt das `D3D11Renderer`-Streamfenster **geöffnet** (`renderer.Destroy()` wird nicht mehr ausgelöst). `recvDecodeThread` schließt den alten Stream-Socket sauber (`sockLifecycleMutex`), setzt `H264Decoder`, `DeltaDecoder`, `UdpVideoFecReceiver` und `lastDecodedFrameIdx` zurück, leert veraltete UDP-Shards, öffnet `w->listenSock` erneut, nimmt den Reconnect entgegen und fordert sofort per `RequestKeyframe` ein frisches Keyframe an.
+  3. **Nahtloser Stream-Auto-Reconnect & Peer-Close-Erkennung am Sender (`NetSocket.*`, `SenderEngine.cpp`):**
+     - `TcpSocket::IsPeerClosed()` erkennt per non-blocking `WSAPoll` + `MSG_PEEK` auch im Leerlauf einen geschlossenen Peer-Stream-Socket (`wait_for(250 ms)` in `asyncSendThread`).
+     - Bei `sendFailed` während aktivem Control-Channel beendet `RunStreamWorker` `asyncSendThread` sauber (ohne irreführendes `StreamEnd`), verbindet den Stream-Socket automatisch neu (`sock.Connect` Loop mit `500 ms` Connect-Timeout), erzwingt ein frisches Keyframe (`forceKeyframe = true`, `sentInitialFrame = false`, Delta-Reset) und setzt das Streaming fort; bei echtem Shutdown verhindert `inBlockingSend` + sofortiges `sock.Close()` ein Blockieren von `Disconnect()`.
+  4. **Basis aus `v1.5.0.53` (Protokoll `v3`) weiter aktiv:**
+     - Direct AMD AMF (`amfrt64.dll` H.264/HEVC), D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer`), `DLT3` QOI-Lossless-Hybrid & UDP Video + GF(2⁸)-Cauchy-RS-FEC (`48216–48217`).
 - **Zurückgestellte Feature-Ideen (Deferred Feature Backlog — explizit vorgemerkt, NICHT in diesem Release):**
   1. **10-Bit HDR End-to-End Streaming** (8-Bit HEVC HW-Encode/-Decode ist seit `v1.5.0.53` aktiv).
   2. **WASAPI Loopback Audio-Streaming** (System-Ton Surface -> PC).
@@ -27,10 +25,8 @@
   4. **In-Stream Quick-HUD Overlay** (weitere Erweiterungen; Basis-HUD bereits aktiv).
   5. **Desktop-Profile** (gespeicherte Presets für Home/Office/Gaming inkl. Auflösungs-, Codec-, KVM- & Power-Kombinationen).
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45221116035`), `infverif.exe` & `Inf2Cat.exe` OK, GitHub Release **`v1.5.0.53`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`).
-- **Offener Diagnose-Punkt (Fix bewusst noch NICHT umgesetzt, wartet auf User-Go):**
-  - *Unerwartetes Schließen des Streamfensters trotz „Verbunden“-Status:* `SenderEngine.cpp:1200` und `ReceiverEngine.cpp:952` setzen `1500 ms` `SO_SNDTIMEO`/`SO_RCVTIMEO` auf dem TCP-Stream-Socket (`48212–48213`); bei kurzem Wi-Fi/Capture-Hänger > 1,5 s beendet `RunStreamWorker` per `MsgType::StreamEnd`, `ReceiverEngine` schließt `renderer.Destroy()`, während `ControlLoop` weiterläuft.
-- **Next Step:** Auf **PC** und **Surface** auf **`v1.5.0.53`** aktualisieren (**Protokoll v3**, Firewall am PC ggf. einmal über den Firewall-Button aktualisieren um UDP `48216–48217` freizugeben), **Direct AMF / HEVC / GPU-Delta / QOI / UDP+FEC** im Alltag testen und auf User-Freigabe warten, ob der Stream-Timeout-Auto-Reconnect-Fix umgesetzt werden soll.
+  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45411535572`), `infverif.exe` & `Inf2Cat.exe` OK, GitHub Release **`v1.5.0.54`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`, inkl. erweitertem `TestLoopbackNetworking` für `IsPeerClosed()` & Same-Port-Reconnect).
+- **Next Step:** Auf **PC** und **Surface** auf **`v1.5.0.54`** aktualisieren und die Stream-Stabilität bei kurzen Wi-Fi-/Capture-Aussetzern (> 1,5 s) im Alltag verifizieren.
 
 ---
 
@@ -130,3 +126,4 @@
 | 2026-11-19 | H.264-Grünstich-Flacker-Fix | Cross-Codec-`DeltaLossless`-Settle (`h264NeedsSettle` nach 150 ms) im H.264-Modus in `SenderEngine::RunStreamWorker` entfernt; H.264 bleibt konsistent im NV12-Pfad ohne 1-2-LSB-YUV/RGB-Grünstich-Sprünge bei jedem neuen Frame (`e30ba0d`, Run `44634411677`, Release `v1.5.0.49`) |
 | 2026-11-23 | Pipeline-Latenz- & Delta-Unschärfe-Fix | `SenderEngine`/`ReceiverEngine`: TCP-Puffer auf `64 KB` / `128 KB` gestrafft, Dual-Monitor-Bitraten-Split (`60%/40%`) & `60 FPS` Auto-Cap, adaptives Encode/Send-Pacing + schnelleres ABR (`10 ms`, Floor `8 Mbit/s`), non-blocking Cursor-Shape-Queue, Burst-Drain-Coalescing & partielles `QueueCpuFrame`; `CodecH264`: 1.5-Frame-VBV & `Flush()` nach `VideoProcessorBlt`; `CodecDelta`/`DxgiCapture`: `O(tiles)`-Grid-Run-Coalescing, 16-KB-L1-LZ4-Hash, `CopyFrameToCpuRegions`, Sustained-Only-2×2 & nicht-abbrechendes Settle (`3cc0af9`, Run `45200582324`, Release `v1.5.0.50`) |
 | 2026-11-23 | Direct AMF (`amfrt64.dll`), HEVC (H.265), GPU Compute Delta, `DLT3` QOI & UDP+RS-FEC | `AmfMinimal.h` / `AmfEncoder.*` direkt auf `amfrt64.dll`; `CodecH264` + UI + `ReceiverEngine` für `CodecType::HEVC`; `GpuDeltaAnalyzer.*` (`cs_5_0` 64×64 Tile Diff + Bounding-Box-Readback); `CodecDelta` `DLT3` QOI-Lossless-Hybrid; `UdpVideoFec.*` + `Protocol v3` UDP `48216–48217` RS-FEC mit TCP-Fallback & Firewall-Update (`7c2d6db`, Run `45221116035`, Release `v1.5.0.53`, 21/21 Tests PASS) |
+| 2026-11-24 | Stream-Timeout- & Auto-Reconnect-Fix | TCP-Stream-Timeouts (`48212–48213`) auf `6000 ms` und Post-Handshake-Control-Timeouts (`48211`) auf `4000 ms` angehoben; `NetSocket::IsPeerClosed()`, automatischer Stream-Socket-Reconnect in `SenderEngine::RunStreamWorker` & `ReceiverEngine::RunStreamWorker` bei aktivem Control-Channel (Streamfenster/`D3D11Renderer` bleibt offen, Decoder/FEC-Reset + `RequestKeyframe`, `expectedPeerIp`-Prüfung, `inBlockingSend`-Shutdown-Guard) + `TestLoopbackNetworking`-Reconnect-Tests (`76a42bc`, Run `45411535572`, Release `v1.5.0.54`, 21/21 Tests PASS) |
