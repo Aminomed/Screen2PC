@@ -38,6 +38,8 @@ using PinPromptCallback = std::function<bool(const std::wstring& pcName,
                                            const std::wstring& message,
                                            std::string& outPin)>;
 
+using RemoteConnectCallback = std::function<void(const std::string& pcIp, const std::wstring& pcName)>;
+
 struct SenderConfig {
     std::string targetIp;
     uint16_t controlPort = kPortControl;
@@ -94,6 +96,16 @@ public:
 
     void SetConfigIniPath(const std::wstring& iniPath);
     void SetPinPromptCallback(PinPromptCallback cb);
+    void SetRemoteConnectCallback(RemoteConnectCallback cb);
+
+    void SetAllowRemoteConnect(bool enabled);
+    bool IsAllowRemoteConnect() const { return m_allowRemoteConnect.load(); }
+    bool StartRemoteConnectListener();
+    void StopRemoteConnectListener();
+
+    std::vector<TrustedDeviceEntry> GetTrustedPcs() const;
+    bool RemoveTrustedPcByKey(const std::wstring& key);
+    bool ClearAllTrustedPcs();
 
     bool Connect(const SenderConfig& cfg);
     void SignalStop();
@@ -150,6 +162,7 @@ private:
                               std::wstring& outError);
     void ControlLoop();
     void RealtimeUdpLoop();
+    void RemoteConnectListenerLoop();
     bool DispatchKvmMouse(const KvmMouseEvent& ev);
     void RunStreamWorker(StreamWorker* w);
 
@@ -162,6 +175,7 @@ private:
     mutable std::mutex m_cfgIoMutex;
     std::wstring m_configIniPath;
     PinPromptCallback m_pinPromptCb;
+    RemoteConnectCallback m_remoteConnectCb;
 
     mutable std::mutex m_virtualRectsMutex;
     std::vector<RECT> m_virtualOutputRects;
@@ -174,6 +188,8 @@ private:
     std::atomic<bool> m_remoteStopped{false};
     std::atomic<bool> m_clipboardEnabled{true};
     std::atomic<bool> m_kvmEnabled{true};
+    std::atomic<bool> m_allowRemoteConnect{true};
+    std::atomic<bool> m_remoteListenerStop{false};
     std::atomic<bool> m_createdVirtualDisplays{false};
     mutable std::atomic<bool> m_cachedDriverActive{false};
     mutable std::atomic<ULONGLONG> m_lastDriverCheckMs{0};
@@ -183,6 +199,9 @@ private:
     std::thread m_controlThread;
     UdpSocket m_realtimeUdpSock;
     std::thread m_realtimeUdpThread;
+    std::mutex m_remoteListenerMutex;
+    UdpSocket m_remoteConnectSock;
+    std::thread m_remoteConnectThread;
     std::atomic<uint32_t> m_cursorUdpSeq{0};
     std::atomic<uint32_t> m_lastMouseMoveSeq{0};
     std::atomic<uint32_t> m_lastMouseBtnSeq{0};

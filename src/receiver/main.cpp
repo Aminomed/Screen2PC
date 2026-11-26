@@ -47,7 +47,9 @@ constexpr UINT WM_UPDATE_DL_DONE    = WM_APP + 12;
 constexpr UINT WM_DISCONNECT_DONE   = WM_APP + 13;
 constexpr UINT WM_PIN_SHOW          = WM_APP + 14;
 constexpr UINT WM_PIN_DISMISS       = WM_APP + 15;
-constexpr UINT WM_VERSION_MISMATCH  = WM_APP + 16;
+constexpr UINT WM_VERSION_MISMATCH    = WM_APP + 16;
+constexpr UINT WM_REMOTE_PROBE_DONE   = WM_APP + 17;
+constexpr UINT WM_REMOTE_CONNECT_DONE = WM_APP + 18;
 
 constexpr UINT_PTR TIMER_TELEMETRY  = 1;
 constexpr UINT_PTR TIMER_TRAY_RETRY = 2;
@@ -84,15 +86,21 @@ constexpr int IDC_DROP_SUB          = 229;
 constexpr int IDC_CHK_STREAM_HUD    = 230;
 constexpr int IDC_LBL_LANG          = 231;
 constexpr int IDC_LANG_COMBO        = 232;
+constexpr int IDC_LBL_REMOTE_LAPTOP = 233;
+constexpr int IDC_REMOTE_LAPTOP_COMBO = 234;
+constexpr int IDC_BTN_REMOTE_CONNECT  = 235;
+constexpr int IDC_BTN_REMOTE_SCAN     = 236;
 
 constexpr int IDC_TAB_OVERVIEW      = 240;
 constexpr int IDC_TAB_TRANSFER      = 241;
 constexpr int IDC_TAB_SETTINGS      = 242;
 
-constexpr int IDM_SHOW              = 3001;
-constexpr int IDM_EXIT              = 3002;
-constexpr int IDM_CHECK_UPDATE      = 3003;
-constexpr int IDM_SHOW_STREAMS      = 3004;
+constexpr int IDM_SHOW                = 3001;
+constexpr int IDM_EXIT                = 3002;
+constexpr int IDM_CHECK_UPDATE        = 3003;
+constexpr int IDM_SHOW_STREAMS        = 3004;
+constexpr int IDM_REMOTE_CONNECT_BASE = 3100;
+constexpr int kMaxTrayRemoteLaptops   = 4;
 
 // Color calibration window control IDs
 constexpr int IDC_CLR_LBL_MON       = 400;
@@ -187,19 +195,33 @@ UINT g_wmTaskbarCreated = 0;
 
 std::thread g_disconnThread;
 std::thread g_updateThread;
+std::thread g_remoteProbeThread;
+std::thread g_remoteConnectThread;
 std::atomic<bool> g_closing{false};
 std::atomic<bool> g_disconnBusy{false};
 std::atomic<bool> g_updateBusy{false};
+std::atomic<bool> g_remoteProbeBusy{false};
+std::atomic<bool> g_remoteConnectBusy{false};
 bool g_promptOpen = false;
 bool g_verPromptOpen = false;
 ULONGLONG g_lastVerPromptTick = 0;
 s2p::UpdateReleaseInfo g_pendingUpdate{};
+
+struct RemoteConnectDoneMsg {
+    s2p::RemoteConnectTriggerResult result;
+    bool fromTray = false;
+};
 
 uint32_t g_selectedColorMonitor = UINT32_MAX;
 bool g_colorPopulating = false;
 
 std::shared_ptr<s2p::PinPopupSession> g_activePinSession;
 std::vector<s2p::TrustedDeviceEntry> g_trustedCache;
+std::vector<s2p::TrustedDeviceEntry> g_remoteLaptops;
+std::vector<s2p::RemoteLaptopProbeResult> g_remoteProbeCache;
+std::wstring g_remoteStatusBanner;
+ULONGLONG g_remoteStatusUntilMs = 0;
+bool g_lastSessionActiveUi = false;
 uint32_t g_lastNotifiedBatchId = 0;
 
 bool IsToggleChecked(HWND hwnd, int id) {
@@ -224,6 +246,7 @@ bool IsReceiverCardControlId(int id) {
     switch (id) {
     case IDC_HERO_TITLE:
     case IDC_INFO_LABEL:
+    case IDC_LBL_REMOTE_LAPTOP:
     case IDC_LBL_MOUSE_SPEED:
     case IDC_VAL_MOUSE_SPEED:
     case IDC_LBL_SCROLL_SPEED:
@@ -250,6 +273,10 @@ void ApplyReceiverTabVisibility(HWND hwnd) {
     const bool t1 = (g_activeTab == 1);
     const bool t2 = (g_activeTab == 2);
 
+    vis(IDC_LBL_REMOTE_LAPTOP, t0);
+    vis(IDC_REMOTE_LAPTOP_COMBO, t0);
+    vis(IDC_BTN_REMOTE_CONNECT, t0);
+    vis(IDC_BTN_REMOTE_SCAN, t0);
     vis(IDC_CHK_FULLSCR, t0);
     vis(IDC_CHK_CLIPBOARD, t0);
     vis(IDC_CHK_KVM, t0);
@@ -290,6 +317,7 @@ void ApplyReceiverTabVisibility(HWND hwnd) {
 void ApplyReceiverTheme(HWND hwnd, bool dark) {
     g_theme.Init(dark);
     s2p::ui::ApplyWindowTheme(hwnd, dark);
+    s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_REMOTE_LAPTOP_COMBO), dark, L"DarkMode_CFD");
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_LANG_COMBO), dark, L"DarkMode_CFD");
     s2p::ui::ApplyChildTheme(GetDlgItem(hwnd, IDC_STATS_TEXT), dark);
     if (g_colorWnd && IsWindow(g_colorWnd)) s2p::ui::ApplyWindowTheme(g_colorWnd, dark);
@@ -355,6 +383,117 @@ bool AddTrayIcon(HWND hwnd) {
     }
     g_trayIconAdded = (Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE);
     return g_trayIconAdded;
+}
+
+void RefreshRemoteLaptopCombo(HWND hwnd) {
+    if (!hwnd || !g_engine) return;
+    HWND cb = GetDlgItem(hwnd, IDC_REMOTE_LAPTOP_COMBO);
+    if (!cb) return;
+
+    std::wstring prevKey;
+    LRESULT prevSel = SendMessageW(cb, CB_GETCURSEL, 0, 0);
+    if (prevSel >= 0 && static_cast<size_t>(prevSel) < g_remoteLaptops.size()) {
+        prevKey = g_remoteLaptops[prevSel].key;
+    }
+
+    g_remoteLaptops = g_engine->GetTrustedDevices();
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+
+    using s2p::lang::Tr;
+    if (g_remoteLaptops.empty()) {
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(
+            Tr(L"Noch kein gekoppelter Laptop", L"No paired laptop yet")));
+        SendMessageW(cb, CB_SETCURSEL, 0, 0);
+        s2p::ui::EnableDlgItemIfChanged(hwnd, IDC_BTN_REMOTE_CONNECT, FALSE);
+        return;
+    }
+
+    int restoreIdx = 0;
+    for (size_t i = 0; i < g_remoteLaptops.size(); ++i) {
+        const auto& dev = g_remoteLaptops[i];
+        if (!prevKey.empty() && _wcsicmp(dev.key.c_str(), prevKey.c_str()) == 0) {
+            restoreIdx = static_cast<int>(i);
+        }
+
+        const s2p::RemoteLaptopProbeResult* match = nullptr;
+        for (const auto& p : g_remoteProbeCache) {
+            if ((!dev.deviceIdHex.empty() && !p.deviceIdHex.empty() &&
+                 _wcsicmp(dev.deviceIdHex.c_str(), p.deviceIdHex.c_str()) == 0) ||
+                (!dev.macStr.empty() && !p.macStr.empty() &&
+                 _wcsicmp(dev.macStr.c_str(), p.macStr.c_str()) == 0) ||
+                (!dev.lastIp.empty() && _wcsicmp(dev.lastIp.c_str(), s2p::Utf8ToWide(p.ip).c_str()) == 0)) {
+                match = &p;
+                break;
+            }
+        }
+
+        std::wstring label = dev.name.empty() ? L"Laptop" : dev.name;
+        if (match) {
+            if (match->isConnected) {
+                label += Tr(L" [Verbunden]", L" [Connected]");
+            } else if (!match->allowRemoteConnect) {
+                label += Tr(L" [Online - Fernstart aus]", L" [Online - Remote off]");
+            } else if (!match->isTrusted) {
+                label += Tr(L" [Online - nicht freigegeben]", L" [Online - not trusted]");
+            } else {
+                label += L" [Online]";
+            }
+        } else if (!dev.lastIp.empty()) {
+            label += L" (" + dev.lastIp + L")";
+        }
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    }
+    SendMessageW(cb, CB_SETCURSEL, restoreIdx, 0);
+
+    bool sessActive = g_engine->GetStatus().sessionActive;
+    s2p::ui::EnableDlgItemIfChanged(hwnd, IDC_BTN_REMOTE_CONNECT,
+        (!sessActive && !g_remoteConnectBusy.load()) ? TRUE : FALSE);
+}
+
+void StartAsyncRemoteProbe() {
+    if (g_closing.load() || !g_engine) return;
+    if (g_remoteProbeBusy.exchange(true)) return;
+    if (g_hwnd) {
+        s2p::ui::EnableDlgItemIfChanged(g_hwnd, IDC_BTN_REMOTE_SCAN, FALSE);
+    }
+    if (g_remoteProbeThread.joinable()) g_remoteProbeThread.join();
+    g_remoteProbeThread = std::thread([]() {
+        auto* found = new std::vector<s2p::RemoteLaptopProbeResult>(g_engine->ProbeRemoteLaptops(650));
+        if (!g_closing.load() && g_hwnd) {
+            PostMessageW(g_hwnd, WM_REMOTE_PROBE_DONE, 0, reinterpret_cast<LPARAM>(found));
+        } else {
+            delete found;
+            g_remoteProbeBusy = false;
+        }
+    });
+}
+
+void StartAsyncRemoteConnect(const s2p::TrustedDeviceEntry& laptop, bool fromTray) {
+    if (g_closing.load() || !g_engine) return;
+    if (g_engine->GetStatus().sessionActive) return;
+    if (g_remoteConnectBusy.exchange(true)) return;
+
+    using s2p::lang::Tr;
+    g_remoteStatusBanner = Tr(L"Sende Verbindungsanfrage an ", L"Sending connect request to ") +
+                           (laptop.name.empty() ? L"Laptop" : laptop.name) + L"...";
+    g_remoteStatusUntilMs = GetTickCount64() + 8000;
+    if (g_hwnd) {
+        s2p::ui::EnableDlgItemIfChanged(g_hwnd, IDC_BTN_REMOTE_CONNECT, FALSE);
+        s2p::ui::SetDlgItemTextIfChanged(g_hwnd, IDC_BTN_REMOTE_CONNECT, Tr(L"Anfrage...", L"Connecting..."));
+    }
+
+    if (g_remoteConnectThread.joinable()) g_remoteConnectThread.join();
+    g_remoteConnectThread = std::thread([laptop, fromTray]() {
+        auto* msg = new RemoteConnectDoneMsg{};
+        msg->result = g_engine->RequestLaptopConnect(laptop, 1500);
+        msg->fromTray = fromTray;
+        if (!g_closing.load() && g_hwnd) {
+            PostMessageW(g_hwnd, WM_REMOTE_CONNECT_DONE, 0, reinterpret_cast<LPARAM>(msg));
+        } else {
+            delete msg;
+            g_remoteConnectBusy = false;
+        }
+    });
 }
 
 // ============================================================================
@@ -1372,14 +1511,25 @@ void UpdateUi() {
         SetToggleChecked(g_hwnd, IDC_CHK_KVM, kvmOn);
     }
 
+    if (st.sessionActive != g_lastSessionActiveUi) {
+        g_lastSessionActiveUi = st.sessionActive;
+        RefreshRemoteLaptopCombo(g_hwnd);
+    }
+    const bool canRemoteConnect = (!st.sessionActive && !g_remoteLaptops.empty() && !g_remoteConnectBusy.load());
+    s2p::ui::EnableDlgItemIfChanged(g_hwnd, IDC_BTN_REMOTE_CONNECT, canRemoteConnect ? TRUE : FALSE);
+
     std::wostringstream body;
     if (!st.sessionActive) {
-        body << L"Keine aktive Session. Starte Screen2PC.Sender.exe auf dem Laptop.\r\n"
+        if (!g_remoteStatusBanner.empty() && GetTickCount64() < g_remoteStatusUntilMs) {
+            body << L"[Remote-Verbindung] " << g_remoteStatusBanner << L"\r\n\r\n";
+        }
+        body << L"Keine aktive Session. Waehle oben einen Laptop oder starte Screen2PC.Sender.exe.\r\n"
              << L"Hinweis: 100 % User-Mode (kein Treiber, kein Test-Signing, Anti-Cheat-sicher).\r\n\r\n"
              << L"Letzte Log-Meldungen:\r\n";
         auto logs = s2p::Logger::Instance().GetRecentLines(5);
         for (const auto& l : logs) body << l << L"\r\n";
     } else {
+        g_remoteStatusBanner.clear();
         for (const auto& s : st.streams) {
             body << L"Display " << (s.monitorIndex + 1) << L" [" << s.width << L"x" << s.height << L"]  "
                  << s.codecName << L"  |  "
@@ -1393,7 +1543,7 @@ void UpdateUi() {
         body << L"Dateien: Gesendet " << st.fileStats.filesSent
              << L" | Empfangen " << st.fileStats.filesReceived << L"\r\n";
     }
-    SetDlgItemTextW(g_hwnd, IDC_STATS_TEXT, body.str().c_str());
+    s2p::ui::SetDlgItemTextIfChanged(g_hwnd, IDC_STATS_TEXT, body.str().c_str());
 }
 
 void OpenFirewallPortsElevated() {
@@ -1443,20 +1593,26 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
     mv(IDC_TAB_SETTINGS,    386, 180, 178, 32, g_boldFont);
 
     // Tab 0: Uebersicht
-    // Card 1: Schnellsteuerung (16, 222, 548, 168)
-    mv(IDC_CHK_FULLSCR,      30, 232, 520, 26);
-    mv(IDC_CHK_CLIPBOARD,    30, 261, 520, 26);
-    mv(IDC_CHK_KVM,          30, 290, 520, 26);
-    mv(IDC_LBL_MOUSE_SPEED,  30, 323, 164, 22, g_boldFont);
-    mv(IDC_TB_MOUSE_SPEED,  198, 321, 290, 26);
-    mv(IDC_VAL_MOUSE_SPEED, 492, 323,  58, 22, g_boldFont);
-    mv(IDC_LBL_SCROLL_SPEED, 30, 354, 164, 22, g_boldFont);
-    mv(IDC_TB_SCROLL_SPEED, 198, 352, 290, 26);
-    mv(IDC_VAL_SCROLL_SPEED,492, 354,  58, 22, g_boldFont);
+    // Card 0: Laptop verbinden (16, 222, 548, 58)
+    mv(IDC_LBL_REMOTE_LAPTOP,   30, 240,  62, 22, g_boldFont);
+    mv(IDC_REMOTE_LAPTOP_COMBO, 96, 238, 250, 180);
+    mv(IDC_BTN_REMOTE_CONNECT, 354, 237, 114, 28, g_boldFont);
+    mv(IDC_BTN_REMOTE_SCAN,    474, 237,  76, 28);
 
-    // Card 2: Live-Stream-Daten (16, 402, 548, 280)
-    mv(IDC_LBL_TELEMETRY,    30, 414, 520, 20, g_boldFont);
-    mv(IDC_STATS_TEXT,       28, 438, 524, 232, g_monoFont);
+    // Card 1: Schnellsteuerung (16, 290, 548, 166)
+    mv(IDC_CHK_FULLSCR,      30, 300, 520, 26);
+    mv(IDC_CHK_CLIPBOARD,    30, 328, 520, 26);
+    mv(IDC_CHK_KVM,          30, 356, 520, 26);
+    mv(IDC_LBL_MOUSE_SPEED,  30, 389, 164, 22, g_boldFont);
+    mv(IDC_TB_MOUSE_SPEED,  198, 387, 290, 26);
+    mv(IDC_VAL_MOUSE_SPEED, 492, 389,  58, 22, g_boldFont);
+    mv(IDC_LBL_SCROLL_SPEED, 30, 420, 164, 22, g_boldFont);
+    mv(IDC_TB_SCROLL_SPEED, 198, 418, 290, 26);
+    mv(IDC_VAL_SCROLL_SPEED,492, 420,  58, 22, g_boldFont);
+
+    // Card 2: Live-Stream-Daten (16, 466, 548, 216)
+    mv(IDC_LBL_TELEMETRY,    30, 478, 520, 20, g_boldFont);
+    mv(IDC_STATS_TEXT,       28, 502, 524, 168, g_monoFont);
 
     // Tab 1: Dateitransfer
     // Drop Zone Card (16, 222, 548, 146)
@@ -1498,6 +1654,13 @@ void ApplyReceiverLanguage(HWND hwnd) {
     SetDlgItemTextW(hwnd, IDC_TAB_TRANSFER,     Tr(L"Dateitransfer", L"File Transfer"));
     SetDlgItemTextW(hwnd, IDC_TAB_SETTINGS,     Tr(L"Einstellungen", L"Settings"));
 
+    SetDlgItemTextW(hwnd, IDC_LBL_REMOTE_LAPTOP,  Tr(L"Laptop:", L"Laptop:"));
+    SetDlgItemTextW(hwnd, IDC_BTN_REMOTE_CONNECT, g_remoteConnectBusy.load()
+                                                      ? Tr(L"Anfrage...", L"Connecting...")
+                                                      : Tr(L"Verbinden", L"Connect"));
+    SetDlgItemTextW(hwnd, IDC_BTN_REMOTE_SCAN,    Tr(L"Pruefen", L"Check"));
+    RefreshRemoteLaptopCombo(hwnd);
+
     SetDlgItemTextW(hwnd, IDC_CHK_FULLSCR,      Tr(L"Streams im randlosen Vollbild starten (F11)", L"Start streams in borderless fullscreen (F11)"));
     SetDlgItemTextW(hwnd, IDC_CHK_CLIPBOARD,    Tr(L"Geteilte Zwischenablage (Text & Bilder)", L"Shared Clipboard (Text & Images)"));
     SetDlgItemTextW(hwnd, IDC_CHK_KVM,          Tr(L"KVM: Maus & Tastatur an Laptop (Strg+Alt+K)", L"KVM: Mouse & Keyboard to Laptop (Ctrl+Alt+K)"));
@@ -1522,6 +1685,9 @@ void ApplyReceiverLanguage(HWND hwnd) {
     SetDlgItemTextW(hwnd, IDC_BTN_UPDATE,       DefaultUpdateButtonText().c_str());
 
     if (g_tooltip) {
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_BTN_REMOTE_CONNECT),
+            Tr(L"Fordert den ausgewaehlten Laptop auf, sich sofort mit diesem PC zu verbinden.",
+               L"Requests the selected laptop to immediately connect to this PC."));
         s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_FULLSCR),
             Tr(L"Oeffnet Streamfenster direkt im randlosen Vollbild (F11 zum Umschalten).",
                L"Opens stream windows directly in borderless fullscreen (F11 to toggle)."));
@@ -1558,6 +1724,12 @@ void CreateUiControls(HWND hwnd) {
     addCtrl(L"BUTTON", L"Uebersicht", BS_OWNERDRAW | WS_TABSTOP, IDC_TAB_OVERVIEW);
     addCtrl(L"BUTTON", L"Dateitransfer", BS_OWNERDRAW | WS_TABSTOP, IDC_TAB_TRANSFER);
     addCtrl(L"BUTTON", L"Einstellungen", BS_OWNERDRAW | WS_TABSTOP, IDC_TAB_SETTINGS);
+
+    // Tab 0: Uebersicht - Remote Laptop Connect
+    addCtrl(L"STATIC", L"Laptop:", SS_CENTERIMAGE, IDC_LBL_REMOTE_LAPTOP);
+    addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_REMOTE_LAPTOP_COMBO);
+    addCtrl(L"BUTTON", L"Verbinden", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_REMOTE_CONNECT);
+    addCtrl(L"BUTTON", L"Pruefen", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_REMOTE_SCAN);
 
     // Tab 0: Uebersicht
     HWND chk = addCtrl(L"BUTTON", L"Streams im randlosen Vollbild starten (F11)", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_FULLSCR);
@@ -1640,16 +1812,32 @@ void CreateUiControls(HWND hwnd) {
 }
 
 void ShowTrayMenu(HWND hwnd) {
+    using s2p::lang::Tr;
     POINT pt{};
     GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, IDM_SHOW, L"Statusfenster oeffnen");
+
+    if (g_engine && !g_engine->GetStatus().sessionActive) {
+        g_remoteLaptops = g_engine->GetTrustedDevices();
+        const int maxItems = static_cast<int>(std::min<size_t>(g_remoteLaptops.size(), kMaxTrayRemoteLaptops));
+        for (int i = 0; i < maxItems; ++i) {
+            std::wstring name = g_remoteLaptops[i].name.empty() ? L"Laptop" : g_remoteLaptops[i].name;
+            std::wstring label = Tr(L"Mit ", L"Connect to ") + name + Tr(L" verbinden", L"");
+            AppendMenuW(menu, MF_STRING | (g_remoteConnectBusy.load() ? MF_GRAYED : MF_ENABLED),
+                        static_cast<UINT_PTR>(IDM_REMOTE_CONNECT_BASE + i), label.c_str());
+        }
+        if (maxItems > 0) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+    }
+
+    AppendMenuW(menu, MF_STRING, IDM_SHOW, Tr(L"Statusfenster oeffnen", L"Open Status Window"));
     bool hasHidden = g_engine && g_engine->HasHiddenStreamWindows();
     AppendMenuW(menu, MF_STRING | (hasHidden ? MF_ENABLED : MF_GRAYED),
-                IDM_SHOW_STREAMS, L"Streamfenster wieder einblenden");
-    AppendMenuW(menu, MF_STRING, IDM_CHECK_UPDATE, L"Nach Updates suchen");
+                IDM_SHOW_STREAMS, Tr(L"Streamfenster wieder einblenden", L"Show Stream Windows"));
+    AppendMenuW(menu, MF_STRING, IDM_CHECK_UPDATE, Tr(L"Nach Updates suchen", L"Check for Updates"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Beenden");
+    AppendMenuW(menu, MF_STRING, IDM_EXIT, Tr(L"Beenden", L"Exit"));
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
@@ -1686,6 +1874,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         UpdateUi();
+        StartAsyncRemoteProbe();
         if (LoadBoolPref(L"AutoUpdateCheck", 1)) {
             StartAsyncUpdateCheck(false);
         }
@@ -1706,6 +1895,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ACTIVATE:
         if (LOWORD(wp) != WA_INACTIVE) {
             SetToggleChecked(hwnd, IDC_CHK_AUTOSTART, s2p::IsAutostartEnabled());
+            RefreshRemoteLaptopCombo(hwnd);
         }
         break;
 
@@ -1738,8 +1928,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                g_theme.ToneColor(g_heroTone), g_theme.bgCard);
 
         if (g_activeTab == 0) {
-            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 168), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 402, 548, 280), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 58), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 290, 548, 166), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 466, 548, 216), g_theme, g_currentDpi);
         } else if (g_activeTab == 1) {
             s2p::ui::DrawCard(hdc, scRect(16, 222, 548, 146), g_theme, g_currentDpi, true);
             s2p::ui::DrawCard(hdc, scRect(16, 380, 548, 134), g_theme, g_currentDpi);
@@ -1780,6 +1971,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s2p::ui::DrawModernButton(dis, g_theme,
                                       active ? s2p::ui::ButtonStyle::TabActive : s2p::ui::ButtonStyle::TabInactive,
                                       g_currentDpi);
+            return TRUE;
+        }
+        if (id == IDC_BTN_REMOTE_CONNECT) {
+            s2p::ui::DrawModernButton(dis, g_theme, s2p::ui::ButtonStyle::Primary, g_currentDpi);
             return TRUE;
         }
         if (id == IDC_BTN_DISCONN) {
@@ -1918,6 +2113,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 UpdateUi();
             }
             return 0;
+        case IDC_BTN_REMOTE_CONNECT: {
+            HWND cb = GetDlgItem(hwnd, IDC_REMOTE_LAPTOP_COMBO);
+            LRESULT sel = cb ? SendMessageW(cb, CB_GETCURSEL, 0, 0) : CB_ERR;
+            if (sel >= 0 && static_cast<size_t>(sel) < g_remoteLaptops.size()) {
+                StartAsyncRemoteConnect(g_remoteLaptops[sel], false);
+            }
+            return 0;
+        }
+        case IDC_BTN_REMOTE_SCAN:
+            StartAsyncRemoteProbe();
+            return 0;
         case IDC_BTN_FIREWALL:
             OpenFirewallPortsElevated();
             return 0;
@@ -1968,8 +2174,56 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_EXIT:
             DestroyWindow(hwnd);
             return 0;
+        default: {
+            const int cmdId = LOWORD(wp);
+            if (cmdId >= IDM_REMOTE_CONNECT_BASE && cmdId < IDM_REMOTE_CONNECT_BASE + kMaxTrayRemoteLaptops) {
+                size_t idx = static_cast<size_t>(cmdId - IDM_REMOTE_CONNECT_BASE);
+                if (idx < g_remoteLaptops.size()) {
+                    StartAsyncRemoteConnect(g_remoteLaptops[idx], true);
+                }
+                return 0;
+            }
+            break;
+        }
         }
         break;
+
+    case WM_REMOTE_PROBE_DONE: {
+        auto* found = reinterpret_cast<std::vector<s2p::RemoteLaptopProbeResult>*>(lp);
+        g_remoteProbeBusy = false;
+        s2p::ui::EnableDlgItemIfChanged(hwnd, IDC_BTN_REMOTE_SCAN, TRUE);
+        if (found) {
+            if (!g_closing.load()) {
+                g_remoteProbeCache = *found;
+                RefreshRemoteLaptopCombo(hwnd);
+            }
+            delete found;
+        }
+        return 0;
+    }
+
+    case WM_REMOTE_CONNECT_DONE: {
+        auto* msg = reinterpret_cast<RemoteConnectDoneMsg*>(lp);
+        g_remoteConnectBusy = false;
+        s2p::ui::SetDlgItemTextIfChanged(hwnd, IDC_BTN_REMOTE_CONNECT,
+                                         s2p::lang::Tr(L"Verbinden", L"Connect"));
+        if (msg && !g_closing.load()) {
+            g_remoteStatusBanner = msg->result.message;
+            g_remoteStatusUntilMs = GetTickCount64() + 12000;
+            if (msg->fromTray && !msg->result.accepted && !IsWindowVisible(hwnd)) {
+                g_nid.uFlags = NIF_INFO;
+                g_nid.dwInfoFlags = NIIF_WARNING;
+                wcscpy_s(g_nid.szInfoTitle, L"Screen2PC Remote-Verbindung");
+                wcsncpy_s(g_nid.szInfo, msg->result.message.c_str(), _TRUNCATE);
+                Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+                g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            }
+            RefreshRemoteLaptopCombo(hwnd);
+            UpdateUi();
+        }
+        delete msg;
+        return 0;
+    }
 
     case WM_DISCONNECT_DONE:
         UpdateUi();
@@ -2150,6 +2404,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_engine) g_engine->Stop();
         if (g_disconnThread.joinable()) g_disconnThread.join();
         if (g_updateThread.joinable()) g_updateThread.join();
+        if (g_remoteProbeThread.joinable()) g_remoteProbeThread.join();
+        if (g_remoteConnectThread.joinable()) g_remoteConnectThread.join();
         if (g_font) { DeleteObject(g_font); g_font = nullptr; }
         if (g_boldFont) { DeleteObject(g_boldFont); g_boldFont = nullptr; }
         if (g_titleFont) { DeleteObject(g_titleFont); g_titleFont = nullptr; }

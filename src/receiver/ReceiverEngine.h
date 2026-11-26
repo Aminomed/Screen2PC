@@ -69,6 +69,26 @@ struct ReceiverStatus {
     FileTransferStats fileStats;
 };
 
+struct RemoteLaptopProbeResult {
+    std::string ip;
+    std::wstring laptopName;
+    std::wstring macStr;
+    std::wstring deviceIdHex;
+    bool allowRemoteConnect = false;
+    bool isConnected = false;
+    bool isTrusted = false;
+    AppVersionTuple version{};
+};
+
+struct RemoteConnectTriggerResult {
+    bool responded = false;
+    bool accepted = false;
+    RemoteConnectStatus status = kRemoteConnectDisabled;
+    std::string laptopIp;
+    std::wstring laptopName;
+    std::wstring message;
+};
+
 class ReceiverEngine {
 public:
     using PinShowCallback = std::function<void(std::shared_ptr<PinPopupSession>)>;
@@ -91,6 +111,9 @@ public:
     std::vector<TrustedDeviceEntry> GetTrustedDevices() const;
     bool RemoveTrustedDeviceByKey(const std::wstring& key);
     bool ClearAllTrustedDevices();
+
+    std::vector<RemoteLaptopProbeResult> ProbeRemoteLaptops(uint32_t timeoutMs = 650) const;
+    RemoteConnectTriggerResult RequestLaptopConnect(const TrustedDeviceEntry& laptop, uint32_t timeoutMs = 1500) const;
 
     bool Start(bool startFullscreen = true);
     void Stop();

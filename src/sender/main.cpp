@@ -52,7 +52,8 @@ constexpr UINT WM_CONNECT_DONE      = WM_APP + 3;
 constexpr UINT WM_UPDATE_CHECK_DONE = WM_APP + 4;
 constexpr UINT WM_UPDATE_DL_DONE    = WM_APP + 5;
 constexpr UINT WM_SHOW_PIN_PROMPT   = WM_APP + 6;
-constexpr UINT WM_APP_DIM_DISMISSED = WM_APP + 7;
+constexpr UINT WM_APP_DIM_DISMISSED  = WM_APP + 7;
+constexpr UINT WM_REMOTE_CONNECT_REQ = WM_APP + 8;
 
 constexpr UINT_PTR TIMER_TELEMETRY  = 1;
 constexpr UINT_PTR TIMER_TRAY_RETRY = 2;
@@ -84,6 +85,8 @@ constexpr int IDC_BTN_SENDFOLDER    = 123;
 constexpr int IDC_FILE_PROGRESS     = 124;
 constexpr int IDC_BTN_CANCELFILE    = 125;
 constexpr int IDC_FILE_STATUS       = 126;
+constexpr int IDC_CHK_ALLOW_REMOTE  = 127;
+constexpr int IDC_BTN_TRUSTED_PCS   = 128;
 
 constexpr int IDC_LBL_PEERS         = 150;
 constexpr int IDC_LBL_IP            = 151;
@@ -105,15 +108,25 @@ constexpr int IDC_PIN_INFO          = 501;
 constexpr int IDC_PIN_STATUS        = 502;
 constexpr int IDC_PIN_EDIT          = 503;
 
+// Trusted PCs dialog controls
+constexpr int IDC_TPC_INFO          = 601;
+constexpr int IDC_TPC_LIST          = 602;
+constexpr int IDC_TPC_BTN_REMOVE    = 603;
+constexpr int IDC_TPC_BTN_CLEAR     = 604;
+constexpr int IDC_TPC_BTN_REFRESH   = 605;
+constexpr int IDC_TPC_BTN_CLOSE     = 606;
+
 constexpr int IDM_SHOW              = 2001;
 constexpr int IDM_TOGGLE            = 2002;
 constexpr int IDM_EXIT              = 2003;
 constexpr int IDM_CHECK_UPDATE      = 2004;
 
-constexpr int kBaseClientW = 540;
-constexpr int kBaseClientH = 660;
-constexpr int kPinBaseW    = 430;
-constexpr int kPinBaseH    = 244;
+constexpr int kBaseClientW    = 540;
+constexpr int kBaseClientH    = 660;
+constexpr int kPinBaseW       = 430;
+constexpr int kPinBaseH       = 244;
+constexpr int kTrustedPcBaseW = 590;
+constexpr int kTrustedPcBaseH = 380;
 
 constexpr DWORD kReconnectBackoffsMs[] = { 2000, 5000, 10000, 20000 };
 
@@ -125,6 +138,11 @@ struct UpdateCheckResult {
 struct UpdateDownloadResult {
     bool ok = false;
     std::wstring error;
+};
+
+struct RemoteConnectRequestMsg {
+    std::string pcIp;
+    std::wstring pcName;
 };
 
 struct SenderPinRequest {
@@ -144,6 +162,7 @@ struct SenderPinRequest {
 s2p::SenderEngine* g_engine = nullptr;
 HWND g_hwnd = nullptr;
 HWND g_pinPromptWnd = nullptr;
+HWND g_trustedPcsWnd = nullptr;
 HWND g_tooltip = nullptr;
 HFONT g_font = nullptr;
 HFONT g_boldFont = nullptr;
@@ -151,8 +170,10 @@ HFONT g_titleFont = nullptr;
 HFONT g_monoFont = nullptr;
 HFONT g_pinFont = nullptr;
 HFONT g_pinBigFont = nullptr;
+HFONT g_trustedPcsFont = nullptr;
 UINT g_currentDpi = 96;
 UINT g_pinDpi = 96;
+std::vector<s2p::TrustedDeviceEntry> g_trustedPcsCache;
 
 s2p::ui::ThemePalette g_theme;
 s2p::ui::StatusTone g_heroTone = s2p::ui::StatusTone::Neutral;
@@ -274,14 +295,48 @@ void ApplySenderTabVisibility(HWND hwnd) {
     vis(IDC_CHK_LID_BYPASS, t2);
     vis(IDC_CHK_DIM_SURFACE, t2);
     vis(IDC_CHK_AUTOUPDATE, t2);
+    vis(IDC_CHK_ALLOW_REMOTE, t2);
     vis(IDC_LBL_LANG, t2);
     vis(IDC_LANG_COMBO, t2);
+    vis(IDC_BTN_TRUSTED_PCS, t2);
     vis(IDC_BTN_UPDATE, t2);
 
     InvalidateRect(GetDlgItem(hwnd, IDC_TAB_CONNECT), nullptr, FALSE);
     InvalidateRect(GetDlgItem(hwnd, IDC_TAB_TRANSFER), nullptr, FALSE);
     InvalidateRect(GetDlgItem(hwnd, IDC_TAB_SETTINGS), nullptr, FALSE);
     InvalidateRect(hwnd, nullptr, TRUE);
+}
+
+void EnsureSenderRemoteFirewallRuleAsync() {
+    static std::atomic<bool> s_fwInFlight{false};
+    if (s_fwInFlight.exchange(true)) return;
+    std::thread([]() {
+        auto runHidden = [](const std::wstring& cmdLine) -> DWORD {
+            std::vector<wchar_t> buf(cmdLine.begin(), cmdLine.end());
+            buf.push_back(L'\0');
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION pi{};
+            if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                return 1;
+            }
+            WaitForSingleObject(pi.hProcess, 5000);
+            DWORD code = 1;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return code;
+        };
+
+        if (runHidden(L"netsh.exe advfirewall firewall show rule name=\"Screen2PC Sender Remote\"") != 0) {
+            runHidden(L"netsh.exe advfirewall firewall add rule name=\"Screen2PC Sender Remote\" dir=in action=allow protocol=UDP localport=" +
+                      std::to_wstring(s2p::kPortRemoteConnect));
+        }
+        s_fwInFlight.store(false);
+    }).detach();
 }
 
 void ApplySenderTheme(HWND hwnd, bool dark) {
@@ -997,20 +1052,22 @@ void LayoutMainControls(HWND hwnd, UINT dpi) {
     mv(IDC_FILE_STATUS,      30, 430, 480, 20);
 
     // Tab 2: Einstellungen
-    // Card: Verhalten & Energie (16, 178, 508, 272)
-    mv(IDC_CHK_CLIPBOARD,    30, 192, 480, 28);
-    mv(IDC_CHK_KVM,          30, 223, 480, 28);
-    mv(IDC_CHK_AUTOSTART,    30, 254, 480, 28);
-    mv(IDC_CHK_AUTOCONNECT,  30, 285, 480, 28);
-    mv(IDC_CHK_AUTORECONNECT,30, 316, 480, 28);
-    mv(IDC_CHK_LID_BYPASS,   30, 347, 480, 28);
-    mv(IDC_CHK_DIM_SURFACE,  30, 378, 480, 28);
-    mv(IDC_CHK_AUTOUPDATE,   30, 409, 480, 28);
+    // Card: Verhalten & Energie (16, 178, 508, 286)
+    mv(IDC_CHK_CLIPBOARD,    30, 188, 480, 26);
+    mv(IDC_CHK_KVM,          30, 218, 480, 26);
+    mv(IDC_CHK_AUTOSTART,    30, 248, 480, 26);
+    mv(IDC_CHK_AUTOCONNECT,  30, 278, 480, 26);
+    mv(IDC_CHK_AUTORECONNECT,30, 308, 480, 26);
+    mv(IDC_CHK_LID_BYPASS,   30, 338, 480, 26);
+    mv(IDC_CHK_DIM_SURFACE,  30, 368, 480, 26);
+    mv(IDC_CHK_AUTOUPDATE,   30, 398, 480, 26);
+    mv(IDC_CHK_ALLOW_REMOTE, 30, 428, 480, 26);
 
-    // Card: Updates & Sprache (16, 462, 508, 98)
-    mv(IDC_LBL_LANG,         30, 476, 150, 22, g_boldFont);
-    mv(IDC_LANG_COMBO,      186, 473, 324, 140);
-    mv(IDC_BTN_UPDATE,       30, 512, 480, 32);
+    // Card: Updates, Vertrauen & Sprache (16, 476, 508, 148)
+    mv(IDC_LBL_LANG,         30, 490, 150, 22, g_boldFont);
+    mv(IDC_LANG_COMBO,      186, 487, 324, 140);
+    mv(IDC_BTN_TRUSTED_PCS,  30, 530, 480, 32);
+    mv(IDC_BTN_UPDATE,       30, 572, 480, 32);
 }
 
 void ApplySenderLanguage(HWND hwnd) {
@@ -1044,7 +1101,9 @@ void ApplySenderLanguage(HWND hwnd) {
     SetDlgItemTextW(hwnd, IDC_CHK_LID_BYPASS,    Tr(L"Standby beim Zuklappen pausieren", L"Pause sleep on lid close"));
     SetDlgItemTextW(hwnd, IDC_CHK_DIM_SURFACE,   Tr(L"Laptop-Bildschirm abdunkeln (ESC/Doppelklick)", L"Dim laptop screen (ESC/Double-click)"));
     SetDlgItemTextW(hwnd, IDC_CHK_AUTOUPDATE,    Tr(L"Beim Start auf GitHub-Updates pruefen", L"Check GitHub updates on startup"));
+    SetDlgItemTextW(hwnd, IDC_CHK_ALLOW_REMOTE,  Tr(L"Verbindungen von vertrauten PCs erlauben", L"Allow connections from trusted PCs"));
     SetDlgItemTextW(hwnd, IDC_LBL_LANG,          Tr(L"Sprache / Language:", L"Language / Sprache:"));
+    SetDlgItemTextW(hwnd, IDC_BTN_TRUSTED_PCS,   Tr(L"Vertraute PCs verwalten...", L"Manage Trusted PCs..."));
     SetDlgItemTextW(hwnd, IDC_BTN_UPDATE,        DefaultUpdateButtonText().c_str());
 
     if (g_tooltip) {
@@ -1060,6 +1119,9 @@ void ApplySenderLanguage(HWND hwnd) {
         s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_DIM_SURFACE),
             Tr(L"Schaltet die physischen Laptop-Displays schwarz, solange am PC gearbeitet wird.",
                L"Dims physical laptop displays black while working on the PC."));
+        s2p::ui::SetControlTooltip(g_tooltip, hwnd, GetDlgItem(hwnd, IDC_CHK_ALLOW_REMOTE),
+            Tr(L"Erlaubt bereits gekoppelten PCs, eine Verbindung zum Laptop per Klick am PC anzufordern (UDP 48218).",
+               L"Allows previously paired PCs to initiate a connection to this laptop directly from the PC (UDP 48218)."));
     }
     InvalidateRect(hwnd, nullptr, TRUE);
 }
@@ -1175,6 +1237,11 @@ void CreateUiControls(HWND hwnd) {
     HWND chkUpd = addCtrl(L"BUTTON", L"Beim Start auf GitHub-Updates pruefen", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_AUTOUPDATE);
     SetToggleChecked(hwnd, IDC_CHK_AUTOUPDATE, LoadSetting(L"AutoUpdateCheck", 1) != 0);
 
+    HWND chkRem = addCtrl(L"BUTTON", L"Verbindungen von vertrauten PCs erlauben", BS_OWNERDRAW | WS_TABSTOP, IDC_CHK_ALLOW_REMOTE);
+    bool allowRem = LoadSetting(L"AllowRemoteConnect", 1) != 0;
+    SetToggleChecked(hwnd, IDC_CHK_ALLOW_REMOTE, allowRem);
+    if (g_engine) g_engine->SetAllowRemoteConnect(allowRem);
+
     addCtrl(L"STATIC", L"Sprache / Language:", SS_CENTERIMAGE, IDC_LBL_LANG);
     HWND langCb = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, IDC_LANG_COMBO);
     SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto (Windows)"));
@@ -1182,6 +1249,7 @@ void CreateUiControls(HWND hwnd) {
     SendMessageW(langCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"English"));
     SendMessageW(langCb, CB_SETCURSEL, s2p::lang::GetLangMode(), 0);
 
+    addCtrl(L"BUTTON", L"Vertraute PCs verwalten...", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_TRUSTED_PCS);
     addCtrl(L"BUTTON", DefaultUpdateButtonText().c_str(), BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_UPDATE);
 
     g_tooltip = s2p::ui::CreateTooltipWindow(hwnd);
@@ -1467,6 +1535,222 @@ void CancelActivePinPrompt() {
     }
 }
 
+void PopulateTrustedPcsList() {
+    if (!g_trustedPcsWnd || !IsWindow(g_trustedPcsWnd) || !g_engine) return;
+    HWND lv = GetDlgItem(g_trustedPcsWnd, IDC_TPC_LIST);
+    if (!lv) return;
+
+    ListView_DeleteAllItems(lv);
+    g_trustedPcsCache = g_engine->GetTrustedPcs();
+
+    for (size_t i = 0; i < g_trustedPcsCache.size(); ++i) {
+        const auto& e = g_trustedPcsCache[i];
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = static_cast<int>(i);
+        item.pszText = const_cast<LPWSTR>(e.name.c_str());
+        ListView_InsertItem(lv, &item);
+
+        std::wstring macOrId = !e.macStr.empty() ? e.macStr : (L"ID:" + e.deviceIdHex.substr(0, 12));
+        ListView_SetItemText(lv, static_cast<int>(i), 1, const_cast<LPWSTR>(macOrId.c_str()));
+        ListView_SetItemText(lv, static_cast<int>(i), 2, const_cast<LPWSTR>(e.lastIp.c_str()));
+        ListView_SetItemText(lv, static_cast<int>(i), 3, const_cast<LPWSTR>(e.addedUtc.c_str()));
+    }
+
+    using s2p::lang::Tr;
+    std::wstring info = g_trustedPcsCache.empty()
+        ? Tr(L"Noch keine vertrauten PCs gespeichert. Nach der ersten erfolgreichen Verbindung erscheint der PC automatisch hier.",
+             L"No trusted PCs saved yet. After the first successful connection, the PC will appear here automatically.")
+        : (Tr(L"Gespeicherte PCs (", L"Saved PCs (") + std::to_wstring(g_trustedPcsCache.size()) +
+           Tr(L"): Duermfen Verbindungen zum Laptop per Klick am PC starten.",
+              L"): Allowed to initiate connections to this laptop remotely."));
+    // Fix German typo cleanly
+    if (!g_trustedPcsCache.empty()) {
+        info = Tr(L"Gespeicherte PCs (", L"Saved PCs (") + std::to_wstring(g_trustedPcsCache.size()) +
+               Tr(L"): Duerfen Verbindungen zum Laptop per Klick am PC starten.",
+                  L"): Allowed to initiate connections to this laptop remotely.");
+    }
+    SetDlgItemTextW(g_trustedPcsWnd, IDC_TPC_INFO, info.c_str());
+}
+
+void LayoutTrustedPcsControls(HWND hwnd, UINT dpi) {
+    if (g_trustedPcsFont) DeleteObject(g_trustedPcsFont);
+    g_trustedPcsFont = CreateFontW(-DpiScale(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    auto mv = [&](int id, int x, int y, int w, int h) {
+        HWND c = GetDlgItem(hwnd, id);
+        if (!c) return;
+        MoveWindow(c, DpiScale(x, dpi), DpiScale(y, dpi), DpiScale(w, dpi), DpiScale(h, dpi), TRUE);
+        SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_trustedPcsFont), TRUE);
+    };
+    mv(IDC_TPC_INFO,        14,  12, 562,  36);
+    mv(IDC_TPC_LIST,        14,  54, 562, 266);
+    mv(IDC_TPC_BTN_REMOVE,  14, 332, 162,  34);
+    mv(IDC_TPC_BTN_CLEAR,  186, 332, 152,  34);
+    mv(IDC_TPC_BTN_REFRESH,348, 332, 110,  34);
+    mv(IDC_TPC_BTN_CLOSE,  468, 332, 108,  34);
+
+    HWND lv = GetDlgItem(hwnd, IDC_TPC_LIST);
+    if (lv) {
+        ListView_SetColumnWidth(lv, 0, DpiScale(150, dpi));
+        ListView_SetColumnWidth(lv, 1, DpiScale(150, dpi));
+        ListView_SetColumnWidth(lv, 2, DpiScale(116, dpi));
+        ListView_SetColumnWidth(lv, 3, DpiScale(138, dpi));
+    }
+}
+
+LRESULT CALLBACK TrustedPcsWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    using s2p::lang::Tr;
+    switch (msg) {
+    case WM_CREATE: {
+        auto addCtrl = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id) -> HWND {
+            return CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                   0, 0, 10, 10, hwnd,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   GetModuleHandleW(nullptr), nullptr);
+        };
+        addCtrl(L"STATIC", L"", 0, IDC_TPC_INFO);
+        HWND lv = addCtrl(WC_LISTVIEWW, L"", WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, IDC_TPC_LIST);
+        ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+
+        auto addCol = [&](int idx, const wchar_t* title, int width) {
+            LVCOLUMNW col{};
+            col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+            col.pszText = const_cast<LPWSTR>(title);
+            col.cx = width;
+            col.iSubItem = idx;
+            ListView_InsertColumn(lv, idx, &col);
+        };
+        addCol(0, Tr(L"PC-Name", L"PC Name"), 150);
+        addCol(1, L"MAC / ID", 150);
+        addCol(2, Tr(L"Letzte IP", L"Last IP"), 116);
+        addCol(3, Tr(L"Gespeichert (UTC)", L"Saved (UTC)"), 138);
+
+        addCtrl(L"BUTTON", Tr(L"Auswahl entfernen", L"Remove Selected"), WS_TABSTOP, IDC_TPC_BTN_REMOVE);
+        addCtrl(L"BUTTON", Tr(L"Alle entfernen", L"Remove All"), WS_TABSTOP, IDC_TPC_BTN_CLEAR);
+        addCtrl(L"BUTTON", Tr(L"Aktualisieren", L"Refresh"), WS_TABSTOP, IDC_TPC_BTN_REFRESH);
+        addCtrl(L"BUTTON", Tr(L"Schliessen", L"Close"), WS_TABSTOP, IDC_TPC_BTN_CLOSE);
+
+        LayoutTrustedPcsControls(hwnd, GetWindowDpiSafe(hwnd));
+        s2p::ui::ApplyWindowTheme(hwnd, g_theme.dark);
+        s2p::ui::ApplyChildTheme(lv, g_theme.dark);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        RECT* suggested = reinterpret_cast<RECT*>(lp);
+        if (suggested) {
+            SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        LayoutTrustedPcsControls(hwnd, HIWORD(wp));
+        return 0;
+    }
+
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        if (g_theme.brushWindow) {
+            FillRect(reinterpret_cast<HDC>(wp), &rc, g_theme.brushWindow);
+            return 1;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORDLG:
+        return s2p::ui::HandleCtlColor(msg, wp, g_theme, false);
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_TPC_BTN_REMOVE: {
+            HWND lv = GetDlgItem(hwnd, IDC_TPC_LIST);
+            int sel = lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+            if (sel >= 0 && static_cast<size_t>(sel) < g_trustedPcsCache.size() && g_engine) {
+                g_engine->RemoveTrustedPcByKey(g_trustedPcsCache[sel].key);
+                PopulateTrustedPcsList();
+            }
+            return 0;
+        }
+        case IDC_TPC_BTN_CLEAR:
+            if (g_engine && !g_trustedPcsCache.empty()) {
+                if (MessageBoxW(hwnd,
+                                Tr(L"Alle vertrauten PCs wirklich entfernen?", L"Remove all trusted PCs?"),
+                                Tr(L"Vertraute PCs", L"Trusted PCs"),
+                                MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                    g_engine->ClearAllTrustedPcs();
+                    PopulateTrustedPcsList();
+                }
+            }
+            return 0;
+        case IDC_TPC_BTN_REFRESH:
+            PopulateTrustedPcsList();
+            return 0;
+        case IDC_TPC_BTN_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        if (g_trustedPcsFont) {
+            DeleteObject(g_trustedPcsFont);
+            g_trustedPcsFont = nullptr;
+        }
+        g_trustedPcsWnd = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void OpenTrustedPcsWindow(HWND parent) {
+    if (g_trustedPcsWnd && IsWindow(g_trustedPcsWnd)) {
+        PopulateTrustedPcsList();
+        ShowWindow(g_trustedPcsWnd, SW_SHOW);
+        SetForegroundWindow(g_trustedPcsWnd);
+        return;
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TrustedPcsWndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hIcon = s2p::LoadAppLargeIcon();
+        wc.hIconSm = s2p::LoadAppSmallIcon();
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"Screen2PCTrustedPcsWnd";
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    const UINT dpi = GetWindowDpiSafe(parent);
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT wr{ 0, 0, DpiScale(kTrustedPcBaseW, dpi), DpiScale(kTrustedPcBaseH, dpi) };
+    AdjustWindowRectExForDpi(&wr, style, FALSE, 0, dpi);
+
+    g_trustedPcsWnd = CreateWindowExW(
+        0, L"Screen2PCTrustedPcsWnd",
+        s2p::lang::Tr(L"Screen2PC \u2014 Vertraute PCs (Laptop)", L"Screen2PC \u2014 Trusted PCs (Laptop)"),
+        style, CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+        parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+    if (g_trustedPcsWnd) {
+        PopulateTrustedPcsList();
+        ShowWindow(g_trustedPcsWnd, SW_SHOW);
+        UpdateWindow(g_trustedPcsWnd);
+    }
+}
+
 // ============================================================================
 // Main window procedure
 // ============================================================================
@@ -1564,8 +1848,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s2p::ui::DrawCard(hdc, scRect(16, 178, 508, 146), g_theme, g_currentDpi, true);
             s2p::ui::DrawCard(hdc, scRect(16, 336, 508, 134), g_theme, g_currentDpi);
         } else if (g_activeTab == 2) {
-            s2p::ui::DrawCard(hdc, scRect(16, 178, 508, 272), g_theme, g_currentDpi);
-            s2p::ui::DrawCard(hdc, scRect(16, 462, 508, 98), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 178, 508, 286), g_theme, g_currentDpi);
+            s2p::ui::DrawCard(hdc, scRect(16, 476, 508, 148), g_theme, g_currentDpi);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -1611,7 +1895,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (id == IDC_CHK_CLIPBOARD || id == IDC_CHK_KVM || id == IDC_CHK_AUTOSTART ||
             id == IDC_CHK_AUTOCONNECT || id == IDC_CHK_AUTORECONNECT || id == IDC_CHK_LID_BYPASS ||
-            id == IDC_CHK_DIM_SURFACE || id == IDC_CHK_AUTOUPDATE) {
+            id == IDC_CHK_DIM_SURFACE || id == IDC_CHK_AUTOUPDATE || id == IDC_CHK_ALLOW_REMOTE) {
             s2p::ui::DrawToggleSwitch(dis, g_theme, IsToggleChecked(hwnd, id), g_currentDpi);
             return TRUE;
         }
@@ -1715,6 +1999,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SaveSetting(L"AutoUpdateCheck", checked ? 1 : 0);
             return 0;
         }
+        case IDC_CHK_ALLOW_REMOTE: {
+            bool checked = ToggleSwitch(hwnd, IDC_CHK_ALLOW_REMOTE);
+            SaveSetting(L"AllowRemoteConnect", checked ? 1 : 0);
+            if (g_engine) g_engine->SetAllowRemoteConnect(checked);
+            if (checked) EnsureSenderRemoteFirewallRuleAsync();
+            return 0;
+        }
+        case IDC_BTN_TRUSTED_PCS:
+            OpenTrustedPcsWindow(hwnd);
+            return 0;
         case IDC_BTN_UPDATE:
             if (g_pendingUpdate.valid && g_pendingUpdate.updateAvailable) {
                 PromptAndApplyUpdate(hwnd, g_pendingUpdate);
@@ -2020,6 +2314,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    case WM_REMOTE_CONNECT_REQ: {
+        auto* req = reinterpret_cast<RemoteConnectRequestMsg*>(lp);
+        if (req && !g_closing.load() && g_engine && !g_engine->IsConnected() && !g_connectBusy.load()) {
+            std::wstring ipW = s2p::Utf8ToWide(req->pcIp);
+            if (!ipW.empty()) {
+                SetDlgItemTextW(hwnd, IDC_IP_EDIT, ipW.c_str());
+                SaveLastIp(ipW);
+                StartConnectAttempt(ipW, false);
+            }
+        }
+        delete req;
+        return 0;
+    }
+
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
         return 0;
@@ -2042,9 +2350,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_dimOverlay.Hide(false);
         g_lidGuard.Restore(GetIniPath());
         CancelActivePinPrompt();
+        if (g_trustedPcsWnd && IsWindow(g_trustedPcsWnd)) {
+            DestroyWindow(g_trustedPcsWnd);
+            g_trustedPcsWnd = nullptr;
+        }
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         g_trayIconAdded = false;
-        if (g_engine) g_engine->SignalStop();
+        if (g_engine) {
+            g_engine->StopRemoteConnectListener();
+            g_engine->SignalStop();
+        }
         if (g_connectThread.joinable()) g_connectThread.join();
         if (g_scanThread.joinable()) g_scanThread.join();
         if (g_updateThread.joinable()) g_updateThread.join();
@@ -2099,7 +2414,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
 
     s2p::RefreshAutostartPathIfNeeded(s2p::kAutostartSenderValueName);
 
-    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
+    INITCOMMONCONTROLSEX icc{
+        sizeof(icc),
+        ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS | ICC_LISTVIEW_CLASSES
+    };
     InitCommonControlsEx(&icc);
 
     s2p::Logger::Instance().Init(L"Screen2PC_Sender.log");
@@ -2121,6 +2439,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     s2p::SenderEngine engine;
     g_engine = &engine;
     engine.SetConfigIniPath(GetIniPath());
+    const bool allowRemoteInit = (LoadSetting(L"AllowRemoteConnect", 1) != 0);
+    engine.SetAllowRemoteConnect(allowRemoteInit);
+    engine.SetRemoteConnectCallback([](const std::string& pcIp, const std::wstring& pcName) {
+        if (g_closing.load() || !g_hwnd || !IsWindow(g_hwnd)) return;
+        auto* msg = new RemoteConnectRequestMsg{ pcIp, pcName };
+        if (!PostMessageW(g_hwnd, WM_REMOTE_CONNECT_REQ, 0, reinterpret_cast<LPARAM>(msg))) {
+            delete msg;
+        }
+    });
+    engine.StartRemoteConnectListener();
+    if (allowRemoteInit) {
+        EnsureSenderRemoteFirewallRuleAsync();
+    }
     engine.SetPinPromptCallback([](const std::wstring& pcName,
                                    const std::string& pcIp,
                                    const s2p::AppVersionTuple& pcVersion,

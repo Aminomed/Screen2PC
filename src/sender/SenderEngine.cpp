@@ -101,6 +101,7 @@ bool WaitForControlPacketRaw(TcpSocket& sock,
 } // namespace
 
 SenderEngine::~SenderEngine() {
+    StopRemoteConnectListener();
     Disconnect();
 }
 
@@ -112,6 +113,180 @@ void SenderEngine::SetConfigIniPath(const std::wstring& iniPath) {
 void SenderEngine::SetPinPromptCallback(PinPromptCallback cb) {
     std::lock_guard<std::mutex> lock(m_cfgIoMutex);
     m_pinPromptCb = std::move(cb);
+}
+
+void SenderEngine::SetRemoteConnectCallback(RemoteConnectCallback cb) {
+    std::lock_guard<std::mutex> lock(m_cfgIoMutex);
+    m_remoteConnectCb = std::move(cb);
+}
+
+void SenderEngine::SetAllowRemoteConnect(bool enabled) {
+    m_allowRemoteConnect.store(enabled, std::memory_order_release);
+}
+
+std::vector<TrustedDeviceEntry> SenderEngine::GetTrustedPcs() const {
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgIoMutex);
+        ini = m_configIniPath;
+    }
+    return LoadTrustedDevices(ini);
+}
+
+bool SenderEngine::RemoveTrustedPcByKey(const std::wstring& key) {
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgIoMutex);
+        ini = m_configIniPath;
+    }
+    return RemoveTrustedDevice(ini, key);
+}
+
+bool SenderEngine::ClearAllTrustedPcs() {
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgIoMutex);
+        ini = m_configIniPath;
+    }
+    return ClearTrustedDevices(ini);
+}
+
+bool SenderEngine::StartRemoteConnectListener() {
+    std::lock_guard<std::mutex> lk(m_remoteListenerMutex);
+    if (m_remoteConnectThread.joinable()) {
+        return true;
+    }
+    m_remoteListenerStop = false;
+    if (!m_remoteConnectSock.Bind(kPortRemoteConnect, true)) {
+        Logger::Instance().Warn("SND-REM",
+            L"Could not bind UDP remote-connect port " + std::to_wstring(kPortRemoteConnect));
+        return false;
+    }
+    m_remoteConnectThread = std::thread(&SenderEngine::RemoteConnectListenerLoop, this);
+    Logger::Instance().Info("SND-REM",
+        L"Remote-connect listener active on UDP " + std::to_wstring(kPortRemoteConnect));
+    return true;
+}
+
+void SenderEngine::StopRemoteConnectListener() {
+    std::lock_guard<std::mutex> lk(m_remoteListenerMutex);
+    m_remoteListenerStop = true;
+    m_remoteConnectSock.Close();
+    if (m_remoteConnectThread.joinable()) {
+        m_remoteConnectThread.join();
+    }
+}
+
+void SenderEngine::RemoteConnectListenerLoop() {
+    uint8_t buf[1024]{};
+    ULONGLONG lastTriggerMs = 0;
+
+    while (!m_remoteListenerStop.load(std::memory_order_relaxed) && m_remoteConnectSock.IsValid()) {
+        std::string srcIp;
+        uint16_t srcPort = 0;
+        int n = m_remoteConnectSock.RecvFrom(buf, sizeof(buf), srcIp, srcPort, 250);
+        if (n <= 0) continue;
+        if (static_cast<size_t>(n) < sizeof(PacketHeader) + sizeof(RemoteConnectReqPayload)) continue;
+
+        PacketHeader hdr{};
+        std::memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != kProtocolMagic || hdr.version != kProtocolVersion ||
+            hdr.type != static_cast<uint16_t>(MsgType::RemoteConnectReq)) {
+            continue;
+        }
+
+        RemoteConnectReqPayload req{};
+        std::memcpy(&req, buf + sizeof(PacketHeader), sizeof(req));
+        req.pcName[_countof(req.pcName) - 1] = L'\0';
+
+        std::wstring iniPath;
+        RemoteConnectCallback cb;
+        {
+            std::lock_guard<std::mutex> lk(m_cfgIoMutex);
+            iniPath = m_configIniPath;
+            cb = m_remoteConnectCb;
+        }
+
+        uint8_t localMac[6]{};
+        if (!GetMacForTargetIp(srcIp, localMac)) {
+            GetLocalPrimaryMac(localMac);
+        }
+        uint8_t localDevId[16]{};
+        LoadOrCreateLocalDeviceId(iniPath, localDevId);
+
+        // If the PC targeted a specific laptop, ignore requests meant for another laptop
+        const bool hasTargetId = !IsAllZero(req.targetLaptopDeviceId, 16);
+        const bool hasTargetMac = !IsAllZero(req.targetLaptopMac, 6);
+        if (hasTargetId || hasTargetMac) {
+            bool idMatch = hasTargetId && !IsAllZero(localDevId, 16) &&
+                           std::memcmp(req.targetLaptopDeviceId, localDevId, 16) == 0;
+            bool macMatch = hasTargetMac && !IsAllZero(localMac, 6) &&
+                            std::memcmp(req.targetLaptopMac, localMac, 6) == 0;
+            if (!idMatch && !macMatch) {
+                continue;
+            }
+        }
+
+        // Check if requesting PC is in this laptop's trusted PCs list (ARP MAC, reported MAC, or DeviceId)
+        uint8_t arpMac[6]{};
+        ResolvePeerMacFromIp(srcIp, arpMac);
+        bool pcTrusted = false;
+        if (!IsAllZero(arpMac, 6)) {
+            pcTrusted = IsDeviceTrusted(iniPath, arpMac, req.pcDeviceId);
+        }
+        if (!pcTrusted && !IsAllZero(req.pcMac, 6)) {
+            pcTrusted = IsDeviceTrusted(iniPath, req.pcMac, req.pcDeviceId);
+        }
+        if (!pcTrusted && !IsAllZero(req.pcDeviceId, 16)) {
+            pcTrusted = IsDeviceTrusted(iniPath, nullptr, req.pcDeviceId);
+        }
+
+        const bool allowRemote = m_allowRemoteConnect.load(std::memory_order_acquire);
+        const bool isConn = m_connected.load(std::memory_order_acquire);
+        const bool isBusy = m_connecting.load(std::memory_order_acquire);
+        const bool isProbe = (req.flags & kRemoteConnectFlagProbe) != 0;
+
+        RemoteConnectStatus respStatus = kRemoteConnectAccepted;
+        if (!allowRemote) {
+            respStatus = kRemoteConnectDisabled;
+        } else if (!pcTrusted) {
+            respStatus = kRemoteConnectNotTrusted;
+        } else if (isConn) {
+            respStatus = kRemoteConnectAlreadyConnected;
+        } else if (isBusy) {
+            respStatus = kRemoteConnectBusy;
+        }
+
+        struct {
+            PacketHeader hdr;
+            RemoteConnectRespPayload body;
+        } reply{};
+        reply.hdr = MakeHeader(MsgType::RemoteConnectResp, sizeof(RemoteConnectRespPayload));
+        reply.body.nonce = req.nonce;
+        reply.body.status = static_cast<uint8_t>(respStatus);
+        reply.body.allowRemoteConnect = allowRemote ? 1 : 0;
+        reply.body.isConnected = isConn ? 1 : 0;
+        reply.body.isTrusted = pcTrusted ? 1 : 0;
+        CopyWideSafe(reply.body.laptopName, _countof(reply.body.laptopName), GetHostComputerName());
+        std::memcpy(reply.body.laptopMac, localMac, 6);
+        std::memcpy(reply.body.laptopDeviceId, localDevId, 16);
+        reply.body.laptopVersion = CurrentAppVersionTuple();
+
+        m_remoteConnectSock.SendTo(srcIp, srcPort, &reply, sizeof(reply));
+
+        if (!isProbe && respStatus == kRemoteConnectAccepted) {
+            const ULONGLONG nowMs = GetTickCount64();
+            if (nowMs - lastTriggerMs >= 2000) {
+                lastTriggerMs = nowMs;
+                std::wstring pcNameW = req.pcName[0] ? std::wstring(req.pcName) : Utf8ToWide(srcIp);
+                Logger::Instance().Info("SND-REM",
+                    L"Accepted remote-connect trigger from trusted PC " + pcNameW + L" (" + Utf8ToWide(srcIp) + L")");
+                if (cb) {
+                    cb(srcIp, pcNameW);
+                }
+            }
+        }
+    }
 }
 
 std::vector<RECT> SenderEngine::GetActiveVirtualOutputRects() const {
@@ -528,6 +703,33 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
     HelloReceiverPayload helloResp{};
     std::memcpy(&helloResp, payload.data(), sizeof(helloResp));
     helloResp.pcName[_countof(helloResp.pcName) - 1] = L'\0';
+
+    // Persist authenticated PC in sender.ini [TrustedDevices] so it can trigger remote connections later
+    {
+        std::wstring iniPath;
+        {
+            std::lock_guard<std::mutex> lk(m_cfgIoMutex);
+            iniPath = m_configIniPath;
+        }
+        uint8_t pcMac[6]{};
+        uint8_t pcDevId[16]{};
+        if (payload.size() >= sizeof(HelloReceiverPayload) + sizeof(HelloReceiverIdentityExt)) {
+            HelloReceiverIdentityExt ext{};
+            std::memcpy(&ext, payload.data() + sizeof(HelloReceiverPayload), sizeof(ext));
+            if (ext.magic == kHelloReceiverExtMagic) {
+                std::memcpy(pcMac, ext.receiverMac, 6);
+                std::memcpy(pcDevId, ext.receiverDeviceId, 16);
+            }
+        }
+        uint8_t arpMac[6]{};
+        if (ResolvePeerMacFromIp(cfg.targetIp, arpMac) && !IsAllZero(arpMac, 6)) {
+            std::memcpy(pcMac, arpMac, 6);
+        }
+        if (!iniPath.empty() && (!IsAllZero(pcMac, 6) || !IsAllZero(pcDevId, 16))) {
+            std::wstring pcNameW = helloResp.pcName[0] ? std::wstring(helloResp.pcName) : Utf8ToWide(cfg.targetIp);
+            SaveTrustedDevice(iniPath, pcNameW, pcMac, pcDevId, cfg.targetIp);
+        }
+    }
 
     if (helloResp.monitorCount == 0) {
         m_connecting = false;

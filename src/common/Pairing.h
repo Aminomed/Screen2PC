@@ -34,7 +34,7 @@ bool ConstantTimePinEquals(const char* a, const char* b, size_t exactLen = 6);
 bool GetLocalPrimaryMac(uint8_t outMac[6]);
 bool GetMacForTargetIp(const std::string& targetIp, uint8_t outMac[6]);
 bool ResolvePeerMacFromIp(const std::string& peerIp, uint8_t outMac[6]);
-bool LoadOrCreateLocalDeviceId(const std::wstring& iniPath, uint8_t outId[16]);
+bool LoadOrCreateLocalDeviceId(const std::wstring& iniPath, uint8_t outId[16], const wchar_t* section = L"Sender");
 
 // Trusted-device persistence ([TrustedDevices] section in receiver.ini)
 std::vector<TrustedDeviceEntry> LoadTrustedDevices(const std::wstring& iniPath);

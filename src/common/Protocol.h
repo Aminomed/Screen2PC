@@ -16,8 +16,10 @@ constexpr uint16_t kPortStreamBase   = 48212; // TCP Stream per monitor (48212 +
 constexpr uint16_t kPortFileTransfer = 48214; // Dedicated bidirectional TCP File Transfer
 constexpr uint16_t kPortRealtimeUdp  = 48215; // Ultra-low-latency bidirectional UDP for KvmMouse & CursorUpdate
 constexpr uint16_t kPortVideoUdpBase = 48216; // UDP Video + RS-FEC stream per monitor (48216 + monitorIndex)
+constexpr uint16_t kPortRemoteConnect = 48218; // UDP Remote-Connect trigger & probe (PC -> Laptop)
 
-constexpr uint32_t kVideoUdpFecMagic = 0x53325646; // "S2VF"
+constexpr uint32_t kVideoUdpFecMagic      = 0x53325646; // "S2VF"
+constexpr uint32_t kHelloReceiverExtMagic = 0x53324944; // "S2ID"
 
 constexpr size_t   kMaxMonitors     = 2;
 constexpr size_t   kMaxFrameBytes   = 64 * 1024 * 1024; // 64 MB safety cap
@@ -30,9 +32,11 @@ enum class CodecType : uint8_t {
 };
 
 enum class MsgType : uint16_t {
-    // UDP Discovery
-    DiscoverReq      = 1,
-    DiscoverResp     = 2,
+    // UDP Discovery & Remote-Connect
+    DiscoverReq       = 1,
+    DiscoverResp      = 2,
+    RemoteConnectReq  = 3,
+    RemoteConnectResp = 4,
 
     // TCP Control
     HelloSender       = 10,
@@ -91,6 +95,19 @@ enum FrameFlags : uint32_t {
     kFrameFlagFullRect = 1 << 1,
 };
 
+enum RemoteConnectStatus : uint8_t {
+    kRemoteConnectAccepted         = 0,
+    kRemoteConnectAlreadyConnected = 1,
+    kRemoteConnectDisabled         = 2,
+    kRemoteConnectNotTrusted       = 3,
+    kRemoteConnectBusy             = 4
+};
+
+enum RemoteConnectFlags : uint16_t {
+    kRemoteConnectFlagNone  = 0,
+    kRemoteConnectFlagProbe = 1 << 0
+};
+
 #pragma pack(push, 1)
 
 struct AppVersionTuple {
@@ -137,6 +154,31 @@ struct DiscoverRespPayload {
     AppVersionTuple receiverVersion;
 };
 
+struct RemoteConnectReqPayload {
+    uint32_t        nonce;
+    uint16_t        controlPort;
+    uint16_t        flags;                    // RemoteConnectFlags
+    wchar_t         pcName[32];
+    uint8_t         pcMac[6];
+    uint8_t         pcDeviceId[16];
+    uint8_t         targetLaptopDeviceId[16]; // all-zero = any laptop
+    uint8_t         targetLaptopMac[6];       // all-zero = any laptop
+    AppVersionTuple pcVersion;
+};
+
+struct RemoteConnectRespPayload {
+    uint32_t        nonce;
+    uint8_t         status;                   // RemoteConnectStatus
+    uint8_t         allowRemoteConnect;       // 1 = enabled on laptop
+    uint8_t         isConnected;              // 1 = already connected
+    uint8_t         isTrusted;                // 1 = PC is in laptop's trusted list
+    wchar_t         laptopName[32];
+    uint8_t         laptopMac[6];
+    uint8_t         laptopDeviceId[16];
+    uint8_t         pad[2];
+    AppVersionTuple laptopVersion;
+};
+
 struct HelloSenderPayload {
     wchar_t         senderName[32];
     uint8_t         preferredCodec; // CodecType
@@ -154,6 +196,14 @@ struct HelloReceiverPayload {
     uint32_t        monitorCount;
     MonitorDesc     monitors[kMaxMonitors];
     AppVersionTuple receiverVersion;
+};
+
+// Optional trailing identity block appended after HelloReceiverPayload (backwards-compatible with v3)
+struct HelloReceiverIdentityExt {
+    uint32_t        magic; // kHelloReceiverExtMagic ("S2ID")
+    uint8_t         receiverMac[6];
+    uint8_t         receiverDeviceId[16];
+    uint8_t         pad[2];
 };
 
 struct VersionMismatchPayload {

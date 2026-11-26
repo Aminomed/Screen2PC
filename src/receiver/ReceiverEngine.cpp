@@ -172,6 +172,210 @@ bool ReceiverEngine::ClearAllTrustedDevices() {
     return ClearTrustedDevices(ini);
 }
 
+namespace {
+
+bool ParseMacText(const std::wstring& macStr, uint8_t outMac[6]) {
+    std::wstring clean;
+    clean.reserve(12);
+    for (wchar_t c : macStr) {
+        if ((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F')) {
+            clean.push_back(c);
+        }
+    }
+    if (clean.size() != 12) return false;
+    return ParseHex(clean, outMac, 6) && !IsAllZero(outMac, 6);
+}
+
+} // namespace
+
+std::vector<RemoteLaptopProbeResult> ReceiverEngine::ProbeRemoteLaptops(uint32_t timeoutMs) const {
+    std::vector<RemoteLaptopProbeResult> results;
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgMutex);
+        ini = m_configIniPath;
+    }
+
+    UdpSocket udp;
+    if (!udp.Bind(0, true)) {
+        return results;
+    }
+
+    const uint32_t nonce = static_cast<uint32_t>(GetTickCount64() ^ (GetCurrentProcessId() << 12));
+    struct {
+        PacketHeader hdr;
+        RemoteConnectReqPayload body;
+    } pkt{};
+    pkt.hdr = MakeHeader(MsgType::RemoteConnectReq, sizeof(RemoteConnectReqPayload));
+    pkt.body.nonce = nonce;
+    pkt.body.controlPort = kPortControl;
+    pkt.body.flags = kRemoteConnectFlagProbe;
+    CopyWideSafe(pkt.body.pcName, _countof(pkt.body.pcName), GetHostComputerName());
+    GetLocalPrimaryMac(pkt.body.pcMac);
+    LoadOrCreateLocalDeviceId(ini, pkt.body.pcDeviceId, L"Receiver");
+    pkt.body.pcVersion = CurrentAppVersionTuple();
+
+    udp.Broadcast(kPortRemoteConnect, &pkt, sizeof(pkt));
+    auto trusted = LoadTrustedDevices(ini);
+    for (const auto& td : trusted) {
+        std::string ip = WideToUtf8(td.lastIp);
+        if (!ip.empty()) {
+            udp.SendTo(ip, kPortRemoteConnect, &pkt, sizeof(pkt));
+        }
+    }
+
+    const ULONGLONG deadline = GetTickCount64() + std::max<uint32_t>(150, timeoutMs);
+    uint8_t buf[1024]{};
+    while (GetTickCount64() < deadline) {
+        std::string fromIp;
+        uint16_t fromPort = 0;
+        int n = udp.RecvFrom(buf, sizeof(buf), fromIp, fromPort, 80);
+        if (n <= 0) continue;
+        if (static_cast<size_t>(n) < sizeof(PacketHeader) + sizeof(RemoteConnectRespPayload)) continue;
+
+        PacketHeader hdr{};
+        std::memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != kProtocolMagic || hdr.version != kProtocolVersion ||
+            hdr.type != static_cast<uint16_t>(MsgType::RemoteConnectResp)) {
+            continue;
+        }
+        RemoteConnectRespPayload resp{};
+        std::memcpy(&resp, buf + sizeof(PacketHeader), sizeof(resp));
+        if (resp.nonce != nonce) continue;
+        resp.laptopName[_countof(resp.laptopName) - 1] = L'\0';
+
+        RemoteLaptopProbeResult r;
+        r.ip = fromIp;
+        r.laptopName = resp.laptopName[0] ? std::wstring(resp.laptopName) : Utf8ToWide(fromIp);
+        if (!IsAllZero(resp.laptopMac, 6)) {
+            r.macStr = FormatMacAddress(resp.laptopMac);
+        }
+        if (!IsAllZero(resp.laptopDeviceId, 16)) {
+            r.deviceIdHex = FormatHex(resp.laptopDeviceId, 16);
+        }
+        r.allowRemoteConnect = (resp.allowRemoteConnect != 0);
+        r.isConnected = (resp.isConnected != 0);
+        r.isTrusted = (resp.isTrusted != 0);
+        r.version = resp.laptopVersion;
+
+        bool dup = false;
+        for (const auto& existing : results) {
+            if ((!r.deviceIdHex.empty() && _wcsicmp(existing.deviceIdHex.c_str(), r.deviceIdHex.c_str()) == 0) ||
+                (!r.macStr.empty() && _wcsicmp(existing.macStr.c_str(), r.macStr.c_str()) == 0) ||
+                existing.ip == r.ip) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            results.push_back(std::move(r));
+        }
+    }
+    return results;
+}
+
+RemoteConnectTriggerResult ReceiverEngine::RequestLaptopConnect(const TrustedDeviceEntry& laptop, uint32_t timeoutMs) const {
+    RemoteConnectTriggerResult res;
+    res.laptopName = laptop.name;
+    res.laptopIp = WideToUtf8(laptop.lastIp);
+
+    std::wstring ini;
+    {
+        std::lock_guard<std::mutex> lock(m_cfgMutex);
+        ini = m_configIniPath;
+    }
+
+    UdpSocket udp;
+    if (!udp.Bind(0, true)) {
+        res.message = L"Konnte UDP-Socket fuer Verbindungsanfrage nicht oeffnen.";
+        return res;
+    }
+
+    const uint32_t nonce = static_cast<uint32_t>(GetTickCount64() ^ (GetCurrentProcessId() << 12) ^ 0x5A3C91E7u);
+    struct {
+        PacketHeader hdr;
+        RemoteConnectReqPayload body;
+    } pkt{};
+    pkt.hdr = MakeHeader(MsgType::RemoteConnectReq, sizeof(RemoteConnectReqPayload));
+    pkt.body.nonce = nonce;
+    pkt.body.controlPort = kPortControl;
+    pkt.body.flags = kRemoteConnectFlagNone;
+    CopyWideSafe(pkt.body.pcName, _countof(pkt.body.pcName), GetHostComputerName());
+
+    if (res.laptopIp.empty() || !GetMacForTargetIp(res.laptopIp, pkt.body.pcMac)) {
+        GetLocalPrimaryMac(pkt.body.pcMac);
+    }
+    LoadOrCreateLocalDeviceId(ini, pkt.body.pcDeviceId, L"Receiver");
+    if (!laptop.deviceIdHex.empty()) {
+        ParseHex(laptop.deviceIdHex, pkt.body.targetLaptopDeviceId, 16);
+    }
+    if (!laptop.macStr.empty()) {
+        ParseMacText(laptop.macStr, pkt.body.targetLaptopMac);
+    }
+    pkt.body.pcVersion = CurrentAppVersionTuple();
+
+    // Send both unicast (fast direct path) and broadcast (handles DHCP IP changes on Wi-Fi)
+    if (!res.laptopIp.empty()) {
+        udp.SendTo(res.laptopIp, kPortRemoteConnect, &pkt, sizeof(pkt));
+    }
+    udp.Broadcast(kPortRemoteConnect, &pkt, sizeof(pkt));
+
+    const ULONGLONG deadline = GetTickCount64() + std::max<uint32_t>(300, timeoutMs);
+    uint8_t buf[1024]{};
+    while (GetTickCount64() < deadline) {
+        std::string fromIp;
+        uint16_t fromPort = 0;
+        int n = udp.RecvFrom(buf, sizeof(buf), fromIp, fromPort, 100);
+        if (n <= 0) continue;
+        if (static_cast<size_t>(n) < sizeof(PacketHeader) + sizeof(RemoteConnectRespPayload)) continue;
+
+        PacketHeader hdr{};
+        std::memcpy(&hdr, buf, sizeof(hdr));
+        if (hdr.magic != kProtocolMagic || hdr.version != kProtocolVersion ||
+            hdr.type != static_cast<uint16_t>(MsgType::RemoteConnectResp)) {
+            continue;
+        }
+        RemoteConnectRespPayload resp{};
+        std::memcpy(&resp, buf + sizeof(PacketHeader), sizeof(resp));
+        if (resp.nonce != nonce) continue;
+        resp.laptopName[_countof(resp.laptopName) - 1] = L'\0';
+
+        res.responded = true;
+        res.status = static_cast<RemoteConnectStatus>(resp.status);
+        res.laptopIp = fromIp;
+        if (resp.laptopName[0]) {
+            res.laptopName = resp.laptopName;
+        }
+        res.accepted = (res.status == kRemoteConnectAccepted);
+
+        switch (res.status) {
+        case kRemoteConnectAccepted:
+            res.message = L"Anfrage bestaetigt — " + res.laptopName + L" verbindet jetzt...";
+            break;
+        case kRemoteConnectAlreadyConnected:
+            res.message = res.laptopName + L" ist bereits verbunden.";
+            break;
+        case kRemoteConnectDisabled:
+            res.message = res.laptopName + L" erlaubt derzeit keine PC-Verbindungsanfragen (Einstellungen am Laptop pruefen).";
+            break;
+        case kRemoteConnectNotTrusted:
+            res.message = L"Dieser PC ist auf " + res.laptopName + L" noch nicht als vertraut gelistet (bitte einmal vom Laptop aus verbinden).";
+            break;
+        case kRemoteConnectBusy:
+            res.message = res.laptopName + L" stellt bereits eine Verbindung her.";
+            break;
+        default:
+            res.message = L"Unbekannte Antwort vom Laptop.";
+            break;
+        }
+        return res;
+    }
+
+    res.message = L"Keine Antwort von " + (res.laptopName.empty() ? L"Laptop" : res.laptopName) +
+                  L" (Laptop im Standby, offline oder Screen2PC Sender laeuft nicht).";
+    return res;
+}
+
 void ReceiverEngine::ShowHiddenStreamWindows() {
     std::lock_guard<std::mutex> wl(m_workersMutex);
     for (auto& w : m_workers) {
@@ -677,15 +881,24 @@ void ReceiverEngine::HandleControlClient(TcpSocket clientSock, const std::string
 
     std::vector<MonitorHdrInfo> hdrList;
     auto mons = EnumerateLocalMonitorsWithHdr(hdrList);
-    HelloReceiverPayload helloResp{};
-    CopyWideSafe(helloResp.pcName, _countof(helloResp.pcName), GetHostComputerName());
-    helloResp.monitorCount = static_cast<uint32_t>(std::min<size_t>(mons.size(), kMaxMonitors));
-    for (uint32_t i = 0; i < helloResp.monitorCount; ++i) {
-        helloResp.monitors[i] = mons[i];
+    struct {
+        HelloReceiverPayload base;
+        HelloReceiverIdentityExt ext;
+    } helloFull{};
+    CopyWideSafe(helloFull.base.pcName, _countof(helloFull.base.pcName), GetHostComputerName());
+    helloFull.base.monitorCount = static_cast<uint32_t>(std::min<size_t>(mons.size(), kMaxMonitors));
+    for (uint32_t i = 0; i < helloFull.base.monitorCount; ++i) {
+        helloFull.base.monitors[i] = mons[i];
     }
-    helloResp.receiverVersion = CurrentAppVersionTuple();
+    helloFull.base.receiverVersion = CurrentAppVersionTuple();
 
-    if (!clientSock.SendPacket(MsgType::HelloReceiver, &helloResp, sizeof(helloResp))) {
+    helloFull.ext.magic = kHelloReceiverExtMagic;
+    if (!GetMacForTargetIp(peerIp, helloFull.ext.receiverMac)) {
+        GetLocalPrimaryMac(helloFull.ext.receiverMac);
+    }
+    LoadOrCreateLocalDeviceId(iniPath, helloFull.ext.receiverDeviceId, L"Receiver");
+
+    if (!clientSock.SendPacket(MsgType::HelloReceiver, &helloFull, sizeof(helloFull))) {
         return;
     }
 

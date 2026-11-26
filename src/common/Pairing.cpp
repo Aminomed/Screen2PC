@@ -294,14 +294,15 @@ bool ResolvePeerMacFromIp(const std::string& peerIp, uint8_t outMac[6]) {
     return false;
 }
 
-bool LoadOrCreateLocalDeviceId(const std::wstring& iniPath, uint8_t outId[16]) {
+bool LoadOrCreateLocalDeviceId(const std::wstring& iniPath, uint8_t outId[16], const wchar_t* section) {
     if (!outId) return false;
     std::memset(outId, 0, 16);
     if (iniPath.empty()) return false;
+    const wchar_t* sec = (section && *section) ? section : L"Sender";
 
     std::lock_guard<std::mutex> lock(g_trustIniMutex);
     wchar_t buf[64]{};
-    GetPrivateProfileStringW(L"Sender", L"DeviceId", L"", buf, _countof(buf), iniPath.c_str());
+    GetPrivateProfileStringW(sec, L"DeviceId", L"", buf, _countof(buf), iniPath.c_str());
     if (ParseHex(buf, outId, 16) && !IsAllZero(outId, 16)) {
         return true;
     }
@@ -314,7 +315,7 @@ bool LoadOrCreateLocalDeviceId(const std::wstring& iniPath, uint8_t outId[16]) {
         outId[15] = 0x32;
     }
     std::wstring hex = FormatHex(outId, 16);
-    WritePrivateProfileStringW(L"Sender", L"DeviceId", hex.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(sec, L"DeviceId", hex.c_str(), iniPath.c_str());
     return true;
 }
 

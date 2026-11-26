@@ -128,8 +128,10 @@ Name: "{autodesktop}\Screen2PC Sender"; Filename: "{app}\Screen2PC.Sender.exe"; 
 Name: "{autodesktop}\Screen2PC Receiver"; Filename: "{app}\Screen2PC.Receiver.exe"; IconFilename: "{app}\Screen2PC.ico"; Components: pc; Tasks: desktopicon
 
 [Run]
-; Laptop: install UMDF virtual display driver & self-signed catalog
+; Laptop: install UMDF virtual display driver & self-signed catalog + allow remote connect from trusted PCs (UDP 48218)
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install_driver.ps1"""; StatusMsg: "{cm:StatusInstallingDriver}"; Components: laptop; Tasks: installdriver; Flags: waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC Sender Remote"""; Components: laptop; Flags: runhidden waituntilterminated
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Screen2PC Sender Remote"" dir=in action=allow protocol=UDP localport=48218"; Components: laptop; Flags: runhidden waituntilterminated
 
 ; PC: configure Windows Firewall rules
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC"""; StatusMsg: "{cm:StatusOpeningFirewall}"; Components: pc; Tasks: openfirewall; Flags: runhidden waituntilterminated
@@ -151,6 +153,7 @@ Filename: "{app}\Screen2PC.Receiver.exe"; Description: "{cm:LaunchAfterInstall,S
 Filename: "{app}\Screen2PC.Sender.exe"; Parameters: "--uninstall-autostart"; Components: laptop; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstAutostartSender"
 Filename: "{app}\Screen2PC.Receiver.exe"; Parameters: "--uninstall-autostart"; Components: pc; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstAutostartReceiver"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall_driver.ps1"""; Components: laptop; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "UninstDriverLaptop"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC Sender Remote"""; Components: laptop; Flags: runhidden waituntilterminated; RunOnceId: "UninstFwSenderRemote"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC"""; Components: pc; Flags: runhidden waituntilterminated; RunOnceId: "UninstFwTcp"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Screen2PC Discovery"""; Components: pc; Flags: runhidden waituntilterminated; RunOnceId: "UninstFwUdp"
 

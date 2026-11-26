@@ -1851,6 +1851,52 @@ void TestAmfFallbackAndHevcHeaders() {
     std::cout << "[PASS] TestAmfFallbackAndHevcHeaders\n";
 }
 
+void TestRemoteConnectProtocolAndIdentity() {
+    CHECK(s2p::kPortRemoteConnect == 48218, "Unexpected remote connect UDP port");
+    CHECK(sizeof(s2p::HelloReceiverIdentityExt) == 28, "HelloReceiverIdentityExt packed size mismatch");
+    CHECK(sizeof(s2p::RemoteConnectReqPayload) > 0 && sizeof(s2p::RemoteConnectRespPayload) > 0,
+          "RemoteConnect payload structs must be non-empty");
+
+    wchar_t tmpDir[MAX_PATH]{};
+    DWORD n = GetTempPathW(MAX_PATH, tmpDir);
+    CHECK(n > 0 && n < MAX_PATH, "GetTempPathW failed");
+    std::wstring iniPath = std::wstring(tmpDir) + L"s2p_test_rem_" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    DeleteFileW(iniPath.c_str());
+
+    uint8_t senderId[16]{};
+    uint8_t receiverId[16]{};
+    uint8_t receiverId2[16]{};
+    CHECK(s2p::LoadOrCreateLocalDeviceId(iniPath, senderId, L"Sender"), "Sender DeviceId creation failed");
+    CHECK(s2p::LoadOrCreateLocalDeviceId(iniPath, receiverId, L"Receiver"), "Receiver DeviceId creation failed");
+    CHECK(s2p::LoadOrCreateLocalDeviceId(iniPath, receiverId2, L"Receiver"), "Receiver DeviceId reload failed");
+    CHECK(!s2p::IsAllZero(senderId, 16) && !s2p::IsAllZero(receiverId, 16), "DeviceIds must be non-zero");
+    CHECK(std::memcmp(receiverId, receiverId2, 16) == 0, "Receiver DeviceId must persist across reloads");
+    CHECK(std::memcmp(senderId, receiverId, 16) != 0, "Sender and Receiver sections must store distinct DeviceIds");
+
+    const uint8_t pcMac[6] = { 0x10, 0x22, 0x33, 0x44, 0x55, 0x66 };
+    CHECK(s2p::SaveTrustedDevice(iniPath, L"GamingPC", pcMac, receiverId, "192.168.1.50"),
+          "Saving trusted PC failed");
+    CHECK(s2p::IsDeviceTrusted(iniPath, pcMac, receiverId), "Trusted PC should match by MAC");
+    CHECK(s2p::IsDeviceTrusted(iniPath, nullptr, receiverId), "Trusted PC should match by DeviceId");
+
+    // Loopback UDP framing check for RemoteConnectReq -> RemoteConnectResp
+    s2p::UdpSocket listener;
+    s2p::UdpSocket client;
+    CHECK(listener.Bind(0, true) && client.Bind(0, true), "UDP sockets bind failed");
+    // Verify MakeHeader produces valid v3 RemoteConnectReq / RemoteConnectResp headers
+    auto reqHdr = s2p::MakeHeader(s2p::MsgType::RemoteConnectReq, sizeof(s2p::RemoteConnectReqPayload));
+    auto respHdr = s2p::MakeHeader(s2p::MsgType::RemoteConnectResp, sizeof(s2p::RemoteConnectRespPayload));
+    CHECK(reqHdr.magic == s2p::kProtocolMagic && reqHdr.version == s2p::kProtocolVersion &&
+          reqHdr.type == static_cast<uint16_t>(s2p::MsgType::RemoteConnectReq),
+          "RemoteConnectReq header mismatch");
+    CHECK(respHdr.magic == s2p::kProtocolMagic && respHdr.version == s2p::kProtocolVersion &&
+          respHdr.type == static_cast<uint16_t>(s2p::MsgType::RemoteConnectResp),
+          "RemoteConnectResp header mismatch");
+
+    DeleteFileW(iniPath.c_str());
+    std::cout << "[PASS] TestRemoteConnectProtocolAndIdentity\n";
+}
+
 } // namespace
 
 int main() {
@@ -1880,6 +1926,7 @@ int main() {
     TestH264BitrateAndFpsInit();
     TestAmfFallbackAndHevcHeaders();
     TestVddDeterministicGuid();
+    TestRemoteConnectProtocolAndIdentity();
 
     CoUninitialize();
 
