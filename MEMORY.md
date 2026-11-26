@@ -6,17 +6,19 @@
 ---
 
 ## 0. Current State (Read First!)
-- **Phase:** `Inno Setup Windows-x64-Installer & Autostart-/Shutdown-Integration (Release v1.5.0.57)`
-- **Status:** Im grünen CI-Build **Run `45419971886`** (Commit `9179b94`, **GitHub Release `v1.5.0.57`**, **21/21 Test-Suites PASS**, INF/CAT OK) ist zusätzlich zum portablen ZIP (`Screen2PC-Windows-x64.zip`, `1.31 MB`) der geführte Windows-x64-Installer **`Screen2PC-Setup-x64.exe`** (`2.62 MB`) live:
-  1. **Inno Setup 6 Installer (`installer/Screen2PC.iss`, `.github/workflows/ci.yml`):**
-     - Zweisprachiger moderner Wizard (Deutsch/Englisch), Installation nach `C:\Program Files\Screen2PC` (kompatibel mit dem GitHub Auto-Updater via `needAdmin`), Startmenü- & optionale Desktop-Verknüpfungen sowie Apps-&-Features-Deinstaller.
-     - Exklusive Rollenauswahl per `[Types]`/`[Components]`: **Laptop (Sender + UMDF v2 VDD-Treiber)** oder **PC (Empfänger — 100 % treiberfrei + Firewall)** inkl. `[InstallDelete]`-Bereinigung bei Rollenwechsel.
-     - Richtet auf Wunsch automatisch den Treiber (`install_driver.ps1` am Laptop) bzw. die Firewall-Ports (`TCP 48211–48215`, `UDP 48210/48215–48217` am PC) sowie den Autostart ein und räumt bei Deinstallation sauber auf (`uninstall_driver.ps1`, Firewall-Regeln, Autostart).
-  2. **Headless Autostart-CLI & Graceful Shutdown (`src/sender/main.cpp`, `src/receiver/main.cpp`):**
-     - `--install-autostart` und `--uninstall-autostart` erlauben dem Installer, exakt die interne C++20-Autostart-Logik auszuführen (Laptop: Task-XML ohne Akku-Sperre; PC: `HKCU\...\Run` mit `runasoriginaluser`).
-     - `WM_QUERYENDSESSION`/`WM_ENDSESSION` schließen Tray-Instanzen bei Upgrades/Windows-Shutdown sauber (`DestroyWindow`), ergänzt um `taskkill`-Fallback im Installer.
-  3. **Basis aus `v1.5.0.53`–`v1.5.0.55` weiter aktiv:**
-     - Akku-/UIPI-fester Sender-Autostart & `TIMER_TRAY_RETRY` (`v1.5.0.55`), Stream-Timeout-Fix + Auto-Reconnect (`v1.5.0.54`), Direct AMD AMF (`amfrt64.dll` H.264/HEVC), D3D11 Compute-Shader Delta (`GpuDeltaAnalyzer`), `DLT3` QOI-Lossless-Hybrid & UDP Video + GF(2⁸)-Cauchy-RS-FEC (`48216–48217`, Protokoll `v3`).
+- **Phase:** `PC-seitiges Fernverbinden mit dem Laptop & Vertraute-PCs-Liste (Release v1.5.0.58)`
+- **Status:** Im grünen CI-Build **Run `45828069062`** (Commit `8ae0074`, **GitHub Release `v1.5.0.58`**, **22/22 Test-Suites PASS**, INF/CAT OK, Inno Setup 6.7.1 OK) kann die Verbindung nun direkt vom PC (Receiver) aus mit einem Klick gestartet werden:
+  1. **Reverse-Trigger-Protokoll (`Protocol.h`, `Pairing.h/.cpp` — abwärtskompatibel in Protokoll `v3`):**
+     - Neuer UDP-Port `48218` (`kPortRemoteConnect`, `RemoteConnectReq` / `RemoteConnectResp`) für Online-Probe und Verbindungs-Trigger PC -> Laptop.
+     - `HelloReceiver` hängt optional `HelloReceiverIdentityExt` (`kHelloReceiverExtMagic`, `receiverMac`, `receiverDeviceId` aus `receiver.ini` `[Receiver]`) an; der Laptop speichert jeden erfolgreich verbundenen PC automatisch in `sender.ini` `[TrustedDevices]`.
+  2. **Laptop / Sender (`SenderEngine.*`, `src/sender/main.cpp`, `installer/Screen2PC.iss`):**
+     - Passiver UDP-Listener (`StartRemoteConnectListener`) prüft `AllowRemoteConnect` (Standard **AN**, Toggle in Tab *Einstellungen*) + PC-Vertrauen (ARP-MAC / MAC / `DeviceId`) und löst per `WM_REMOTE_CONNECT_REQ` das normale `StartConnectAttempt(pcIp)` aus.
+     - Neuer Dialog **„Vertraute PCs verwalten…“** in den Laptop-Einstellungen; automatische Windows-Firewall-Regel `Screen2PC Sender Remote` (UDP `48218`) sowohl beim Aktivieren/Starten als auch im Inno Setup Installer.
+  3. **PC / Receiver (`ReceiverEngine.*`, `src/receiver/main.cpp`):**
+     - Neue kompakte **Laptop-Verbindungs-Karte** oben in Tab *Übersicht* (Dropdown vertrauter Laptops mit Live-Online-Status + *„Verbinden“* & *„Prüfen“*).
+     - **1-Klick-Eintrag direkt im PC-Tray-Menü** (*„Mit \<Laptop\> verbinden“*, bis zu 4 vertraute Laptops).
+  4. **Basis aus `v1.5.0.53`–`v1.5.0.57` weiter aktiv:**
+     - Inno Setup 6 Installer `Screen2PC-Setup-x64.exe` (`v1.5.0.57`), Akku-/UIPI-fester Sender-Autostart & `TIMER_TRAY_RETRY` (`v1.5.0.55`), Stream-Timeout-Fix + Auto-Reconnect (`v1.5.0.54`), Direct AMD AMF (`amfrt64.dll` H.264/HEVC), GPU Compute Delta, `DLT3` QOI & UDP+RS-FEC (`v1.5.0.53`).
 - **Zurückgestellte Feature-Ideen (Deferred Feature Backlog — explizit vorgemerkt, NICHT in diesem Release):**
   1. **10-Bit HDR End-to-End Streaming** (8-Bit HEVC HW-Encode/-Decode ist seit `v1.5.0.53` aktiv).
   2. **WASAPI Loopback Audio-Streaming** (System-Ton Surface -> PC).
@@ -24,8 +26,8 @@
   4. **In-Stream Quick-HUD Overlay** (weitere Erweiterungen; Basis-HUD bereits aktiv).
   5. **Desktop-Profile** (gespeicherte Presets für Home/Office/Gaming inkl. Auflösungs-, Codec-, KVM- & Power-Kombinationen).
 - **Compiler-, INF- & Test-Realität:**
-  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45419971886`), `infverif.exe` & `Inf2Cat.exe` OK, Inno Setup 6.7.1 OK (`Screen2PC-Setup-x64.exe` + `Screen2PC-Windows-x64.zip`), GitHub Release **`v1.5.0.57`**, **`Screen2PC.Tests.exe` 21/21 PASS** (`ALL SCREEN2PC TESTS PASSED!`).
-- **Next Step:** **`Screen2PC-Setup-x64.exe` (`v1.5.0.57`)** auf Laptop (Rolle *Laptop*) und — sobald verfügbar — auf dem Gaming-PC (Rolle *PC*) testen: Installation nach `C:\Program Files\Screen2PC`, Akku-Autostart nach Neustart sowie Streaming (`v1.5.0.54+` Reconnect, Direct AMF/HEVC, UDP+FEC).
+  - *Build & INF:* Windows-x64 Release-Build via `.github/workflows/ci.yml` (Run `45828069062`), `infverif.exe` & `Inf2Cat.exe` OK, Inno Setup 6.7.1 OK (`Screen2PC-Setup-x64.exe` + `Screen2PC-Windows-x64.zip`), GitHub Release **`v1.5.0.58`**, **`Screen2PC.Tests.exe` 22/22 PASS** (`ALL SCREEN2PC TESTS PASSED!`).
+- **Next Step:** Auf Laptop & PC auf **`v1.5.0.58`** aktualisieren (per Auto-Updater oder `Screen2PC-Setup-x64.exe`), einmalig vom Laptop aus verbinden (damit der PC automatisch in `sender.ini` `[TrustedDevices]` landet) und danach das 1-Klick-Verbinden vom PC-Fenster & PC-Tray testen.
 
 ---
 
@@ -129,3 +131,4 @@
 | 2026-11-24 | Stream-Timeout- & Auto-Reconnect-Fix | TCP-Stream-Timeouts (`48212–48213`) auf `6000 ms` und Post-Handshake-Control-Timeouts (`48211`) auf `4000 ms` angehoben; `NetSocket::IsPeerClosed()`, automatischer Stream-Socket-Reconnect in `SenderEngine::RunStreamWorker` & `ReceiverEngine::RunStreamWorker` bei aktivem Control-Channel (Streamfenster/`D3D11Renderer` bleibt offen, Decoder/FEC-Reset + `RequestKeyframe`, `expectedPeerIp`-Prüfung, `inBlockingSend`-Shutdown-Guard) + `TestLoopbackNetworking`-Reconnect-Tests (`76a42bc`, Run `45411535572`, Release `v1.5.0.54`, 21/21 Tests PASS) |
 | 2026-11-24 | Akku-/UIPI-fester Sender-Autostart & Tray-Resilienz | `Autostart.h/.cpp`: `BuildSenderTaskXml` registriert `"Screen2PC Sender"` per UTF-16LE Task-XML mit `DisallowStartIfOnBatteries=false`, `StopIfGoingOnBatteries=false`, `StartWhenAvailable=true`, `ExecutionTimeLimit=PT0S`, User-SID & `HighestAvailable`; `RefreshAutostartPathIfNeeded` migriert alte `HKCU\Run`-Einträge und aktualisiert bestehende Tasks automatisch (`NeedsSenderTaskUpgrade`); `RunSchtasks` unterstützt UTF-16LE/UTF-8/OEM; `sender/main.cpp` & `receiver/main.cpp`: `ChangeWindowMessageFilterEx` (`TaskbarCreated` / `g_wmShowExisting`) + `TIMER_TRAY_RETRY` (60×1 s) + erweiterte `TestAutostartAndCli`-Tests (`daf8f3b`, Run `45414540566`, Release `v1.5.0.55`, 21/21 Tests PASS) |
 | 2026-11-24 | Inno Setup Windows-x64-Installer (`Screen2PC-Setup-x64.exe`) | `installer/Screen2PC.iss` & `.github/workflows/ci.yml`: zweisprachiger Wizard (DE/EN), exklusive Rollen *Laptop* (`Sender` + `install_driver.ps1` + Task-XML-Autostart) vs. *PC* (`Receiver` 100 % treiberfrei + Firewall TCP `48211–48215` / UDP `48210,48215–48217` + `runasoriginaluser` Autostart), Installation nach `C:\Program Files\Screen2PC`, `[InstallDelete]` bei Rollenwechsel & sauberer Deinstaller; `--install-autostart`/`--uninstall-autostart` & `WM_QUERYENDSESSION`/`WM_ENDSESSION` in `sender/main.cpp` & `receiver/main.cpp`; Release liefert `Screen2PC-Setup-x64.exe` (`2.62 MB`) + `Screen2PC-Windows-x64.zip` (`1.31 MB`) für den In-App-Updater (`9179b94`, Run `45419971886`, Release `v1.5.0.57`, 21/21 Tests PASS) |
+| 2026-11-26 | PC-seitiges Fernverbinden mit dem Laptop & Vertraute-PCs-Liste | `Protocol.h` (`kPortRemoteConnect = 48218`, `RemoteConnectReq`/`Resp`, `HelloReceiverIdentityExt`), `Pairing.*` (`[Receiver]` `DeviceId`), `SenderEngine.*` + `sender/main.cpp` (passiver UDP-Listener, `AllowRemoteConnect` standardmäßig AN, automatische `sender.ini` `[TrustedDevices]`-Übernahme, Dialog *„Vertraute PCs verwalten…“*, automatische UDP-48218-Firewall-Regel + `Screen2PC.iss`), `ReceiverEngine.*` + `receiver/main.cpp` (Laptop-Verbindungs-Karte mit Online-Probe in *Übersicht* + 1-Klick-Eintrag im PC-Tray-Menü) + `TestRemoteConnectProtocolAndIdentity` (`8ae0074`, Run `45828069062`, Release `v1.5.0.58`, 22/22 Tests PASS) |

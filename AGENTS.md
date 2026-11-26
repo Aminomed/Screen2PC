@@ -39,6 +39,7 @@ This file is the authoritative instruction & architecture reference for AI codin
 | `48214` | TCP | Dedicated recursive folder/file transfer (`FileTransfer.*`) |
 | `48215` | UDP | **Realtime KVM & Cursor channel** (`kPortRealtimeUdp`): `KvmMouse` (`kMouseMove` UDP-only, buttons/wheel dual UDP+TCP deduplicated via `hdr.reserved` sequence) and `CursorUpdate` (`!shapeChanged`), running on `THREAD_PRIORITY_HIGHEST` |
 | `48216–48217` | UDP | **Video + RS-FEC channel** (`kPortVideoUdpBase` + streamIndex): `UdpVideoFecSender`/`Receiver` sends frames `<= 256 KB` (`kUdpVideoShardSize = 1360`) with GF(2^8) Cauchy Reed-Solomon parity, recovering lost shards without TCP head-of-line blocking (rate-limited `RequestKeyframe` on unrecoverable gaps) |
+| `48218` | UDP | **PC-initiated Remote Connect & Probe** (`kPortRemoteConnect`): PC sends `RemoteConnectReq` (probe or connect trigger) to Laptop; Laptop verifies `AllowRemoteConnect` + `sender.ini` `[TrustedDevices]` (ARP MAC / MAC / `DeviceId`) and triggers normal `StartConnectAttempt(pcIp)` |
 
 ### 3.2 Mouse & Cursor Low-Latency (`M1–M3`)
 - **`D3D11Renderer` (`src/receiver/D3D11Renderer.cpp`):**
