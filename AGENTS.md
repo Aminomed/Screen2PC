@@ -58,13 +58,14 @@ This file is the authoritative instruction & architecture reference for AI codin
   - `H264Decoder` supports both `CodecType::H264` (`MFVideoFormat_H264`) and `CodecType::HEVC` (`MFVideoFormat_HEVC`), sets `CODECAPI_AVLowLatencyMode`, `CODECAPI_AVDecVideoFastDecodeMode = 32`, caches up to 24 `ID3D11VideoProcessorInputView` slots, and guards startup DPB warmup via `WasLastCallNeedMoreInput()`.
   - **Direct NV12 Shader Path (`HasNv12Pipeline()`):** `H264Decoder::Decode` copies DXVA NV12 slices directly into `D3D11Renderer::Nv12Texture()` (`CopyNv12TexToTarget`), skipping `VideoProcessorBlt`; `PSMainNv12` converts BT.709 Studio NV12 directly to `scRGB` HDR or SDR (`H.264 (NVDEC Direct)` / `HEVC (NVDEC Direct)`).
 
-### 3.4 GPU Compute Delta, `DLT3` QOI Hybrid & Lossless Settle
+### 3.4 GPU Compute Delta, `DLT3` QOI Hybrid & Dynamic Auto Bitrate
 - **`GpuDeltaAnalyzer` (`src/sender/GpuDeltaAnalyzer.*`):**
   - `cs_5_0` compute shader compares current vs previous BGRA texture in `64×64` tiles on the Radeon iGPU, reading back only ~3.6 KB tile flags (zero pixel readback when idle) and copying only the dirty bounding box via `CopySubresourceRegion`.
 - **`CodecDelta` (`src/common/CodecDelta.h/.cpp`):**
-  - Supports `DLT1`, `DLT2` (XOR + fast LZ4 + `MoveRects` + 2×2 Fast-Motion), and `DLT3` (hybrid pure-C++20 **QOI** lossless on keyframes & `>= 20%` dirty areas, XOR+LZ4 on small incremental UI diffs).
-- **Partial Upload & Lossless Settle:**
-  - `D3D11Renderer::QueueCpuFrame` / `UploadCpuBgra` uploads only `LastBoundingRect()` via `D3D11_BOX`; after `120 ms` of stillness following sustained 2×2 Fast-Motion, `SenderEngine` sends a 100 % lossless settle frame.
+  - Supports `DLT1`, `DLT2` (XOR + fast LZ4 + `MoveRects`), and `DLT3` (hybrid pure-C++20 **QOI** lossless on keyframes & `>= 20%` dirty areas, XOR+LZ4 on small incremental UI diffs).
+  - `SenderEngine` keeps `DeltaLossless` strictly 100% lossless (`allowFastMotion = false`) so text remains razor-sharp even while scrolling webpages; `D3D11Renderer::QueueCpuFrame` / `UploadCpuBgra` uploads only `LastBoundingRect()` via `D3D11_BOX`.
+- **Dynamic Auto Bitrate & FPS (`src/common/BitratePresets.h`, `SenderEngine.cpp`):**
+  - Supports `Auto (Dyn.)` (`kBitrateAutoMbps = 0`, `ComputeAutoBitratePlan` scaled by resolution, FPS, HEVC vs H.264, and multi-monitor share) with live bidirectional adaptation to send stalls, encoder load, and UDP packet-loss keyframe requests, plus `Auto / 30 / 60 / 90 / 120 FPS` presets.
 
 ---
 
@@ -73,14 +74,14 @@ This file is the authoritative instruction & architecture reference for AI codin
 |---|---|
 | `AGENTS.md` | Agent engineering rules, invariants, architecture & repo map |
 | `MEMORY.md` | Detailed project state, INI/registry specs, and chronological changelog |
-| `README.md` | User-facing quickstart & feature documentation |
+| `README.md`, `README.de.md` | User-facing quickstart & feature documentation (EN / DE) |
 | `Screen2PC.sln`, `Directory.Build.props`, `packages.config` | VS 2022 Solution (`x64`, `SCREEN2PC_BUILD_NUMBER`), NuGet WDK/SDK `10.0.26100.2454` |
 | `src/common/` (`Screen2PC.Common.vcxproj`) | `Protocol.h` (`v3`), `Version.h`, `Resource.h`, `AppIcon.h`, `BitratePresets.h`, `AmfMinimal.h`, `AmfEncoder.*`, `UdpVideoFec.*`, `Autostart.*`, `ColorProfile.*`, `Pairing.*`, `Updater.*`, `Logger.*`, `NetSocket.*`, `CodecH264.*`, `CodecDelta.*`, `ClipboardSync.*`, `FileTransfer.*`, `KvmInput.*`, `UiTheme.*`, `Lang.h` |
 | `src/driver/` (`Screen2PC.Driver.vcxproj`) | UMDF v2 `IddCx 1.2` virtual display driver (`DriverProtocol.h`, `Driver.h/.cpp`, `Screen2PCDriver.inf`) |
 | `src/driversetup/` (`Screen2PC.DriverSetup.vcxproj`) | Driver installer helper (`Screen2PC.DriverSetup.exe`) |
 | `src/sender/` (`Screen2PC.Sender.vcxproj`) | Surface Sender app (`SenderEngine.*`, `DxgiCapture.*`, `GpuDeltaAnalyzer.*`, `PowerPolicy.*`, `VirtualDisplayCtl.*`, `main.cpp`) |
 | `src/receiver/` (`Screen2PC.Receiver.vcxproj`) | PC Receiver app (`ReceiverEngine.*`, `D3D11Renderer.*`, `main.cpp`) |
-| `src/tests/` (`Screen2PC.Tests.vcxproj`) | Automated unit & integration test suite (`Screen2PC.Tests.exe`, 21 suites) |
+| `src/tests/` (`Screen2PC.Tests.vcxproj`) | Automated unit & integration test suite (`Screen2PC.Tests.exe`, 22 suites) |
 | `scripts/` | `install_driver.ps1`, `uninstall_driver.ps1`, `generate_icons.py` |
 | `installer/` | `Screen2PC.iss` — Inno Setup 6 Windows x64 installer (`Screen2PC-Setup-x64.exe`, Laptop/PC roles, autostart, driver/firewall setup) |
 | `.github/workflows/ci.yml` | Windows-2022 CI: MSBuild `Release\|x64`, `Screen2PC.Tests.exe`, `infverif`, `Inf2Cat`, Inno Setup, Artifact & GitHub Release |
