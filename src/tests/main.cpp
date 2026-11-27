@@ -1211,10 +1211,13 @@ void TestAppIcons() {
 }
 
 void TestBitratePresets() {
-    CHECK(s2p::kBitratePresetCount == 10, "Expected 10 bitrate presets");
-    CHECK(s2p::BitrateFromPresetIndex(s2p::kDefaultBitratePresetIdx) == 80, "Default bitrate must be 80 Mbit/s");
-    CHECK(s2p::BitrateFromPresetIndex(-1) == 80 && s2p::BitrateFromPresetIndex(999) == 80,
-          "Out-of-bounds preset index must safely fall back to 80 Mbit/s");
+    CHECK(s2p::kBitratePresetCount == 11, "Expected 11 bitrate presets (Auto + 15..200 Mbit/s)");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::kDefaultBitratePresetIdx) == s2p::kBitrateAutoMbps,
+          "Default bitrate must be Auto (0)");
+    CHECK(s2p::BitrateFromPresetIndex(-1) == s2p::kBitrateAutoMbps &&
+          s2p::BitrateFromPresetIndex(999) == s2p::kBitrateAutoMbps,
+          "Out-of-bounds preset index must safely fall back to Auto");
+    CHECK(s2p::FormatBitrateLabel(0) == L"Auto (Dyn.)", "Auto bitrate label mismatch");
 
     for (size_t i = 1; i < s2p::kBitratePresetCount; ++i) {
         CHECK(s2p::kBitratePresetsMbps[i] > s2p::kBitratePresetsMbps[i - 1],
@@ -1222,25 +1225,42 @@ void TestBitratePresets() {
     }
 
     // Requested 60 and 100 Mbit/s presets must exist with clean labels
+    int idxAuto = s2p::FindBitratePresetIndex(0);
     int idx60 = s2p::FindBitratePresetIndex(60);
     int idx100 = s2p::FindBitratePresetIndex(100);
+    CHECK(idxAuto == 0 && s2p::BitrateFromPresetIndex(idxAuto) == 0, "Auto preset missing");
     CHECK(s2p::BitrateFromPresetIndex(idx60) == 60, "60 Mbit/s preset missing");
     CHECK(s2p::BitrateFromPresetIndex(idx100) == 100, "100 Mbit/s preset missing");
     CHECK(s2p::FormatBitrateLabel(60) == L"60 Mbit/s", "60 Mbit/s label mismatch");
     CHECK(s2p::FormatBitrateLabel(100) == L"100 Mbit/s", "100 Mbit/s label mismatch");
 
-    // Legacy 5-step INI migration (v1.5.0.28 and earlier: 25, 50, 80, 120, 200)
-    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 0)) == 25, "Legacy idx 0 -> 25 failed");
-    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 1)) == 50, "Legacy idx 1 -> 50 failed");
-    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 2)) == 80, "Legacy idx 2 -> 80 failed");
-    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 3)) == 120, "Legacy idx 3 -> 120 failed");
-    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 4)) == 200, "Legacy idx 4 -> 200 failed");
-    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, -1)) == 80, "Fresh INI default -> 80 failed");
+    // Legacy 5-step INI migration (v1.5.0.28 and earlier: 25, 50, 80, 120, 200 when BitrateMbps key is absent: -1)
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(-1, 0)) == 25, "Legacy idx 0 -> 25 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(-1, 1)) == 50, "Legacy idx 1 -> 50 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(-1, 2)) == 80, "Legacy idx 2 -> 80 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(-1, 3)) == 120, "Legacy idx 3 -> 120 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(-1, 4)) == 200, "Legacy idx 4 -> 200 failed");
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(-1, -1)) == 0, "Fresh INI default -> Auto failed");
 
-    // Explicit BitrateMbps always wins over legacy index and snaps nearest
+    // Explicit BitrateMbps (including 0 = Auto) always wins over legacy index and snaps nearest
+    CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(0, 4)) == 0, "Explicit Auto (0) ignored");
     CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(60, 4)) == 60, "Explicit 60 Mbit/s ignored");
     CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(100, 0)) == 100, "Explicit 100 Mbit/s ignored");
     CHECK(s2p::BitrateFromPresetIndex(s2p::ResolveSavedBitratePresetIndex(95, 0)) == 100, "Nearest snap 95 -> 100 failed");
+
+    // AutoBitratePlan scaling sanity (resolution, FPS, HEVC efficiency, multi-monitor share)
+    auto p1080_30 = s2p::ComputeAutoBitratePlan(1920, 1080, 30, false, 0, 1);
+    auto p1440_60 = s2p::ComputeAutoBitratePlan(2560, 1440, 60, false, 0, 1);
+    auto p1440_hevc = s2p::ComputeAutoBitratePlan(2560, 1440, 60, true, 0, 1);
+    auto pDual0 = s2p::ComputeAutoBitratePlan(2560, 1440, 60, false, 0, 2);
+    auto pDual1 = s2p::ComputeAutoBitratePlan(1920, 1080, 60, false, 1, 2);
+    CHECK(p1080_30.minMbps >= 8 && p1080_30.startMbps >= p1080_30.minMbps && p1080_30.startMbps <= p1080_30.maxMbps,
+          "1080p30 AutoBitratePlan bounds invalid");
+    CHECK(p1440_60.maxMbps > p1080_30.maxMbps && p1440_60.startMbps > p1080_30.startMbps,
+          "1440p60 AutoBitratePlan must exceed 1080p30");
+    CHECK(p1440_hevc.maxMbps < p1440_60.maxMbps, "HEVC AutoBitratePlan should target lower bitrate than H.264");
+    CHECK(pDual0.maxMbps < p1440_60.maxMbps && pDual1.maxMbps < pDual0.maxMbps,
+          "Dual-monitor AutoBitratePlan must split budget across monitors");
 
     std::cout << "[PASS] TestBitratePresets\n";
 }
@@ -1310,19 +1330,27 @@ void TestVersionProtocolAndPresets() {
     srvSock.Close();
 
     // 3. FPS presets & effective FPS calculation
-    CHECK(s2p::kFpsPresetCount == 4, "Expected 4 FPS presets (Auto, 60, 90, 120)");
+    CHECK(s2p::kFpsPresetCount == 5, "Expected 5 FPS presets (Auto, 30, 60, 90, 120)");
     CHECK(s2p::FpsFromPresetIndex(0) == 0 &&
-          s2p::FpsFromPresetIndex(1) == 60 &&
-          s2p::FpsFromPresetIndex(2) == 90 &&
-          s2p::FpsFromPresetIndex(3) == 120,
+          s2p::FpsFromPresetIndex(1) == 30 &&
+          s2p::FpsFromPresetIndex(2) == 60 &&
+          s2p::FpsFromPresetIndex(3) == 90 &&
+          s2p::FpsFromPresetIndex(4) == 120,
           "FPS preset order mismatch");
-    CHECK(s2p::FindFpsPresetIndex(0) == 0 && s2p::FindFpsPresetIndex(90) == 2 && s2p::FindFpsPresetIndex(144) == 3,
+    CHECK(s2p::FindFpsPresetIndex(0) == 0 &&
+          s2p::FindFpsPresetIndex(30) == 1 &&
+          s2p::FindFpsPresetIndex(60) == 2 &&
+          s2p::FindFpsPresetIndex(90) == 3 &&
+          s2p::FindFpsPresetIndex(144) == 4,
           "FindFpsPresetIndex mismatch");
     CHECK(s2p::ResolveEffectiveFps(0, 144) == 120 &&
           s2p::ResolveEffectiveFps(0, 60) == 60 &&
+          s2p::ResolveEffectiveFps(30, 144) == 30 &&
           s2p::ResolveEffectiveFps(90, 144) == 90,
           "ResolveEffectiveFps mismatch");
-    CHECK(s2p::FormatFpsLabel(0) == L"Auto (Monitor-Hz)" && s2p::FormatFpsLabel(120) == L"120 FPS",
+    CHECK(s2p::FormatFpsLabel(0) == L"Auto (Monitor-Hz)" &&
+          s2p::FormatFpsLabel(30) == L"30 FPS" &&
+          s2p::FormatFpsLabel(120) == L"120 FPS",
           "FormatFpsLabel mismatch");
 
     std::cout << "[PASS] TestVersionProtocolAndPresets\n";

@@ -42,6 +42,24 @@ uint32_t ComputeStreamBitrateMbps(uint32_t totalBitrateMbps, uint32_t streamIdx,
     return std::max<uint32_t>(10u, alloc);
 }
 
+AutoBitratePlan ResolveStreamBitratePlan(uint32_t rawBitrateMbps,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         uint32_t effFps,
+                                         bool isHevc,
+                                         uint32_t streamIdx,
+                                         uint32_t streamCount) {
+    if (rawBitrateMbps == kBitrateAutoMbps) {
+        return ComputeAutoBitratePlan(width, height, effFps, isHevc, streamIdx, streamCount);
+    }
+    uint32_t fixedBr = ComputeStreamBitrateMbps(rawBitrateMbps, streamIdx, streamCount);
+    AutoBitratePlan plan{};
+    plan.minMbps = 8u;
+    plan.startMbps = fixedBr;
+    plan.maxMbps = fixedBr;
+    return plan;
+}
+
 uint32_t ResolveWorkerEffectiveFps(uint32_t fpsSetting, uint32_t monitorHz, uint32_t streamCount) {
     uint32_t eff = ResolveEffectiveFps(fpsSetting, monitorHz);
     if (fpsSetting == 0 && streamCount > 1) {
@@ -775,13 +793,15 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
                              ? helloResp.monitors[targetPcMon].refreshHz
                              : 60u;
         uint32_t effFps = ResolveWorkerEffectiveFps(cfg.targetFps, monHz, streamCount);
-        uint32_t streamBitrate = ComputeStreamBitrateMbps(cfg.bitrateMbps, i, streamCount);
+        AutoBitratePlan brPlan = ResolveStreamBitratePlan(
+            cfg.bitrateMbps, captureOutputs[i].width, captureOutputs[i].height,
+            effFps, cfg.codec == CodecType::HEVC, i, streamCount);
         startReq.streams[i].monitorIndex = targetPcMon;
         startReq.streams[i].width = captureOutputs[i].width;
         startReq.streams[i].height = captureOutputs[i].height;
         startReq.streams[i].refreshHz = monHz;
         startReq.streams[i].codec = static_cast<uint8_t>(cfg.codec);
-        startReq.streams[i].bitrateMbps = streamBitrate;
+        startReq.streams[i].bitrateMbps = brPlan.startMbps;
         startReq.streams[i].targetFps = effFps;
     }
 
@@ -832,7 +852,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->targetFps = startReq.streams[i].targetFps;
         w->sessionStreamCount = streamCount;
         w->desiredCodec.store(static_cast<uint8_t>(cfg.codec));
-        w->desiredBitrateMbps.store(startReq.streams[i].bitrateMbps);
+        w->desiredBitrateMbps.store(cfg.bitrateMbps);
         w->desiredTargetFps.store(cfg.targetFps);
         w->peerIp = cfg.targetIp;
         w->streamPort = static_cast<uint16_t>(kPortStreamBase + i);
@@ -841,6 +861,7 @@ bool SenderEngine::Connect(const SenderConfig& cfg) {
         w->stats.height = w->height;
         w->stats.configuredBitrateMbps = startReq.streams[i].bitrateMbps;
         w->stats.liveBitrateMbps = startReq.streams[i].bitrateMbps;
+        w->stats.autoBitrate = (cfg.bitrateMbps == kBitrateAutoMbps);
         w->stats.targetFps = w->targetFps;
 
         StreamWorker* raw = w.get();
@@ -1168,9 +1189,11 @@ bool SenderEngine::ReconfigureStream(CodecType codec, uint32_t bitrateMbps, uint
         std::lock_guard<std::mutex> wl(m_workersMutex);
         const uint32_t streamCount = static_cast<uint32_t>(std::max<size_t>(1, m_workers.size()));
         for (auto& w : m_workers) {
-            uint32_t streamBitrate = ComputeStreamBitrateMbps(bitrateMbps, w->streamIndex, streamCount);
+            uint32_t effFps = ResolveWorkerEffectiveFps(targetFps, w->refreshHz, streamCount);
+            AutoBitratePlan brPlan = ResolveStreamBitratePlan(
+                bitrateMbps, w->width, w->height, effFps, codec == CodecType::HEVC, w->streamIndex, streamCount);
             w->desiredCodec.store(static_cast<uint8_t>(codec));
-            w->desiredBitrateMbps.store(streamBitrate);
+            w->desiredBitrateMbps.store(bitrateMbps);
             w->desiredTargetFps.store(targetFps);
             w->forceKeyframe.store(true);
             w->reconfigPending.store(true);
@@ -1178,8 +1201,8 @@ bool SenderEngine::ReconfigureStream(CodecType codec, uint32_t bitrateMbps, uint
             ReconfigureStreamPayload req{};
             req.streamIndex = w->streamIndex;
             req.codec = static_cast<uint8_t>(codec);
-            req.bitrateMbps = streamBitrate;
-            req.targetFps = ResolveWorkerEffectiveFps(targetFps, w->refreshHz, streamCount);
+            req.bitrateMbps = brPlan.startMbps;
+            req.targetFps = effFps;
             notices.push_back(req);
         }
     }
@@ -1217,6 +1240,7 @@ void SenderEngine::ControlLoop() {
                     for (auto& w : m_workers) {
                         if (w->streamIndex == req.monitorIndex || w->targetPcMonitor == req.monitorIndex) {
                             w->forceKeyframe = true;
+                            w->remoteKeyframeReqCount.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 } else if (hdr.type == static_cast<uint16_t>(MsgType::StopSession)) {
@@ -1435,8 +1459,18 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
     const uint32_t sessionStreams = std::max<uint32_t>(1u, w->sessionStreamCount);
     uint32_t effFps = ResolveWorkerEffectiveFps(w->desiredTargetFps.load(), w->refreshHz, sessionStreams);
-    uint32_t configBitrateMbps = w->desiredBitrateMbps.load();
-    uint32_t liveBitrateMbps = configBitrateMbps;
+    uint32_t rawBitrateSetting = w->desiredBitrateMbps.load();
+    bool autoBitrate = (rawBitrateSetting == kBitrateAutoMbps);
+    AutoBitratePlan brPlan = ResolveStreamBitratePlan(
+        rawBitrateSetting, w->width, w->height, effFps, activeCodec == CodecType::HEVC, w->streamIndex, sessionStreams);
+    uint32_t minBitrateMbps = brPlan.minMbps;
+    uint32_t configBitrateMbps = brPlan.maxMbps;
+    uint32_t liveBitrateMbps = brPlan.startMbps;
+    uint32_t encOverloadCount = 0;
+    LARGE_INTEGER initQpcLi{};
+    QueryPerformanceCounter(&initQpcLi);
+    int64_t autoBitrateGraceUntilQpc = initQpcLi.QuadPart + qpcFreq * 2;
+    w->remoteKeyframeReqCount.store(0, std::memory_order_relaxed);
 
     auto isVideoCodec = [](CodecType c) {
         return c == CodecType::H264 || c == CodecType::HEVC;
@@ -1479,7 +1513,6 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
     bool deltaSettleFull = false;
     bool losslessSettleActive = false;
     uint32_t consecutiveLargeDeltaFrames = 0;
-    int64_t lastLargeDeltaQpc = 0;
     int64_t lastMotionQpc = 0;
     uint32_t cpuStride = 0;
     uint64_t frameIndex = 0;
@@ -1488,6 +1521,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         std::lock_guard<std::mutex> sl(w->statsMutex);
         w->stats.configuredBitrateMbps = configBitrateMbps;
         w->stats.liveBitrateMbps = liveBitrateMbps;
+        w->stats.autoBitrate = autoBitrate;
         w->stats.targetFps = effFps;
         if (isVideoCodec(activeCodec)) {
             w->stats.codecName = h264Label();
@@ -1748,6 +1782,18 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         w->width = cw;
         w->height = ch;
         activeD3dDevice = curDev;
+        if (autoBitrate) {
+            brPlan = ResolveStreamBitratePlan(
+                rawBitrateSetting, cw, ch, effFps, activeCodec == CodecType::HEVC, w->streamIndex, sessionStreams);
+            minBitrateMbps = brPlan.minMbps;
+            configBitrateMbps = brPlan.maxMbps;
+            liveBitrateMbps = std::clamp(liveBitrateMbps, minBitrateMbps, configBitrateMbps);
+        }
+        LARGE_INTEGER resQpcLi{};
+        QueryPerformanceCounter(&resQpcLi);
+        autoBitrateGraceUntilQpc = resQpcLi.QuadPart + qpcFreq * 2;
+        encOverloadCount = 0;
+        w->remoteKeyframeReqCount.store(0, std::memory_order_relaxed);
         delta.Reset();
         gpuDelta.Shutdown();
         if (isVideoCodec(activeCodec)) {
@@ -1763,6 +1809,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             w->stats.height = ch;
             w->stats.configuredBitrateMbps = configBitrateMbps;
             w->stats.liveBitrateMbps = liveBitrateMbps;
+            w->stats.autoBitrate = autoBitrate;
             w->stats.targetFps = effFps;
             if (isVideoCodec(activeCodec)) {
                 w->stats.codecName = h264Label();
@@ -1792,18 +1839,32 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
 
         CodecType newCodec = static_cast<CodecType>(w->desiredCodec.load());
         if (newCodec == CodecType::Auto) newCodec = CodecType::H264;
-        uint32_t newBitrate = w->desiredBitrateMbps.load();
+        uint32_t newRawBitrate = w->desiredBitrateMbps.load();
         uint32_t newEffFps = ResolveWorkerEffectiveFps(w->desiredTargetFps.load(), w->refreshHz, sessionStreams);
+        bool newAutoBitrate = (newRawBitrate == kBitrateAutoMbps);
+        AutoBitratePlan newPlan = ResolveStreamBitratePlan(
+            newRawBitrate, w->width, w->height, newEffFps, newCodec == CodecType::HEVC, w->streamIndex, sessionStreams);
 
         const bool codecChanged = (newCodec != activeCodec);
         const bool fpsChanged = (newEffFps != effFps);
-        const bool bitrateChanged = (newBitrate != configBitrateMbps || newBitrate != liveBitrateMbps);
+        const bool bitrateChanged = (newRawBitrate != rawBitrateSetting ||
+                                     newPlan.maxMbps != configBitrateMbps ||
+                                     newPlan.startMbps != liveBitrateMbps);
 
-        configBitrateMbps = newBitrate;
-        liveBitrateMbps = newBitrate;
+        rawBitrateSetting = newRawBitrate;
+        autoBitrate = newAutoBitrate;
+        brPlan = newPlan;
+        minBitrateMbps = brPlan.minMbps;
+        configBitrateMbps = brPlan.maxMbps;
+        liveBitrateMbps = brPlan.startMbps;
         effFps = newEffFps;
         stallCount = 0;
         cleanSendStreak = 0;
+        encOverloadCount = 0;
+        w->remoteKeyframeReqCount.store(0, std::memory_order_relaxed);
+        LARGE_INTEGER rcQpcLi{};
+        QueryPerformanceCounter(&rcQpcLi);
+        autoBitrateGraceUntilQpc = rcQpcLi.QuadPart + qpcFreq * 2;
         nextEncodeQpc = 0;
         smoothedEncMs = 0.0;
         smoothedSendMs = 0.0;
@@ -1854,6 +1915,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         std::lock_guard<std::mutex> sl(w->statsMutex);
         w->stats.configuredBitrateMbps = configBitrateMbps;
         w->stats.liveBitrateMbps = liveBitrateMbps;
+        w->stats.autoBitrate = autoBitrate;
         w->stats.targetFps = effFps;
         if (isVideoCodec(activeCodec)) {
             w->stats.codecName = h264Label();
@@ -1864,7 +1926,9 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
         }
         Logger::Instance().Info("SND-CFG",
             L"Live reconfigure monitor #" + std::to_wstring(w->targetPcMonitor + 1) +
-            L": " + w->stats.codecName + L", " + std::to_wstring(liveBitrateMbps) +
+            L": " + w->stats.codecName + L", " +
+            (autoBitrate ? (L"Auto(" + std::to_wstring(liveBitrateMbps) + L".." + std::to_wstring(configBitrateMbps) + L")")
+                         : std::to_wstring(liveBitrateMbps)) +
             L" Mbit/s, " + std::to_wstring(effFps) + L" FPS");
     };
 
@@ -2011,7 +2075,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             }
         }
 
-        // Check async ABR feedback from latest completed SendPacket
+        // Check async ABR / Auto-Bitrate feedback from latest completed SendPacket
         if (sendMsUpdated.exchange(false, std::memory_order_acquire)) {
             const double sendMs = latestSendMs.load(std::memory_order_relaxed);
             windowSendMsSum += sendMs;
@@ -2019,12 +2083,35 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             smoothedSendMs = (smoothedSendMs <= 0.0) ? sendMs : (smoothedSendMs * 0.75 + sendMs * 0.25);
 
             if (isVideoCodec(activeCodec)) {
-                const double stallThreshMs = std::max<double>(10.0, 900.0 / static_cast<double>(effFps));
-                if (sendMs > stallThreshMs) {
+                const double frameBudgetMs = 1000.0 / static_cast<double>(std::max<uint32_t>(1u, effFps));
+                const double stallThreshMs = std::max<double>(10.0, frameBudgetMs * 0.85);
+                const double upSendThreshMs = autoBitrate
+                    ? std::max<double>(4.5, frameBudgetMs * 0.38)
+                    : 6.0;
+                const double encOverloadMs = frameBudgetMs * 0.85;
+                const double encHeadroomMs = frameBudgetMs * 0.65;
+                const uint32_t remoteKeyReqs = w->remoteKeyframeReqCount.exchange(0, std::memory_order_relaxed);
+                const bool pastGrace = (nowQpc >= autoBitrateGraceUntilQpc);
+
+                if (autoBitrate && pastGrace && remoteKeyReqs > 0 && liveBitrateMbps > minBitrateMbps) {
                     cleanSendStreak = 0;
-                    if (++stallCount >= 2 && liveBitrateMbps > 8) {
+                    stallCount = 0;
+                    encOverloadCount = 0;
+                    uint32_t newBr = std::max<uint32_t>(minBitrateMbps, (liveBitrateMbps * 85u) / 100u);
+                    if (newBr == liveBitrateMbps && liveBitrateMbps > minBitrateMbps) newBr = liveBitrateMbps - 1u;
+                    if (newBr < liveBitrateMbps && h264.SetBitrate(newBr)) {
+                        liveBitrateMbps = newBr;
+                        std::lock_guard<std::mutex> sl(w->statsMutex);
+                        w->stats.liveBitrateMbps = liveBitrateMbps;
+                        Logger::Instance().Info("SND-ABR",
+                            L"Auto-Bitrate: packet loss / keyframe req -> " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                    }
+                } else if (sendMs > stallThreshMs) {
+                    cleanSendStreak = 0;
+                    encOverloadCount = 0;
+                    if (++stallCount >= 2 && liveBitrateMbps > minBitrateMbps) {
                         stallCount = 0;
-                        uint32_t newBr = std::max<uint32_t>(8u, (liveBitrateMbps * 3u) / 4u);
+                        uint32_t newBr = std::max<uint32_t>(minBitrateMbps, (liveBitrateMbps * 3u) / 4u);
                         if (newBr < liveBitrateMbps && h264.SetBitrate(newBr)) {
                             liveBitrateMbps = newBr;
                             std::lock_guard<std::mutex> sl(w->statsMutex);
@@ -2034,22 +2121,44 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                                 L" ms) -> reduced bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
                         }
                     }
+                } else if (autoBitrate && smoothedEncMs > encOverloadMs && liveBitrateMbps > minBitrateMbps) {
+                    cleanSendStreak = 0;
+                    stallCount = 0;
+                    if (++encOverloadCount >= 3) {
+                        encOverloadCount = 0;
+                        uint32_t newBr = std::max<uint32_t>(minBitrateMbps, (liveBitrateMbps * 85u) / 100u);
+                        if (newBr < liveBitrateMbps && h264.SetBitrate(newBr)) {
+                            liveBitrateMbps = newBr;
+                            std::lock_guard<std::mutex> sl(w->statsMutex);
+                            w->stats.liveBitrateMbps = liveBitrateMbps;
+                            Logger::Instance().Info("SND-ABR",
+                                L"Auto-Bitrate: encoder load (" + std::to_wstring(static_cast<int>(smoothedEncMs)) +
+                                L" ms) -> " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                        }
+                    }
                 } else {
                     stallCount = 0;
-                    if (sendMs < 6.0 && liveBitrateMbps < configBitrateMbps) {
-                        if (++cleanSendStreak >= effFps * 3u) {
+                    encOverloadCount = 0;
+                    const bool encHasHeadroom = (!autoBitrate || smoothedEncMs <= 0.0 || smoothedEncMs < encHeadroomMs);
+                    if (sendMs < upSendThreshMs && encHasHeadroom && liveBitrateMbps < configBitrateMbps) {
+                        const uint32_t neededCleanFrames = autoBitrate ? (effFps * 2u) : (effFps * 3u);
+                        if (++cleanSendStreak >= neededCleanFrames) {
                             cleanSendStreak = 0;
-                            uint32_t step = std::max<uint32_t>(4u, configBitrateMbps / 8u);
+                            uint32_t step = autoBitrate
+                                ? std::clamp<uint32_t>((configBitrateMbps - liveBitrateMbps) / 5u, 4u, 12u)
+                                : std::max<uint32_t>(4u, configBitrateMbps / 8u);
                             uint32_t newBr = std::min<uint32_t>(configBitrateMbps, liveBitrateMbps + step);
                             if (newBr > liveBitrateMbps && h264.SetBitrate(newBr)) {
                                 liveBitrateMbps = newBr;
                                 std::lock_guard<std::mutex> sl(w->statsMutex);
                                 w->stats.liveBitrateMbps = liveBitrateMbps;
                                 Logger::Instance().Info("SND-ABR",
-                                    L"Network recovered -> raised bitrate to " + std::to_wstring(liveBitrateMbps) + L" Mbit/s");
+                                    (autoBitrate ? L"Auto-Bitrate: headroom -> raised to "
+                                                 : L"Network recovered -> raised bitrate to ") +
+                                    std::to_wstring(liveBitrateMbps) + L" Mbit/s");
                             }
                         }
-                    } else if (sendMs >= 6.0) {
+                    } else if (sendMs >= upSendThreshMs || !encHasHeadroom) {
                         cleanSendStreak = 0;
                     }
                 }
@@ -2132,75 +2241,25 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                         pendingMoveRects.clear();
                         forceFullDirtyRect = false;
                     } else {
-                        const uint64_t totalScreenArea = static_cast<uint64_t>(capture.Width()) * capture.Height();
-                        uint64_t approxHintArea = 0;
-                        for (const auto& r : gpuDirtyRects) {
-                            approxHintArea += static_cast<uint64_t>(r.w) * r.h;
-                        }
-                        const int64_t fastWindowQpc = (qpcFreq * 150) / 1000;
-                        const bool isLargeFrame = (totalScreenArea > 0) && (approxHintArea * 100ULL >= totalScreenArea * 35ULL);
-                        if (isLargeFrame) {
-                            if (lastLargeDeltaQpc > 0 && (nowQpc - lastLargeDeltaQpc) <= fastWindowQpc) {
-                                ++consecutiveLargeDeltaFrames;
-                            } else {
-                                consecutiveLargeDeltaFrames = 1;
-                            }
-                            lastLargeDeltaQpc = nowQpc;
-                        } else {
-                            consecutiveLargeDeltaFrames = 0;
-                        }
-                        const bool allowFastMotion = (consecutiveLargeDeltaFrames >= 2);
+                        // Keep Delta Lossless strictly 100% lossless (no 2x2 subsampling) so text stays
+                        // razor-sharp even while scrolling webpages; DLT3 QOI handles large dirty areas fast.
                         bool usedFastMotion = false;
                         encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
                                                 cpuStride, gpuDirtyRects, false, encodedPayload, isKeyframe,
-                                                {}, allowFastMotion, &usedFastMotion);
-                        if (encodeOk && usedFastMotion) {
-                            deltaNeedsSettle = true;
-                            if (!deltaSettleFull) {
-                                settleDirtyRects.insert(settleDirtyRects.end(), gpuDirtyRects.begin(), gpuDirtyRects.end());
-                                if (settleDirtyRects.size() > 32) {
-                                    settleDirtyRects = DeltaEncoder::MergeAndBoundRects(
-                                        settleDirtyRects, capture.Width(), capture.Height(), 32);
-                                }
-                            }
-                        }
+                                                {}, /*allowFastMotion=*/false, &usedFastMotion);
                     }
                 } else {
                     std::vector<DeltaRect> mergedHints;
                     std::vector<DeltaRect> copyRegions;
-                    uint64_t approxHintArea = 0;
-                    const uint64_t totalScreenArea = static_cast<uint64_t>(capture.Width()) * capture.Height();
 
                     if (!forceFullDirtyRect && !needKey && (!pendingDirtyRects.empty() || !pendingMoveRects.empty())) {
                         mergedHints = DeltaEncoder::MergeAndBoundRects(
                             pendingDirtyRects, capture.Width(), capture.Height(), 32);
                         copyRegions = mergedHints;
-                        for (const auto& r : mergedHints) {
-                            approxHintArea += static_cast<uint64_t>(r.w) * r.h;
-                        }
                         for (const auto& m : pendingMoveRects) {
                             copyRegions.push_back(DeltaRect{m.dstX, m.dstY, m.w, m.h});
-                            approxHintArea += static_cast<uint64_t>(m.w) * m.h;
                         }
-                    } else {
-                        approxHintArea = totalScreenArea;
                     }
-
-                    // Only engage 2x2 fast-motion on *sustained* large-area motion (>= 2 consecutive large frames
-                    // within 150ms) so single tab/window switches render 100% razor-sharp immediately!
-                    const int64_t fastWindowQpc = (qpcFreq * 150) / 1000;
-                    const bool isLargeFrame = (totalScreenArea > 0) && (approxHintArea * 100ULL >= totalScreenArea * 35ULL);
-                    if (isLargeFrame) {
-                        if (lastLargeDeltaQpc > 0 && (nowQpc - lastLargeDeltaQpc) <= fastWindowQpc) {
-                            ++consecutiveLargeDeltaFrames;
-                        } else {
-                            consecutiveLargeDeltaFrames = 1;
-                        }
-                        lastLargeDeltaQpc = nowQpc;
-                    } else {
-                        consecutiveLargeDeltaFrames = 0;
-                    }
-                    const bool allowFastMotion = (consecutiveLargeDeltaFrames >= 2);
 
                     const bool copied = (!forceFullDirtyRect && !needKey && !copyRegions.empty())
                                             ? capture.CopyFrameToCpuRegions(cpuBgra, cpuStride, copyRegions)
@@ -2216,21 +2275,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
                         encodeOk = delta.Encode(cpuBgra.data(), capture.Width(), capture.Height(),
                                                 cpuStride, hints, needKey, encodedPayload, isKeyframe,
                                                 (forceFullDirtyRect || needKey) ? std::vector<DeltaMoveRect>{} : pendingMoveRects,
-                                                allowFastMotion, &usedFastMotion);
-                        if (encodeOk && usedFastMotion) {
-                            // Arm settle and accumulate affected regions; NEVER clear on later small non-fast-motion frames!
-                            deltaNeedsSettle = true;
-                            if (forceFullDirtyRect || needKey || mergedHints.empty()) {
-                                deltaSettleFull = true;
-                                settleDirtyRects.clear();
-                            } else if (!deltaSettleFull) {
-                                settleDirtyRects.insert(settleDirtyRects.end(), mergedHints.begin(), mergedHints.end());
-                                if (settleDirtyRects.size() > 32) {
-                                    settleDirtyRects = DeltaEncoder::MergeAndBoundRects(
-                                        settleDirtyRects, capture.Width(), capture.Height(), 32);
-                                }
-                            }
-                        }
+                                                /*allowFastMotion=*/false, &usedFastMotion);
                     }
                 }
             }
@@ -2309,6 +2354,7 @@ void SenderEngine::RunStreamWorker(StreamWorker* w) {
             w->stats.framesSent = frameIndex;
             w->stats.configuredBitrateMbps = configBitrateMbps;
             w->stats.liveBitrateMbps = liveBitrateMbps;
+            w->stats.autoBitrate = autoBitrate;
             w->stats.targetFps = effFps;
             w->stats.avgEncodeMs = windowEncodeCount > 0 ? (windowEncodeMsSum / static_cast<double>(windowEncodeCount)) : 0.0;
             w->stats.avgSendMs = windowSendCount > 0 ? (windowSendMsSum / static_cast<double>(windowSendCount)) : 0.0;

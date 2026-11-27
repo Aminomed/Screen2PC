@@ -691,7 +691,9 @@ void UpdateUiFromState() {
                << s.codecName << L"  |  "
                << std::fixed << std::setprecision(1) << s.fps << L"/" << s.targetFps << L" FPS  |  "
                << std::setprecision(1) << s.mbps << L" Mbit/s";
-            if (s.configuredBitrateMbps > 0 && s.liveBitrateMbps > 0 && s.liveBitrateMbps < s.configuredBitrateMbps) {
+            if (s.autoBitrate && s.liveBitrateMbps > 0) {
+                ss << L" (Auto " << s.liveBitrateMbps << L" Mbit/s)";
+            } else if (s.configuredBitrateMbps > 0 && s.liveBitrateMbps > 0 && s.liveBitrateMbps < s.configuredBitrateMbps) {
                 ss << L" (ABR " << s.liveBitrateMbps << L"/" << s.configuredBitrateMbps << L")";
             }
             ss << L"  |  Enc: " << std::setprecision(1) << s.avgEncodeMs
@@ -1179,7 +1181,7 @@ void CreateUiControls(HWND hwnd) {
         SendMessageW(brCb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
     int savedBr = s2p::ResolveSavedBitratePresetIndex(
-        LoadSetting(L"BitrateMbps", 0),
+        LoadSetting(L"BitrateMbps", -1),
         LoadSetting(L"BitrateIdx", -1));
     SendMessageW(brCb, CB_SETCURSEL, savedBr, 0);
 

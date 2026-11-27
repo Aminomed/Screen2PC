@@ -45,8 +45,8 @@ struct SenderConfig {
     uint16_t controlPort = kPortControl;
     DisplayMode mode = DisplayMode::ExtendAll;
     CodecType codec = CodecType::H264;
-    uint32_t bitrateMbps = 80;
-    uint32_t targetFps = 0; // 0 = Auto (Monitor-Hz), 60, 90, 120
+    uint32_t bitrateMbps = 0; // 0 = Auto (Dynamic), or fixed total Mbit/s
+    uint32_t targetFps = 0;   // 0 = Auto (Monitor-Hz), 30, 60, 90, 120
 };
 
 struct StreamStats {
@@ -58,6 +58,7 @@ struct StreamStats {
     uint64_t framesSent = 0;
     uint32_t configuredBitrateMbps = 0;
     uint32_t liveBitrateMbps = 0;
+    bool autoBitrate = false;
     uint32_t targetFps = 0;
     std::wstring codecName;
     bool hardwareAccelerated = false;
@@ -144,10 +145,11 @@ private:
         uint16_t streamPort = kPortStreamBase;
 
         std::atomic<uint8_t> desiredCodec{static_cast<uint8_t>(CodecType::H264)};
-        std::atomic<uint32_t> desiredBitrateMbps{80};
-        std::atomic<uint32_t> desiredTargetFps{0}; // raw preset: 0=Auto, 60, 90, 120
+        std::atomic<uint32_t> desiredBitrateMbps{0}; // raw setting: 0=Auto (Dynamic), >0=fixed total Mbit/s
+        std::atomic<uint32_t> desiredTargetFps{0};   // raw preset: 0=Auto, 30, 60, 90, 120
         std::atomic<bool> reconfigPending{false};
         std::atomic<bool> forceKeyframe{true};
+        std::atomic<uint32_t> remoteKeyframeReqCount{0};
         std::atomic<bool> stop{false};
         std::thread thread;
 
